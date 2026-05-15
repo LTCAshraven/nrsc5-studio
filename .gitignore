@@ -1,0 +1,33 @@
+# Rust build output ----------------------------------------------------
+/target/
+**/*.rs.bk
+
+# Cargo lock — keep for binaries, but ignore lock backups
+**/Cargo.lock.bak
+
+# Bundled / vendored toolchains and SDKs that shouldn't live in git -----
+# (multi-gigabyte llvm-mingw + Python bundle; bootstrap script downloads them)
+/.toolchains/
+
+# Packaging output ------------------------------------------------------
+/dist/
+
+# Editor & IDE ----------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS detritus -----------------------------------------------------------
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Runtime artifacts -----------------------------------------------------
+*.log
+nrsc5-*.log
+
+# Local config overrides ------------------------------------------------
+.env
+.env.local

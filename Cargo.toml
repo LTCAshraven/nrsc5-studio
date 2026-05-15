@@ -1,0 +1,53 @@
+[package]
+name = "nrsc5-studio"
+version = "0.1.2"
+edition = "2021"
+authors = ["LTCAshraven"]
+license = "MIT"
+description = "A native Windows desktop app for listening to HD Radio broadcasts with an RTL-SDR dongle, built on top of nrsc5."
+repository = "https://github.com/LTCAshraven/nrsc5-studio"
+readme = "README.md"
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+cpal = "0.16"
+crossbeam-channel = "0.5"
+dirs = "6"
+eframe = { version = "0.34", features = ["persistence"] }
+egui = "0.34"
+egui_dock = { version = "0.19", features = ["serde"] }
+egui_extras = { version = "0.34", features = ["image", "file"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+libloading = "0.8"
+ron = "0.8"
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
+thiserror = "2"
+toml = "0.8"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Media_Audio",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+    "Win32_UI_Shell_PropertiesSystem",
+] }
+
+[build-dependencies]
+bindgen = "0.72"
+# Used by build.rs to procedurally generate a multi-resolution Windows icon
+# and embed it as a resource in the final .exe. Only active on Windows
+# targets — see build.rs for the cfg gate.
+image = { version = "0.25", default-features = false }
+ico = "0.4"
+embed-resource = "3"
+
+[profile.release]
+opt-level = "z"      # Optimize for size
+lto = true           # Link-time optimization
+codegen-units = 1    # Better optimization (slower compile, smaller binary)
+strip = true         # Strip debug symbols
+panic = "abort"      # No unwinding (smaller binary; fine for a GUI app)

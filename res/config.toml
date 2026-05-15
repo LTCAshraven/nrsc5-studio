@@ -1,0 +1,6 @@
+frequency_mhz = 101.1
+selected_program = 0
+use_rtl_tcp = false
+rtl_device_index = 0
+rtl_tcp_host = "127.0.0.1"
+rtl_tcp_port = 1234
