@@ -22,7 +22,7 @@ pub enum UiCommand {
     SetMute(bool),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum DockTab {
     Tuner,
     NowPlaying,
@@ -30,6 +30,30 @@ pub enum DockTab {
     Weather,
     Signal,
     Collage,
+}
+
+impl DockTab {
+    /// All panel variants in the order they should appear in the View menu.
+    pub const ALL: [DockTab; 6] = [
+        DockTab::Tuner,
+        DockTab::NowPlaying,
+        DockTab::Collage,
+        DockTab::Signal,
+        DockTab::Traffic,
+        DockTab::Weather,
+    ];
+
+    /// Compact label (emoji + short name) for the top-toolbar tab toggles.
+    pub fn toolbar_label(&self) -> &'static str {
+        match self {
+            DockTab::Tuner => "\u{1F4FB} Tuner",
+            DockTab::NowPlaying => "\u{1F3B5} Now Playing",
+            DockTab::Collage => "\u{1F5BC} Collage",
+            DockTab::Signal => "\u{1F4F6} Signal",
+            DockTab::Traffic => "\u{1F697} Traffic",
+            DockTab::Weather => "\u{2601} Weather",
+        }
+    }
 }
 
 pub struct DockViewer<'a> {

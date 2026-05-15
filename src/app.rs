@@ -4,7 +4,7 @@ use crate::ffi::{Nrsc5Process, NrscEvent};
 use crate::gui::dock::{DockTab, DockViewer, UiCommand};
 use crate::gui::state::{AppState, ArtTile};
 use crate::maps::{TrafficMap, WeatherMap};
-use egui_dock::{DockArea, DockState, NodeIndex};
+use egui_dock::{DockArea, DockState, NodeIndex, NodePath, SurfaceIndex};
 use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
@@ -26,6 +26,52 @@ struct ArtEntry {
     /// Timestamps of every distinct play within the current window, oldest
     /// first. Pruned to `ART_WINDOW` on each new event.
     plays: VecDeque<Instant>,
+}
+
+/// Bookkeeping that lets us put a closed panel back where it lived.
+///
+/// On every frame we record where each open tab is, and diff before/after
+/// the dock area is shown. Tabs that disappeared are tracked here so that the
+/// next click on the toolbar puts them back in (roughly) the same spot.
+#[derive(Debug, Clone, Default)]
+struct ClosedTabInfo {
+    /// Exact leaf the tab lived in when it was closed.
+    location: Option<NodePath>,
+    /// Other tabs that shared the same leaf — first-tier fallback anchor.
+    leaf_mates: Vec<DockTab>,
+    /// Other tabs in the same surface (window) — second-tier fallback anchor.
+    surface_mates: Vec<DockTab>,
+}
+
+/// Snapshot of where every open tab currently lives, used for frame-to-frame
+/// diffing so we can detect tabs that disappeared from the dock state.
+#[derive(Debug, Default)]
+struct LayoutSnapshot {
+    tabs: HashMap<DockTab, NodePath>,
+    leaves: HashMap<(SurfaceIndex, NodeIndex), Vec<DockTab>>,
+    surfaces: HashMap<SurfaceIndex, Vec<DockTab>>,
+}
+
+impl LayoutSnapshot {
+    fn build(state: &DockState<DockTab>) -> Self {
+        let mut snap = LayoutSnapshot::default();
+        for (path, tab) in state.iter_all_tabs() {
+            let np = NodePath {
+                surface: path.surface,
+                node: path.node,
+            };
+            snap.tabs.insert(tab.clone(), np);
+            snap.leaves
+                .entry((path.surface, path.node))
+                .or_default()
+                .push(tab.clone());
+            snap.surfaces
+                .entry(path.surface)
+                .or_default()
+                .push(tab.clone());
+        }
+        snap
+    }
 }
 
 pub struct Nrsc5App {
@@ -59,6 +105,12 @@ pub struct Nrsc5App {
     /// Last time we pruned expired plays from `art_history`. Throttled so
     /// we don't walk the map every UI frame.
     last_art_prune_at: Option<Instant>,
+    /// Where each recently-closed panel used to live, so re-opening it from
+    /// the toolbar restores it to (roughly) the same spot.
+    closed_tab_locations: HashMap<DockTab, ClosedTabInfo>,
+    /// Layout snapshot from the previous frame, used to detect tabs that
+    /// were closed via the dock area's own "X" button.
+    prev_layout: LayoutSnapshot,
 }
 
 impl Nrsc5App {
@@ -112,6 +164,8 @@ impl Nrsc5App {
             art_history: HashMap::new(),
             last_counted_art_path: None,
             last_art_prune_at: None,
+            closed_tab_locations: HashMap::new(),
+            prev_layout: LayoutSnapshot::default(),
         }
     }
 }
@@ -192,6 +246,35 @@ impl eframe::App for Nrsc5App {
                 egui::Color32::from_gray(140)
             };
             ui.label(egui::RichText::new(&self.app_state.nrsc5_status).color(status_color));
+            ui.separator();
+
+            // Panel toggle buttons. Selected state indicates the panel is
+            // currently open in the dock; clicking a closed panel restores it
+            // to its previous location (when possible), clicking an open one
+            // focuses it.
+            for tab in DockTab::ALL {
+                let is_open = self.dock_state.find_tab(&tab).is_some();
+                let label = tab.toolbar_label();
+                let response = ui.selectable_label(is_open, label);
+                if response.clicked() {
+                    if let Some(loc) = self.dock_state.find_tab(&tab) {
+                        let _ = self.dock_state.set_active_tab(loc);
+                    } else {
+                        self.reopen_tab(tab);
+                    }
+                }
+            }
+
+            // Reset-layout button, right-aligned by allocating remaining space.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .button("↺")
+                    .on_hover_text("Reset panel layout to default")
+                    .clicked()
+                {
+                    self.dock_state = default_dock_state();
+                }
+            });
         });
         ui.separator();
 
@@ -201,9 +284,15 @@ impl eframe::App for Nrsc5App {
             commands: &mut commands,
             presets: &self.config.presets,
         };
+        // Snapshot the layout before show_inside so we can detect tabs that
+        // the user closes via the "X" button in this frame.
+        let pre_layout = LayoutSnapshot::build(&self.dock_state);
         DockArea::new(&mut self.dock_state)
             .style(egui_dock::Style::from_egui(ui.style()))
             .show_inside(ui, &mut viewer);
+        let post_layout = LayoutSnapshot::build(&self.dock_state);
+        self.record_closures(&pre_layout, &post_layout);
+        self.prev_layout = post_layout;
 
         for command in commands {
             self.handle_command(command);
@@ -237,6 +326,86 @@ impl eframe::App for Nrsc5App {
 }
 
 impl Nrsc5App {
+    /// Record any tabs that existed in `pre` but are missing from `post`.
+    /// Their previous location and neighbours are stashed so the next click
+    /// on the panel toolbar can restore them to (roughly) the same spot.
+    fn record_closures(&mut self, pre: &LayoutSnapshot, post: &LayoutSnapshot) {
+        for (tab, np) in &pre.tabs {
+            if post.tabs.contains_key(tab) {
+                continue;
+            }
+            let leaf_mates: Vec<DockTab> = pre
+                .leaves
+                .get(&(np.surface, np.node))
+                .map(|v| v.iter().filter(|t| *t != tab).cloned().collect())
+                .unwrap_or_default();
+            let surface_mates: Vec<DockTab> = pre
+                .surfaces
+                .get(&np.surface)
+                .map(|v| v.iter().filter(|t| *t != tab).cloned().collect())
+                .unwrap_or_default();
+            self.closed_tab_locations.insert(
+                tab.clone(),
+                ClosedTabInfo {
+                    location: Some(*np),
+                    leaf_mates,
+                    surface_mates,
+                },
+            );
+        }
+        // Drop bookkeeping for any tab that has since reappeared.
+        for tab in post.tabs.keys() {
+            self.closed_tab_locations.remove(tab);
+        }
+    }
+
+    /// Push `tab` back into the dock state, preferring its previous location.
+    /// Falls back through several heuristics so the panel comes back near
+    /// where it was even after intervening layout changes.
+    fn reopen_tab(&mut self, tab: DockTab) {
+        let info = self.closed_tab_locations.remove(&tab).unwrap_or_default();
+
+        // 1) Exact previous leaf, if it still exists.
+        if let Some(np) = info.location {
+            let still_alive = self
+                .dock_state
+                .iter_all_tabs()
+                .any(|(p, _)| p.surface == np.surface && p.node == np.node);
+            if still_alive {
+                self.dock_state.set_focused_node_and_surface(np);
+                self.dock_state.push_to_focused_leaf(tab);
+                return;
+            }
+        }
+
+        // 2) Any former leaf-mate that's still around.
+        for mate in &info.leaf_mates {
+            if let Some(path) = self.dock_state.find_tab(mate) {
+                self.dock_state.set_focused_node_and_surface(NodePath {
+                    surface: path.surface,
+                    node: path.node,
+                });
+                self.dock_state.push_to_focused_leaf(tab);
+                return;
+            }
+        }
+
+        // 3) Any tab from the same surface that's still around.
+        for mate in &info.surface_mates {
+            if let Some(path) = self.dock_state.find_tab(mate) {
+                self.dock_state.set_focused_node_and_surface(NodePath {
+                    surface: path.surface,
+                    node: path.node,
+                });
+                self.dock_state.push_to_focused_leaf(tab);
+                return;
+            }
+        }
+
+        // 4) Last resort: focused leaf.
+        self.dock_state.push_to_focused_leaf(tab);
+    }
+
     fn apply_theme(ctx: &egui::Context, dark: bool) {
         let accent = egui::Color32::from_rgb(100, 160, 255);
 

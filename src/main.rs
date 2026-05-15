@@ -1,3 +1,8 @@
+// In release builds, mark the binary as a Windows GUI app so no console
+// window appears when the user double-clicks the .exe. Debug builds keep the
+// console so `println!` / `eprintln!` remain visible during development.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod app;
 mod collage;
 mod config;
