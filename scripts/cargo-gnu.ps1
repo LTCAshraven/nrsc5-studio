@@ -1,3 +1,8 @@
+param(
+	[ValidateSet("debug", "release")]
+	[string]$Configuration = "debug"
+)
+
 $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $PSScriptRoot
 Set-Location $Root
@@ -20,4 +25,10 @@ if (-not (Test-Path $WinResAlias)) {
 $env:PATH = "$env:USERPROFILE\.cargo\bin;$ToolRoot;$env:PATH"
 
 rustup toolchain install stable-x86_64-pc-windows-gnullvm
-cargo +stable-x86_64-pc-windows-gnullvm build --target x86_64-pc-windows-gnullvm
+
+$cargoArgs = @("+stable-x86_64-pc-windows-gnullvm", "build", "--target", "x86_64-pc-windows-gnullvm")
+if ($Configuration -eq "release") {
+	$cargoArgs += "--release"
+}
+
+cargo @cargoArgs
