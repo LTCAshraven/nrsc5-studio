@@ -2,12 +2,17 @@ use std::time::Instant;
 
 pub use crate::maps::WeatherFrame;
 
-/// One tile in the album-art heat-map collage: the file path to the image and
-/// the number of times it has appeared as cover art during the session.
+/// One tile in the album-art heat-map collage: the file path to the image,
+/// the number of times it has appeared, and the unique (title, artist) pairs
+/// observed while it was on screen. Used to render hover tooltips.
 #[derive(Debug, Clone, Default)]
 pub struct ArtTile {
     pub path: String,
     pub count: u32,
+    /// Unique (title, artist) pairs that have been displayed with this cover.
+    pub songs: Vec<(String, String)>,
+    /// Most recently observed album name for this cover, if any.
+    pub album: String,
 }
 
 #[derive(Debug, Clone, Default)]

@@ -1,7 +1,86 @@
 use std::env;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+#[path = "src/icon_render.rs"]
+mod icon_render;
 
 fn main() {
+    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=src/icon_render.rs");
+
+    // Embed the application icon as a Windows resource. Skips silently on
+    // non-Windows targets and warns (rather than failing the build) if the
+    // resource compiler is missing.
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        embed_app_icon();
+    }
+
+    // Optional bindgen generation, gated by NRSC5_GENERATE_BINDINGS.
+    generate_bindings();
+}
+
+fn embed_app_icon() {
+    let Some(out_dir) = env::var_os("OUT_DIR").map(PathBuf::from) else {
+        println!("cargo:warning=OUT_DIR not set; skipping icon embedding");
+        return;
+    };
+
+    // Render a multi-resolution .ico file from the shared icon-rendering
+    // code. Multiple resolutions let Windows pick the closest size for any
+    // display context (Explorer small/medium/large icons, taskbar, Alt-Tab,
+    // pinned shortcuts, etc.) instead of downscaling a single large image.
+    let ico_path = out_dir.join("nrsc5-studio.ico");
+    let sizes: [u32; 6] = [16, 32, 48, 64, 128, 256];
+    let mut icon_dir = ico::IconDir::new(ico::ResourceType::Icon);
+    for size in sizes {
+        let img = icon_render::render(size);
+        let image = ico::IconImage::from_rgba_data(size, size, img.into_raw());
+        match ico::IconDirEntry::encode(&image) {
+            Ok(entry) => icon_dir.add_entry(entry),
+            Err(err) => {
+                println!("cargo:warning=failed to encode {size}x{size} icon: {err}");
+                return;
+            }
+        }
+    }
+    let file = match std::fs::File::create(&ico_path) {
+        Ok(f) => f,
+        Err(err) => {
+            println!(
+                "cargo:warning=failed to create {}: {err}",
+                ico_path.display()
+            );
+            return;
+        }
+    };
+    if let Err(err) = icon_dir.write(file) {
+        println!("cargo:warning=failed to write icon file: {err}");
+        return;
+    }
+
+    // Generate a minimal Windows resource script and hand it to
+    // embed-resource, which invokes `rc.exe` (MSVC) or `windres` (MinGW /
+    // llvm-mingw) to produce a linkable resource object.
+    let rc_path = out_dir.join("nrsc5-studio.rc");
+    let rc_contents = format!(
+        "1 ICON \"{}\"\n",
+        ico_path.to_string_lossy().replace('\\', "/")
+    );
+    if let Err(err) = std::fs::write(&rc_path, rc_contents) {
+        println!("cargo:warning=failed to write {}: {err}", rc_path.display());
+        return;
+    }
+
+    let result = embed_resource::compile(&rc_path, embed_resource::NONE);
+    if let Err(err) = result.manifest_optional() {
+        println!(
+            "cargo:warning=embedding application icon failed (the .exe will \
+             still build, just without a custom icon resource): {err}"
+        );
+    }
+}
+
+fn generate_bindings() {
     let header = Path::new("res/nrsc5.h");
     println!("cargo:rerun-if-changed={}", header.display());
 

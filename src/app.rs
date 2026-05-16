@@ -26,6 +26,11 @@ struct ArtEntry {
     /// Timestamps of every distinct play within the current window, oldest
     /// first. Pruned to `ART_WINDOW` on each new event.
     plays: VecDeque<Instant>,
+    /// Unique (title, artist) pairs that have been displayed with this cover.
+    /// Capped to avoid unbounded growth on chatty stations.
+    songs: Vec<(String, String)>,
+    /// Most recently observed album name for this cover, if any.
+    album: String,
 }
 
 /// Bookkeeping that lets us put a closed panel back where it lived.
@@ -571,13 +576,36 @@ impl Nrsc5App {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         bytes.hash(&mut hasher);
         let key = hasher.finish();
+
+        // Grab the song metadata currently on display so we can label this
+        // cover later in tooltips. Trim and skip empty pieces so we don't
+        // accumulate noise entries like ("", "").
+        let title = self.app_state.title.trim().to_string();
+        let artist = self.app_state.artist.trim().to_string();
+        let album = self.app_state.album.trim().to_string();
+
         let entry = self.art_history.entry(key).or_insert_with(|| ArtEntry {
             path: path_str.to_string(),
             plays: VecDeque::new(),
+            songs: Vec::new(),
+            album: album.clone(),
         });
         entry.plays.push_back(now);
         // Always refresh path — a re-emitted image may live at a new LOT path.
         entry.path = path_str.to_string();
+        if !album.is_empty() {
+            entry.album = album;
+        }
+        if !title.is_empty() || !artist.is_empty() {
+            const MAX_SONGS_PER_COVER: usize = 16;
+            let pair = (title, artist);
+            if !entry.songs.iter().any(|p| p == &pair) {
+                if entry.songs.len() >= MAX_SONGS_PER_COVER {
+                    entry.songs.remove(0);
+                }
+                entry.songs.push(pair);
+            }
+        }
         self.last_counted_art_path = Some(path_str.to_string());
         self.rebuild_art_tiles();
     }
@@ -590,6 +618,8 @@ impl Nrsc5App {
             .map(|e| ArtTile {
                 path: e.path.clone(),
                 count: e.plays.len() as u32,
+                songs: e.songs.clone(),
+                album: e.album.clone(),
             })
             .collect();
         // Sort by count desc, then by path for stable layout.

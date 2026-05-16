@@ -682,11 +682,11 @@ impl DockViewer<'_> {
         // Find max count for relative font sizing on play-count overlay.
         let max_count = tiles.iter().map(|t| t.count).max().unwrap_or(1);
 
-        for (tile_rect, path, count) in placements
-            .into_iter()
-            .zip(tiles.iter())
-            .map(|((r, p), tile)| (r, p, tile.count))
+        for ((tile_rect, _placement_path), tile) in
+            placements.into_iter().zip(tiles.iter())
         {
+            let path = &tile.path;
+            let count = tile.count;
             // Tiny gap between tiles.
             let outer = tile_rect.shrink(1.0);
             if outer.width() < 8.0 || outer.height() < 8.0 {
@@ -705,6 +705,32 @@ impl DockViewer<'_> {
             egui::Image::new(&uri)
                 .corner_radius(3)
                 .paint_at(ui, inner);
+
+            // Hover region with a tooltip listing the album and every unique
+            // song we've seen displayed with this cover.
+            if !tile.songs.is_empty() || !tile.album.is_empty() {
+                let id = egui::Id::new(("art_tile", path));
+                let resp = ui.interact(inner, id, egui::Sense::hover());
+                let album = tile.album.clone();
+                let songs = tile.songs.clone();
+                resp.on_hover_ui(|ui| {
+                    if !album.is_empty() {
+                        ui.label(RichText::new(&album).strong().size(14.0));
+                    }
+                    if !songs.is_empty() && !album.is_empty() {
+                        ui.separator();
+                    }
+                    for (title, artist) in &songs {
+                        let line = match (title.is_empty(), artist.is_empty()) {
+                            (false, false) => format!("\u{201c}{}\u{201d} \u{2014} {}", title, artist),
+                            (false, true) => format!("\u{201c}{}\u{201d}", title),
+                            (true, false) => artist.clone(),
+                            (true, true) => continue,
+                        };
+                        ui.label(line);
+                    }
+                });
+            }
 
             // For tiles representing a "dominant" cover (>=2 plays *and* big
             // enough to be readable), overlay the play count in the corner.
