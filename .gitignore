@@ -31,3 +31,8 @@ nrsc5-*.log
 # Local config overrides ------------------------------------------------
 .env
 .env.local
+# Personal planning notes (kept local, not in the public repo) ----------
+*.private.md
+
+# Dev-only one-shot screenshot helper (mocks the album-art cache) -------
+scripts/seed-collage-mock.ps1

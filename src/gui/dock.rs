@@ -20,6 +20,9 @@ pub enum UiCommand {
     SetVolume(f32),
     /// Toggle / set mute state for the per-process audio session.
     SetMute(bool),
+    /// Set the maximum number of album-art tiles shown in the Collage tab.
+    /// Snapped server-side to a power of two in [1, 512].
+    SetCollageTileCap(u32),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -30,15 +33,19 @@ pub enum DockTab {
     Weather,
     Signal,
     Collage,
+    /// QPSK constellation "scope" — animated scatter of synthesized symbol
+    /// samples whose tightness is driven by per-sideband MER from nrsc5.
+    Constellation,
 }
 
 impl DockTab {
     /// All panel variants in the order they should appear in the View menu.
-    pub const ALL: [DockTab; 6] = [
+    pub const ALL: [DockTab; 7] = [
         DockTab::Tuner,
         DockTab::NowPlaying,
         DockTab::Collage,
         DockTab::Signal,
+        DockTab::Constellation,
         DockTab::Traffic,
         DockTab::Weather,
     ];
@@ -50,6 +57,7 @@ impl DockTab {
             DockTab::NowPlaying => "\u{1F3B5} Now Playing",
             DockTab::Collage => "\u{1F5BC} Collage",
             DockTab::Signal => "\u{1F4F6} Signal",
+            DockTab::Constellation => "\u{1F30C} Constellation",
             DockTab::Traffic => "\u{1F697} Traffic",
             DockTab::Weather => "\u{2601} Weather",
         }
@@ -73,6 +81,7 @@ impl TabViewer for DockViewer<'_> {
             DockTab::Weather => "\u{2601} Weather".into(),
             DockTab::Signal => "\u{1F4F6} Signal".into(),
             DockTab::Collage => "\u{1F5BC} Collage".into(),
+            DockTab::Constellation => "\u{1F30C} Constellation".into(),
         }
     }
 
@@ -84,6 +93,7 @@ impl TabViewer for DockViewer<'_> {
             DockTab::Weather => self.weather_ui(ui),
             DockTab::Signal => self.signal_ui(ui),
             DockTab::Collage => self.collage_ui(ui),
+            DockTab::Constellation => self.constellation_ui(ui),
         }
     }
 }
@@ -625,6 +635,207 @@ impl DockViewer<'_> {
         );
     }
 
+    /// QPSK "scope" panel — animated scatter of synthesized symbol samples
+    /// that visually tightens or fuzzes based on per-sideband MER reported
+    /// by nrsc5. Lower-sideband MER governs the spread of samples on the
+    /// left half of the plot; upper-sideband MER governs the right half.
+    ///
+    /// Note: these samples are *generated* from MER, not captured from the
+    /// real demodulator — nrsc5 doesn't expose post-equalizer symbol data
+    /// to us. The cloud shape is statistically faithful (σ ≈ 10^(-MER/20),
+    /// which is the standard EVM relationship) so a well-tuned strong
+    /// station collapses into four crisp dots, and a marginal one smears.
+    fn constellation_ui(&mut self, ui: &mut Ui) {
+        let dim = Color32::from_gray(140);
+        // "Locked" iff nrsc5 has signaled sync and we're actively streaming.
+        // Without a lock we render very wide noise so the panel makes it
+        // obvious nothing is being received.
+        let synced = self.app_state.is_streaming
+            && (self.app_state.nrsc5_status == "synced"
+                || self.app_state.nrsc5_status.starts_with("audio started"));
+        let lock_color = if synced {
+            Color32::from_rgb(60, 170, 90)
+        } else {
+            Color32::from_rgb(200, 70, 70)
+        };
+        let lock_text = if synced { "\u{25CF} LOCK" } else { "\u{25CB} no lock" };
+
+        ui.add_space(2.0);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(lock_text).strong().color(lock_color));
+            ui.add_space(8.0);
+            ui.label(
+                RichText::new(format!(
+                    "MER  L {:>5.1} dB   U {:>5.1} dB",
+                    self.app_state.mer_lower, self.app_state.mer_upper,
+                ))
+                .monospace()
+                .color(dim),
+            );
+        });
+        ui.add_space(4.0);
+
+        // Allocate a square viewport — constellations only look right at 1:1.
+        let avail = ui.available_size();
+        let side = avail.x.min(avail.y).max(80.0);
+        let (rect, _resp) =
+            ui.allocate_exact_size(Vec2::new(side, side), egui::Sense::hover());
+        let painter = ui.painter_at(rect);
+
+        // Dark "oscilloscope" backdrop, independent of light/dark theme so the
+        // phosphor-green samples stay legible either way.
+        let scope_bg = Color32::from_rgb(8, 12, 14);
+        painter.rect_filled(rect, egui::CornerRadius::same(4), scope_bg);
+
+        // Map normalized symbol coords (±1.6 view window) into the square.
+        let cx = rect.center().x;
+        let cy = rect.center().y;
+        let scale = (side * 0.5) / 1.6;
+        let to_screen = |x: f32, y: f32| -> egui::Pos2 {
+            // Invert Y so +Q is up, matching textbook constellation diagrams.
+            egui::pos2(cx + x * scale, cy - y * scale)
+        };
+
+        // Faint unit-magnitude gridlines through ±1, then brighter I/Q axes.
+        let grid = Color32::from_rgb(28, 60, 40);
+        let axis = Color32::from_rgb(50, 110, 70);
+        for &v in &[-1.0f32, 1.0] {
+            painter.line_segment(
+                [to_screen(v, -1.5), to_screen(v, 1.5)],
+                egui::Stroke::new(0.5, grid),
+            );
+            painter.line_segment(
+                [to_screen(-1.5, v), to_screen(1.5, v)],
+                egui::Stroke::new(0.5, grid),
+            );
+        }
+        painter.line_segment(
+            [to_screen(0.0, -1.5), to_screen(0.0, 1.5)],
+            egui::Stroke::new(0.8, axis),
+        );
+        painter.line_segment(
+            [to_screen(-1.5, 0.0), to_screen(1.5, 0.0)],
+            egui::Stroke::new(0.8, axis),
+        );
+
+        // Crosshairs at the four ideal QPSK symbol locations.
+        let target = Color32::from_rgba_unmultiplied(200, 255, 220, 90);
+        for &sx in &[-1.0f32, 1.0] {
+            for &sy in &[-1.0f32, 1.0] {
+                let c = to_screen(sx, sy);
+                painter.line_segment(
+                    [c - egui::vec2(5.0, 0.0), c + egui::vec2(5.0, 0.0)],
+                    egui::Stroke::new(1.0, target),
+                );
+                painter.line_segment(
+                    [c - egui::vec2(0.0, 5.0), c + egui::vec2(0.0, 5.0)],
+                    egui::Stroke::new(1.0, target),
+                );
+            }
+        }
+
+        // Ring buffer + RNG state, lazily initialized on first paint.
+        const RING: usize = 1024;
+        const NEW_PER_FRAME: usize = 24;
+        let st = &mut self.app_state;
+        if st.constellation_samples.len() != RING {
+            st.constellation_samples = vec![[0.0_f32, 0.0_f32]; RING];
+            st.constellation_head = 0;
+        }
+        if st.constellation_rng == 0 {
+            // Mix in a per-run salt so two side-by-side instances don't look
+            // identical; the exact seed doesn't matter as long as it's nonzero.
+            st.constellation_rng = 0x9E37_79B9_7F4A_7C15
+                ^ (std::time::Instant::now().elapsed().as_nanos() as u64)
+                    .wrapping_mul(0xD2B7_4407_B1CE_6E93);
+            if st.constellation_rng == 0 {
+                st.constellation_rng = 0xA5A5_A5A5_A5A5_A5A5;
+            }
+        }
+
+        // EVM ≈ 10^(-MER/20). Clamped so a 30 dB station doesn't show *zero*
+        // jitter (looks dead) and a -5 dB one doesn't extend off-screen.
+        fn sigma_from_mer(mer_db: f32, synced: bool) -> f32 {
+            if !synced || !mer_db.is_finite() {
+                return 1.2;
+            }
+            let lin = 10f32.powf(-mer_db / 20.0);
+            lin.clamp(0.03, 1.4)
+        }
+        let sigma_l_target = sigma_from_mer(st.mer_lower, synced);
+        let sigma_u_target = sigma_from_mer(st.mer_upper, synced);
+
+        // Low-pass the displayed σ so 1 Hz MER ticks become a smooth
+        // tightening/loosening of the cloud instead of a visible step.
+        // α=0.08 ≈ quarter-second settle at 30 fps, which reads as a
+        // satisfying "locking on" animation when MER rapidly improves.
+        if st.constellation_sigma_l <= 0.0 {
+            st.constellation_sigma_l = sigma_l_target;
+            st.constellation_sigma_u = sigma_u_target;
+        } else {
+            st.constellation_sigma_l +=
+                (sigma_l_target - st.constellation_sigma_l) * 0.08;
+            st.constellation_sigma_u +=
+                (sigma_u_target - st.constellation_sigma_u) * 0.08;
+        }
+        let sigma_l = st.constellation_sigma_l;
+        let sigma_u = st.constellation_sigma_u;
+
+        // Push fresh samples. Bits 0/1 of the RNG word pick which QPSK
+        // symbol; Gaussian noise from box_muller is scaled by the σ for
+        // whichever sideband that symbol falls into.
+        for _ in 0..NEW_PER_FRAME {
+            let bits = xorshift64(&mut st.constellation_rng);
+            let bx = if (bits & 1) == 0 { -1.0_f32 } else { 1.0 };
+            let by = if (bits & 2) == 0 { -1.0_f32 } else { 1.0 };
+            let sigma = if bx < 0.0 { sigma_l } else { sigma_u };
+            let nx = box_muller(&mut st.constellation_rng) * sigma;
+            let ny = box_muller(&mut st.constellation_rng) * sigma;
+            let idx = st.constellation_head;
+            st.constellation_samples[idx] = [bx + nx, by + ny];
+            st.constellation_head = (idx + 1) % RING;
+        }
+
+        // Draw oldest → newest so the freshest samples overdraw stale ones.
+        // Alpha ramps from 30 (oldest) to 220 (newest), giving the cloud a
+        // subtle motion-trail / phosphor-persistence feel.
+        for i in 0..RING {
+            let buf_idx = (st.constellation_head + i) % RING;
+            let p = st.constellation_samples[buf_idx];
+            let pos = to_screen(p[0], p[1]);
+            if !rect.contains(pos) {
+                continue;
+            }
+            let age01 = i as f32 / (RING - 1) as f32;
+            let alpha = (30.0 + age01 * 190.0) as u8;
+            let color = Color32::from_rgba_unmultiplied(80, 240, 140, alpha);
+            painter.circle_filled(pos, 1.6, color);
+        }
+
+        // Tiny axis legends in the corners ("I" right, "Q" top) for the
+        // SDR-aficionado vibe.
+        let label_color = Color32::from_rgba_unmultiplied(120, 200, 150, 180);
+        let font = egui::FontId::monospace(10.0);
+        painter.text(
+            egui::pos2(rect.max.x - 10.0, cy - 6.0),
+            egui::Align2::RIGHT_BOTTOM,
+            "I",
+            font.clone(),
+            label_color,
+        );
+        painter.text(
+            egui::pos2(cx + 6.0, rect.min.y + 2.0),
+            egui::Align2::LEFT_TOP,
+            "Q",
+            font,
+            label_color,
+        );
+
+        // Keep animating at ~30 Hz while the tab is visible.
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_millis(33));
+    }
+
     fn collage_ui(&mut self, ui: &mut Ui) {
         let dim = Color32::from_gray(120);
         let tiles = self.app_state.art_tiles.clone();
@@ -641,7 +852,9 @@ impl DockViewer<'_> {
             return;
         }
 
-        // Header strip showing session age and unique-art count.
+        // Header strip showing session age, unique-art count, and a small
+        // tile-cap stepper. Cap snaps to powers of two so a "geeky"
+        // 1/2/4/8/.../512 progression is the only thing the user can pick.
         let session_label = match self.app_state.art_session_started {
             Some(t) => {
                 let secs = t.elapsed().as_secs().min(8 * 3600);
@@ -659,12 +872,39 @@ impl DockViewer<'_> {
             }
             None => format!("{} covers", tiles.len()),
         };
+        let cap = self.app_state.collage_tile_cap.clamp(1, 512);
         ui.horizontal(|ui| {
             ui.label(
                 RichText::new(session_label)
                     .small()
                     .color(Color32::from_gray(150)),
             );
+            ui.add_space(12.0);
+            ui.label(
+                RichText::new("tiles")
+                    .small()
+                    .color(Color32::from_gray(150)),
+            );
+            let halve = ui
+                .add_enabled(cap > 1, egui::Button::new("\u{2212}").small())
+                .on_hover_text("Halve the tile cap");
+            if halve.clicked() {
+                self.commands
+                    .push(UiCommand::SetCollageTileCap((cap / 2).max(1)));
+            }
+            ui.label(
+                RichText::new(format!("{cap}"))
+                    .small()
+                    .monospace()
+                    .color(Color32::from_gray(200)),
+            );
+            let dbl = ui
+                .add_enabled(cap < 512, egui::Button::new("+").small())
+                .on_hover_text("Double the tile cap (max 512)");
+            if dbl.clicked() {
+                self.commands
+                    .push(UiCommand::SetCollageTileCap((cap * 2).min(512)));
+            }
         });
         ui.add_space(4.0);
 
@@ -677,40 +917,45 @@ impl DockViewer<'_> {
             .iter()
             .map(|t| (t.count.max(1) as f64, t.path.clone()))
             .collect();
-        let placements = squarified_treemap(&weights, rect);
-
-        // Find max count for relative font sizing on play-count overlay.
-        let max_count = tiles.iter().map(|t| t.count).max().unwrap_or(1);
+        let placements = square_grid_pack(&weights, rect);
 
         for ((tile_rect, _placement_path), tile) in
             placements.into_iter().zip(tiles.iter())
         {
             let path = &tile.path;
-            let count = tile.count;
-            // Tiny gap between tiles.
-            let outer = tile_rect.shrink(1.0);
+            // Paint into the full treemap cell with no inter-tile gap so
+            // covers butt right up against each other. Album art is 1:1, so
+            // when the cell isn't square we center-crop the source via the
+            // UV rect (object-fit: cover) -- this keeps the visible portion
+            // proportional rather than anamorphically squishing the cover.
+            let outer = tile_rect;
             if outer.width() < 8.0 || outer.height() < 8.0 {
                 continue;
             }
-            // Album art is always 1:1; fit a centred square inside the
-            // treemap cell so covers never stretch. Any leftover space stays
-            // as the tab's background colour (mostly invisible since the
-            // treemap already tries to keep cells near-square).
-            let side = outer.width().min(outer.height());
-            let inner = egui::Rect::from_center_size(
-                outer.center(),
-                egui::vec2(side, side),
-            );
+            let aspect = outer.width() / outer.height();
+            let uv = if aspect >= 1.0 {
+                // Cell wider than tall: trim top/bottom of the square cover.
+                let crop = (1.0 - 1.0 / aspect) * 0.5;
+                egui::Rect::from_min_max(
+                    egui::pos2(0.0, crop),
+                    egui::pos2(1.0, 1.0 - crop),
+                )
+            } else {
+                // Cell taller than wide: trim left/right of the square cover.
+                let crop = (1.0 - aspect) * 0.5;
+                egui::Rect::from_min_max(
+                    egui::pos2(crop, 0.0),
+                    egui::pos2(1.0 - crop, 1.0),
+                )
+            };
             let uri = format!("file:///{}", path.replace('\\', "/"));
-            egui::Image::new(&uri)
-                .corner_radius(3)
-                .paint_at(ui, inner);
+            egui::Image::new(&uri).uv(uv).paint_at(ui, outer);
 
             // Hover region with a tooltip listing the album and every unique
             // song we've seen displayed with this cover.
             if !tile.songs.is_empty() || !tile.album.is_empty() {
                 let id = egui::Id::new(("art_tile", path));
-                let resp = ui.interact(inner, id, egui::Sense::hover());
+                let resp = ui.interact(outer, id, egui::Sense::hover());
                 let album = tile.album.clone();
                 let songs = tile.songs.clone();
                 resp.on_hover_ui(|ui| {
@@ -730,42 +975,6 @@ impl DockViewer<'_> {
                         ui.label(line);
                     }
                 });
-            }
-
-            // For tiles representing a "dominant" cover (>=2 plays *and* big
-            // enough to be readable), overlay the play count in the corner.
-            if count >= 2 && inner.width() >= 60.0 && inner.height() >= 60.0 {
-                let intensity =
-                    (count as f32 / max_count.max(1) as f32).clamp(0.4, 1.0);
-                let badge_color = Color32::from_rgba_unmultiplied(
-                    0,
-                    0,
-                    0,
-                    (180.0 * intensity) as u8,
-                );
-                let text = format!("\u{00d7}{count}");
-                let font = egui::FontId::proportional(
-                    (inner.height() * 0.15).clamp(12.0, 28.0),
-                );
-                let painter = ui.painter().with_clip_rect(inner);
-                let galley = painter.layout_no_wrap(
-                    text.clone(),
-                    font.clone(),
-                    Color32::WHITE,
-                );
-                let pad = egui::vec2(6.0, 2.0);
-                let badge_size = galley.size() + pad * 2.0;
-                let badge_pos = egui::pos2(
-                    inner.max.x - badge_size.x - 4.0,
-                    inner.max.y - badge_size.y - 4.0,
-                );
-                let badge_rect = egui::Rect::from_min_size(badge_pos, badge_size);
-                painter.rect_filled(
-                    badge_rect,
-                    egui::CornerRadius::same(4),
-                    badge_color,
-                );
-                painter.galley(badge_pos + pad, galley, Color32::WHITE);
             }
         }
     }
@@ -798,12 +1007,171 @@ fn signal_badge(ui: &mut Ui, label: &str, value: &str, color: Color32) {
         });
 }
 
+/// Discrete-size square-tile layout for the album-art collage. Unlike the
+/// proportional treemap (which produces variable-aspect rectangles), this
+/// packer puts every cover into a perfect square whose side is a small
+/// integer multiple of a base cell. Heavy-rotation covers get 6x6-cell
+/// squares, singletons get 1x1, and a skyline packer drops them in
+/// largest-first so there are no gaps.
+///
+/// Returns a `Vec<(Rect, payload)>` in the **same order as the input** so
+/// the caller can keep pairing placements with its own ordered tile list.
+/// Tiles that didn't fit are returned with a zero-sized rect; the caller
+/// already skips anything below an 8px minimum.
+fn square_grid_pack(
+    items: &[(f64, String)],
+    rect: egui::Rect,
+) -> Vec<(egui::Rect, String)> {
+    let n = items.len();
+    if n == 0 || rect.width() <= 0.0 || rect.height() <= 0.0 {
+        return Vec::new();
+    }
+
+    // Quantile-bucket each item into a side multiplier. Top 0.5% mega-hits
+    // are huge, next 2.5% heavy, next 7% medium-heavy, next 20% medium,
+    // remainder singletons. Adapts gracefully to any tile cap.
+    let mut rank_order: Vec<usize> = (0..n).collect();
+    rank_order.sort_by(|&a, &b| {
+        items[b]
+            .0
+            .partial_cmp(&items[a].0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut sizes = vec![1usize; n];
+    for (rank, &orig_idx) in rank_order.iter().enumerate() {
+        let frac = rank as f64 / n as f64;
+        sizes[orig_idx] = if frac < 0.005 {
+            6
+        } else if frac < 0.03 {
+            4
+        } else if frac < 0.10 {
+            3
+        } else if frac < 0.30 {
+            2
+        } else {
+            1
+        };
+    }
+
+    // Pick a base cell size so the total area used by the buckets fits the
+    // available rect. Cells are kept exactly square (cell = min of the two
+    // axis-fit sizes) so every placed tile is a perfect square.
+    let total_cells: f64 = sizes.iter().map(|&s| (s * s) as f64).sum();
+    let area = rect.width() as f64 * rect.height() as f64;
+    let base = (area / total_cells.max(1.0)).sqrt().max(4.0);
+    let cols = ((rect.width() as f64 / base).floor() as usize).max(1);
+    let rows = ((rect.height() as f64 / base).floor() as usize).max(1);
+    let cell = (rect.width() / cols as f32).min(rect.height() / rows as f32);
+
+    // Clamp every bucket size to what the grid can actually hold. With very
+    // small tile counts the quantile bucketing assigns a 6x6 "mega" tile
+    // but the grid may only be 3 rows tall -- without this cap the packer's
+    // s > rows check silently drops that tile and the collage looks like
+    // it's missing a cover.
+    let max_dim = cols.min(rows).max(1);
+    for s in sizes.iter_mut() {
+        if *s > max_dim {
+            *s = max_dim;
+        }
+    }
+
+    // Scattered placement: process tiles largest-first so the big ones
+    // always find a home, but for any tile bigger than 1x1 pick a random
+    // valid position rather than the lowest-skyline corner. Singletons
+    // (1x1) then fall back to a tight first-fit scan to plug the holes.
+    //
+    // The RNG is seeded from the combined tile-path hash so the layout is
+    // deterministic for a given set of covers (no frame-to-frame jitter)
+    // but changes naturally when new art arrives.
+    let mut rng_state: u64 = 0x9E37_79B9_7F4A_7C15;
+    for (_, p) in items.iter() {
+        // FNV-1a-ish folding of the path bytes into the seed.
+        for b in p.as_bytes() {
+            rng_state ^= *b as u64;
+            rng_state = rng_state.wrapping_mul(0x100000001b3);
+        }
+    }
+    fn next_rand(state: &mut u64) -> u64 {
+        // LCG from Numerical Recipes -- not cryptographic, just a stable
+        // way to spread big tiles across the grid.
+        *state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        *state
+    }
+
+    let mut occupied = vec![vec![false; rows]; cols];
+    let mut placement_rects: Vec<egui::Rect> = vec![
+        egui::Rect::from_min_size(egui::Pos2::ZERO, egui::Vec2::ZERO);
+        n
+    ];
+
+    let mut pack_order: Vec<usize> = (0..n).collect();
+    pack_order.sort_by(|&a, &b| sizes[b].cmp(&sizes[a]));
+
+    for &i in &pack_order {
+        let s = sizes[i];
+        if s > cols || s > rows {
+            continue;
+        }
+        // Collect every valid (c, r) where an s x s block is fully clear.
+        let mut valid: Vec<(usize, usize)> = Vec::new();
+        let max_c = cols - s;
+        let max_r = rows - s;
+        'outer: for c in 0..=max_c {
+            'inner: for r in 0..=max_r {
+                for dx in 0..s {
+                    for dy in 0..s {
+                        if occupied[c + dx][r + dy] {
+                            continue 'inner;
+                        }
+                    }
+                }
+                valid.push((c, r));
+                // Singletons only need the first hit for a tight fill.
+                if s == 1 {
+                    break 'outer;
+                }
+            }
+        }
+        if valid.is_empty() {
+            continue;
+        }
+        let (c0, r0) = if s >= 2 {
+            // Pick a deterministic-pseudo-random valid spot so big tiles
+            // scatter across the grid instead of clumping in one corner.
+            let idx = (next_rand(&mut rng_state) as usize) % valid.len();
+            valid[idx]
+        } else {
+            valid[0]
+        };
+        for dx in 0..s {
+            for dy in 0..s {
+                occupied[c0 + dx][r0 + dy] = true;
+            }
+        }
+        let min = egui::pos2(
+            rect.min.x + c0 as f32 * cell,
+            rect.min.y + r0 as f32 * cell,
+        );
+        let size = egui::vec2(s as f32 * cell, s as f32 * cell);
+        placement_rects[i] = egui::Rect::from_min_size(min, size);
+    }
+
+    placement_rects
+        .into_iter()
+        .zip(items.iter())
+        .map(|(r, (_, p))| (r, p.clone()))
+        .collect()
+}
+
 /// Squarified-treemap layout (Bruls/Huijsen/van Wijk 2000). Given a list of
 /// `(weight, payload)` pairs sorted by weight descending and a bounding `Rect`,
 /// returns a `Vec<(Rect, payload)>` partitioning the rect into rectangles whose
 /// areas are proportional to weights and whose aspect ratios are kept as close
 /// to 1:1 as possible. This is what makes the album-art tiles "look right"
 /// instead of getting stretched into skinny strips.
+#[allow(dead_code)]
 fn squarified_treemap(
     items: &[(f64, String)],
     rect: egui::Rect,
@@ -863,6 +1231,7 @@ fn squarified_treemap(
 /// Worst (largest) aspect ratio of any item in `row` if laid out along the
 /// shorter side `w`. Used to decide when to "close" a row in the squarified
 /// treemap algorithm.
+#[allow(dead_code)]
 fn worst_ratio(row: &[(f64, String)], w: f64) -> f64 {
     if w <= 0.0 {
         return f64::INFINITY;
@@ -888,6 +1257,7 @@ fn worst_ratio(row: &[(f64, String)], w: f64) -> f64 {
 
 /// Place a completed row of `(area, payload)` items inside `rect`, returning
 /// the placed rectangles and the remaining area for the next row.
+#[allow(dead_code)]
 fn layout_row(
     row: &[(f64, String)],
     rect: egui::Rect,
@@ -933,4 +1303,43 @@ fn layout_row(
         );
         (placed, new_remaining)
     }
+}
+
+// -- Constellation RNG helpers ---------------------------------------------
+//
+// We don't pull in a full RNG crate just for the constellation panel: a
+// xorshift64 seeded from the system clock is plenty for visualization-only
+// jitter, and keeps the dependency footprint flat.
+
+/// Xorshift64 step. State must be nonzero on entry; never returns 0.
+fn xorshift64(s: &mut u64) -> u64 {
+    let mut x = *s;
+    if x == 0 {
+        x = 0x9E37_79B9_7F4A_7C15;
+    }
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    *s = x;
+    x
+}
+
+/// Uniform float in [0, 1) using the high 53 bits of one xorshift step.
+fn rand_unit(s: &mut u64) -> f32 {
+    let v = xorshift64(s) >> 11;
+    (v as f64 / (1u64 << 53) as f64) as f32
+}
+
+/// Standard-normal sample via Box-Muller. Returns one of the two outputs;
+/// the other is discarded since this is purely for visual jitter and the
+/// cost of computing both is irrelevant here.
+fn box_muller(s: &mut u64) -> f32 {
+    let mut u1 = rand_unit(s);
+    if u1 < 1e-7 {
+        u1 = 1e-7;
+    }
+    let u2 = rand_unit(s);
+    let r = (-2.0 * u1.ln()).sqrt();
+    let theta = std::f32::consts::TAU * u2;
+    r * theta.cos()
 }

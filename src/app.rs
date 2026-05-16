@@ -4,8 +4,9 @@ use crate::ffi::{Nrsc5Process, NrscEvent};
 use crate::gui::dock::{DockTab, DockViewer, UiCommand};
 use crate::gui::state::{AppState, ArtTile};
 use crate::maps::{TrafficMap, WeatherMap};
+use chrono::Utc;
 use egui_dock::{DockArea, DockState, NodeIndex, NodePath, SurfaceIndex};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::thread::JoinHandle;
@@ -13,11 +14,32 @@ use std::time::{Duration, Instant};
 
 /// Hard cap on tracked album-art tiles — prevents the collage from getting
 /// unbounded if a session runs all day on a very busy station.
-const MAX_ART_TILES: usize = 64;
+/// Hard cap on tracked album-art tiles — prevents the collage from getting
+/// silly on long sessions and bounds memory + persistence cost. The actual
+/// displayed cap is read from `AppConfig.collage_max_tiles` (1..=512,
+/// snapped to a power of two) and may be lower than this.
+const ART_TILES_HARD_MAX: usize = 512;
+
+/// Resolve the user's preferred collage tile cap from config, clamping to
+/// the supported range and snapping to the nearest power of two. The UI
+/// only emits exact powers of two, so this only matters for hand-edited
+/// `config.toml` files.
+fn collage_tile_cap(cfg: &AppConfig) -> usize {
+    (cfg.collage_max_tiles.max(1) as usize)
+        .min(ART_TILES_HARD_MAX)
+        .next_power_of_two()
+        .min(ART_TILES_HARD_MAX)
+}
 /// Rolling window for the album-art collage. Plays older than this are
 /// pruned on every new event so the heat-map keeps moving instead of
 /// freezing.
 const ART_WINDOW: Duration = Duration::from_secs(8 * 60 * 60);
+/// Minimum time between successive *counted* plays of the exact same cover.
+/// nrsc5 re-emits XHDR pointing at the same LOT image many times while a
+/// song plays; without this cooldown, a 4-minute song can rack up dozens
+/// of phantom plays. Stations almost never back-to-back two songs from the
+/// same album, so a 4-minute floor is safe.
+const ART_COUNT_COOLDOWN: Duration = Duration::from_secs(4 * 60);
 
 /// One unique image observed in the rolling collage window.
 #[derive(Debug, Clone)]
@@ -104,9 +126,10 @@ pub struct Nrsc5App {
     /// content hash so re-emissions of the same bytes — even under different
     /// LOT filenames — collapse into a single tile.
     art_history: HashMap<u64, ArtEntry>,
-    /// Last cover-art path we counted, used to debounce repeated XHDR
-    /// emissions while the same song is playing.
-    last_counted_art_path: Option<String>,
+    /// Persistent on-disk cache so the collage survives restarts. `None`
+    /// only if the local data dir couldn't be resolved/created, in which
+    /// case the collage falls back to in-memory-only behavior.
+    art_cache: Option<crate::art_cache::ArtCache>,
     /// Last time we pruned expired plays from `art_history`. Throttled so
     /// we don't walk the map every UI frame.
     last_art_prune_at: Option<Instant>,
@@ -141,6 +164,13 @@ impl Nrsc5App {
             .map(|n| n.aas_dir().to_path_buf())
             .unwrap_or_else(|| std::env::temp_dir().join("nrsc5-tui-aas"));
 
+        // Open the on-disk art cache and load any history from previous
+        // sessions. Failure here is non-fatal — we just start with an
+        // empty collage and degrade to in-memory-only behavior.
+        let art_cache = crate::art_cache::ArtCache::new();
+        let (art_history, art_tiles, art_session_started) =
+            restore_art_history(art_cache.as_ref(), collage_tile_cap(&config));
+
         Self {
             app_state: AppState {
                 frequency_mhz: config.frequency_mhz,
@@ -150,6 +180,14 @@ impl Nrsc5App {
                 nrsc5_status,
                 volume: config.volume.clamp(0.0, 1.0),
                 muted: config.muted,
+                // Default to "present" + "probe available" so the no-SDR
+                // overlay only appears once we've actually probed and seen
+                // zero devices — avoids a flash on launch.
+                sdr_present: true,
+                sdr_probe_available: true,
+                art_tiles,
+                art_session_started,
+                collage_tile_cap: collage_tile_cap(&config) as u32,
                 ..AppState::default()
             },
             dock_state,
@@ -166,8 +204,8 @@ impl Nrsc5App {
             #[cfg(target_os = "windows")]
             volume_ctl: crate::winaudio::ProcessVolumeControl::new(),
             last_session_probe_at: None,
-            art_history: HashMap::new(),
-            last_counted_art_path: None,
+            art_history,
+            art_cache,
             last_art_prune_at: None,
             closed_tab_locations: HashMap::new(),
             prev_layout: LayoutSnapshot::default(),
@@ -307,6 +345,14 @@ impl eframe::App for Nrsc5App {
         // volume slider becomes usable once playback starts.
         self.poll_audio_session();
 
+        // Probe librtlsdr for attached devices every ~2 s so the no-SDR
+        // overlay below reflects the current state of the USB bus.
+        self.poll_sdr_presence(ui.ctx());
+
+        // Render the "no SDR detected" overlay last so it sits on top of the
+        // dock when applicable. Self-dismissing as soon as a dongle appears.
+        self.render_no_sdr_overlay(ui.ctx());
+
         // Keep the rolling 8-hour collage window honest even in quiet periods
         // by pruning expired plays roughly once a minute.
         self.maybe_prune_art_history();
@@ -327,6 +373,12 @@ impl eframe::App for Nrsc5App {
         self.config.volume = self.app_state.volume;
         self.config.muted = self.app_state.muted;
         save_config(&self.config);
+
+        // Last-chance flush of the album-art history. The cache is also
+        // written incrementally on every play event so a hard crash still
+        // preserves most of the data — this just covers any tail changes
+        // (e.g. expirations from a prune that happened after the last play).
+        self.persist_art_history();
     }
 }
 
@@ -541,17 +593,137 @@ impl Nrsc5App {
         }
     }
 
-    /// Update the album-art heat-map histogram with a newly-displayed cover.
-    /// Dedupes by content hash so the same image transmitted under different
-    /// LOT IDs still counts as one tile, and debounces same-path emissions
-    /// while a song is still playing.
-    fn record_album_art(&mut self, full_path: &std::path::Path, path_str: &str) {
-        // Debounce: only count when the displayed art *transitions* to a new
-        // path. Repeated XHDR pings for the same song should not inflate the
-        // count.
-        if self.last_counted_art_path.as_deref() == Some(path_str) {
+    /// Probe `librtlsdr` for the number of attached RTL-SDR devices and
+    /// update `app_state.sdr_present` / `sdr_probe_available`. Throttled to
+    /// roughly one probe every two seconds. If the probe is unavailable on
+    /// this system (DLL missing), we silently mark it so and never show the
+    /// no-SDR overlay — a false "missing" warning would be worse than no
+    /// warning at all.
+    fn poll_sdr_presence(&mut self, ctx: &egui::Context) {
+        let now = Instant::now();
+        let due = self
+            .app_state
+            .sdr_last_probed
+            .map(|t| now.duration_since(t) >= Duration::from_millis(2000))
+            .unwrap_or(true);
+        if !due {
             return;
         }
+        self.app_state.sdr_last_probed = Some(now);
+
+        match crate::sdr_detect::device_count() {
+            Some(n) => {
+                self.app_state.sdr_probe_available = true;
+                self.app_state.sdr_present = n > 0;
+            }
+            None => {
+                self.app_state.sdr_probe_available = false;
+                self.app_state.sdr_present = true;
+            }
+        }
+
+        // While the overlay is showing, ensure egui keeps repainting even
+        // if the user isn't interacting — otherwise we'd stop polling.
+        if self.app_state.sdr_probe_available && !self.app_state.sdr_present {
+            ctx.request_repaint_after(Duration::from_millis(2100));
+        }
+    }
+
+    /// Render the centered "no SDR detected" panel on top of the dock when
+    /// we've confirmed no RTL-SDR is attached and we're not already
+    /// streaming. The overlay is informational only — the rest of the UI
+    /// remains usable behind it (so users can still arrange panels and
+    /// configure presets), and it self-dismisses the moment a device shows
+    /// up on the next probe tick.
+    fn render_no_sdr_overlay(&mut self, ctx: &egui::Context) {
+        if !self.app_state.sdr_probe_available
+            || self.app_state.sdr_present
+            || self.app_state.is_streaming
+        {
+            return;
+        }
+
+        let mut refresh_clicked = false;
+        egui::Area::new(egui::Id::new("no-sdr-overlay"))
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .order(egui::Order::Foreground)
+            .interactable(true)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style())
+                    .fill(egui::Color32::from_rgb(28, 32, 42))
+                    .stroke(egui::Stroke::new(
+                        1.0,
+                        egui::Color32::from_rgb(90, 120, 180),
+                    ))
+                    .corner_radius(egui::CornerRadius::same(10))
+                    .inner_margin(egui::Margin::same(24))
+                    .show(ui, |ui| {
+                        ui.set_max_width(380.0);
+                        ui.vertical_centered(|ui| {
+                            ui.label(
+                                egui::RichText::new("\u{1F4F6}")
+                                    .size(56.0),
+                            );
+                            ui.add_space(2.0);
+                            ui.label(
+                                egui::RichText::new("No SDR detected")
+                                    .heading()
+                                    .color(egui::Color32::from_rgb(
+                                        230, 200, 110,
+                                    )),
+                            );
+                            ui.add_space(10.0);
+                            ui.label(
+                                egui::RichText::new(
+                                    "Plug in your RTL-SDR dongle, then click Refresh.",
+                                )
+                                .size(14.0),
+                            );
+                            ui.add_space(4.0);
+                            ui.label(
+                                egui::RichText::new(
+                                    "(or just wait \u{2014} we keep checking)",
+                                )
+                                .small()
+                                .color(egui::Color32::from_gray(150)),
+                            );
+                            ui.add_space(16.0);
+                            let btn = ui.add_sized(
+                                [140.0, 30.0],
+                                egui::Button::new(
+                                    egui::RichText::new("\u{21BB}  Refresh")
+                                        .strong()
+                                        .color(egui::Color32::from_gray(230)),
+                                )
+                                .fill(egui::Color32::from_rgb(60, 95, 160)),
+                            );
+                            if btn.clicked() {
+                                refresh_clicked = true;
+                            }
+                        });
+                    });
+            });
+
+        if refresh_clicked {
+            // Force the next frame to re-probe immediately rather than
+            // waiting for the 2-second cadence to elapse.
+            self.app_state.sdr_last_probed = None;
+            ctx.request_repaint();
+        }
+    }
+
+    /// Update the album-art heat-map histogram with a newly-displayed cover.
+    /// Dedupes by content hash so the same image transmitted under different
+    /// LOT IDs still counts as one tile, and enforces `ART_COUNT_COOLDOWN`
+    /// between successive counted plays of the same hash so a single song's
+    /// repeated XHDR emissions don't inflate the count.
+    ///
+    /// Also takes ownership of the cover-display lifecycle: sets
+    /// `app_state.cover_art_path` to the durable cache copy when we have one
+    /// (falling back to the AAS-dump path otherwise), and deletes the
+    /// redundant AAS-dump file after a successful cache write so the temp
+    /// dir doesn't accumulate ~50 KB per song forever.
+    fn record_album_art(&mut self, full_path: &std::path::Path, path_str: &str) {
         let now = Instant::now();
         // Anchor the session timestamp on the first art event so the UI can
         // still report "how long you've been listening" — it's now purely
@@ -571,11 +743,54 @@ impl Nrsc5App {
             });
         }
         let Ok(bytes) = std::fs::read(full_path) else {
+            // Couldn't read the dump — fall back to the AAS path so the
+            // live cover at least *tries* to load. Don't delete anything.
+            self.app_state.cover_art_path = Some(path_str.to_string());
             return;
         };
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         bytes.hash(&mut hasher);
         let key = hasher.finish();
+
+        // Per-hash cooldown. If we counted this exact image less than
+        // `ART_COUNT_COOLDOWN` ago, treat this XHDR as a re-broadcast of
+        // the same in-progress song rather than a new play. Still redirect
+        // the live cover to the existing cache copy and prune the new AAS
+        // dump — its contents are byte-identical to what we already have.
+        if let Some(existing) = self.art_history.get(&key) {
+            if let Some(&last) = existing.plays.back() {
+                if now.duration_since(last) < ART_COUNT_COOLDOWN {
+                    let cached_path = existing.path.clone();
+                    self.app_state.cover_art_path = Some(cached_path.clone());
+                    // Only delete the AAS dump if we actually have a cache
+                    // path to fall back on (cached_path != AAS path).
+                    if self.art_cache.is_some() && cached_path != path_str {
+                        let _ = std::fs::remove_file(full_path);
+                    }
+                    return;
+                }
+            }
+        }
+
+        // Copy the image bytes into our persistent cache. On success we use
+        // the cache path as the authoritative location for both the live
+        // cover display and the heat-map tile; on failure we keep the AAS
+        // dump in place as a fallback.
+        let cached_path: Option<String> = self.art_cache.as_ref().and_then(|cache| {
+            cache
+                .store_image(key, &bytes, full_path)
+                .map(|p| p.to_string_lossy().into_owned())
+        });
+        let resolved_path = cached_path
+            .clone()
+            .unwrap_or_else(|| path_str.to_string());
+
+        // Live cover display follows the cache when possible.
+        self.app_state.cover_art_path = Some(resolved_path.clone());
+        // With a durable cache copy in hand, the AAS-dir dump is dead weight.
+        if cached_path.is_some() {
+            let _ = std::fs::remove_file(full_path);
+        }
 
         // Grab the song metadata currently on display so we can label this
         // cover later in tooltips. Trim and skip empty pieces so we don't
@@ -585,14 +800,15 @@ impl Nrsc5App {
         let album = self.app_state.album.trim().to_string();
 
         let entry = self.art_history.entry(key).or_insert_with(|| ArtEntry {
-            path: path_str.to_string(),
+            path: resolved_path.clone(),
             plays: VecDeque::new(),
             songs: Vec::new(),
             album: album.clone(),
         });
         entry.plays.push_back(now);
-        // Always refresh path — a re-emitted image may live at a new LOT path.
-        entry.path = path_str.to_string();
+        // Always refresh path — a re-emitted image may live at a new LOT path,
+        // and on first load from disk we want to upgrade to the cache path.
+        entry.path = resolved_path.clone();
         if !album.is_empty() {
             entry.album = album;
         }
@@ -606,26 +822,39 @@ impl Nrsc5App {
                 entry.songs.push(pair);
             }
         }
-        self.last_counted_art_path = Some(path_str.to_string());
         self.rebuild_art_tiles();
+        self.persist_art_history();
     }
 
-    /// Rebuild the AppState's sorted tile list from `art_history`.
+    /// Rebuild the AppState's tile list from `art_history`. We first keep
+    /// the top `collage_tile_cap()` covers by play count (so the heat-map
+    /// always shows the actual heavy-rotation winners) and then re-order
+    /// the survivors by *arrival* — the timestamp of the oldest play still
+    /// inside the rolling window. The squarified-treemap algorithm works on
+    /// any order; passing arrival order instead of count-desc scatters the
+    /// big tiles through the layout rather than clumping them to one side.
     fn rebuild_art_tiles(&mut self) {
-        let mut tiles: Vec<ArtTile> = self
+        let cap = collage_tile_cap(&self.config);
+        let mut entries: Vec<(&ArtEntry, Instant)> = self
             .art_history
             .values()
-            .map(|e| ArtTile {
+            .filter_map(|e| e.plays.front().map(|t| (e, *t)))
+            .collect();
+        // Step 1: keep the most-played covers within the tile cap.
+        entries.sort_by(|a, b| b.0.plays.len().cmp(&a.0.plays.len()));
+        entries.truncate(cap);
+        // Step 2: re-order the survivors by arrival so spatial layout
+        // reflects "order they came in", not "how many plays".
+        entries.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.path.cmp(&b.0.path)));
+        self.app_state.art_tiles = entries
+            .into_iter()
+            .map(|(e, _)| ArtTile {
                 path: e.path.clone(),
                 count: e.plays.len() as u32,
                 songs: e.songs.clone(),
                 album: e.album.clone(),
             })
             .collect();
-        // Sort by count desc, then by path for stable layout.
-        tiles.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.path.cmp(&b.path)));
-        tiles.truncate(MAX_ART_TILES);
-        self.app_state.art_tiles = tiles;
     }
 
     /// Throttled background prune so the rolling collage window keeps moving
@@ -662,7 +891,69 @@ impl Nrsc5App {
         });
         if any_changed || before != self.art_history.len() {
             self.rebuild_art_tiles();
+            self.persist_art_history();
         }
+    }
+
+    /// Serialize the in-memory `art_history` map to disk so the collage
+    /// survives restarts. Converts each `Instant` play timestamp to Unix
+    /// milliseconds via the wall-clock offset between `Instant::now()` and
+    /// `Utc::now()` at call time. Best-effort: writes are atomic via a
+    /// .tmp + rename, and any failure is logged but never escalated.
+    ///
+    /// Also runs a one-shot orphan sweep of the cache directory so files
+    /// left over from expired entries are removed promptly.
+    fn persist_art_history(&self) {
+        let Some(cache) = self.art_cache.as_ref() else {
+            return;
+        };
+
+        let now_inst = Instant::now();
+        let now_utc_ms = Utc::now().timestamp_millis();
+
+        let mut entries: Vec<crate::art_cache::PersistedEntry> =
+            Vec::with_capacity(self.art_history.len());
+        let mut keep: HashSet<String> = HashSet::with_capacity(self.art_history.len());
+
+        for (hash, entry) in &self.art_history {
+            // Convert Instant → wall-clock millis by subtracting the play's
+            // age (in monotonic time) from the current wall-clock now.
+            let plays_unix_ms: Vec<i64> = entry
+                .plays
+                .iter()
+                .map(|t| {
+                    let age = now_inst.saturating_duration_since(*t);
+                    now_utc_ms - age.as_millis() as i64
+                })
+                .collect();
+
+            // Derive the cache-relative filename from the live path so we
+            // don't depend on string conventions outside this module.
+            let filename = std::path::Path::new(&entry.path)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| {
+                    crate::art_cache::ArtCache::filename_for(
+                        *hash,
+                        std::path::Path::new(&entry.path),
+                    )
+                });
+            keep.insert(filename.clone());
+
+            entries.push(crate::art_cache::PersistedEntry {
+                hash: *hash,
+                filename,
+                plays_unix_ms,
+                songs: entry.songs.clone(),
+                album: entry.album.clone(),
+            });
+        }
+
+        if let Err(e) = cache.save_manifest(entries) {
+            eprintln!("art-cache: failed to save manifest: {e}");
+        }
+        cache.sweep_orphans(&keep);
     }
 
     fn handle_nrsc5_event(&mut self, evt: NrscEvent) {
@@ -686,6 +977,8 @@ impl Nrsc5App {
             }
             NrscEvent::Mer { lower, upper } => {
                 self.app_state.mer = (lower + upper) / 2.0;
+                self.app_state.mer_lower = lower;
+                self.app_state.mer_upper = upper;
             }
             NrscEvent::Ber { cber } => {
                 self.app_state.ber = cber;
@@ -784,8 +1077,10 @@ impl Nrsc5App {
                     if full_path.exists() {
                         let path_str = full_path.to_string_lossy().to_string();
                         if param == 0 {
-                            // Cover art
-                            self.app_state.cover_art_path = Some(path_str.clone());
+                            // Cover art. `record_album_art` sets
+                            // `cover_art_path` itself (preferring the durable
+                            // cache copy) and prunes the AAS-dir dump after
+                            // a successful cache write.
                             self.record_album_art(&full_path, &path_str);
                         } else if param == 1 {
                             // Station logo
@@ -850,12 +1145,12 @@ impl Nrsc5App {
                 self.app_state.is_streaming = true;
                 self.start_requested_at = Some(Instant::now());
                 self.last_signal_at = None;
-                // A fresh Start (after Stop) resets the 8-hour collage horizon
-                // and clears any accumulated tiles.
-                self.art_history.clear();
-                self.last_counted_art_path = None;
-                self.app_state.art_tiles.clear();
-                self.app_state.art_session_started = Some(Instant::now());
+                // Note: we deliberately do NOT clear the collage here. The
+                // 8-hour rolling window already prunes stale plays on its
+                // own, and the on-disk cache makes the heat-map persistent
+                // across Start/Stop and full app restarts. A user-driven
+                // "wipe collage" affordance can live on the Collage tab if
+                // we ever need one.
                 self.app_state.nrsc5_status = format!(
                     "started {mhz:.1} MHz HD{}; waiting for sync...",
                     program + 1
@@ -1035,6 +1330,22 @@ impl Nrsc5App {
                 self.app_state.muted = mute;
                 self.config.muted = mute;
                 self.apply_mute();
+            }
+            UiCommand::SetCollageTileCap(value) => {
+                // Snap to nearest power of two in [1, ART_TILES_HARD_MAX]. The
+                // UI only ever emits exact powers of two, but defensive
+                // clamping protects against hand-edited configs.
+                let snapped = (value.max(1) as usize)
+                    .min(ART_TILES_HARD_MAX)
+                    .next_power_of_two()
+                    .min(ART_TILES_HARD_MAX) as u32;
+                if self.config.collage_max_tiles == snapped {
+                    return;
+                }
+                self.config.collage_max_tiles = snapped;
+                self.app_state.collage_tile_cap = snapped;
+                self.rebuild_art_tiles();
+                save_config(&self.config);
             }
         }
     }
@@ -1334,6 +1645,94 @@ const DEFAULT_DOCK_RON: &str = r#"(
     ),
 )"#;
 
+/// Restore the persisted album-art history from disk and produce three
+/// pieces of state the constructor needs: the rebuilt `art_history` map
+/// (live `Instant`-based timestamps), the sorted `ArtTile` list, and a
+/// best-guess `art_session_started` Instant derived from the oldest
+/// persisted play.
+///
+/// Entries with no plays inside the 8-hour rolling window are discarded.
+/// Entries whose backing image file is missing on disk are also dropped.
+fn restore_art_history(
+    cache: Option<&crate::art_cache::ArtCache>,
+    cap: usize,
+) -> (HashMap<u64, ArtEntry>, Vec<ArtTile>, Option<Instant>) {
+    let mut map: HashMap<u64, ArtEntry> = HashMap::new();
+    let mut tiles: Vec<ArtTile> = Vec::new();
+    let mut oldest_play: Option<Instant> = None;
+
+    let Some(cache) = cache else {
+        return (map, tiles, None);
+    };
+
+    let now_inst = Instant::now();
+    let now_utc_ms = Utc::now().timestamp_millis();
+    let cutoff_ms = now_utc_ms.saturating_sub(ART_WINDOW.as_millis() as i64);
+
+    for entry in cache.load_manifest() {
+        let abs_path = cache.dir().join(&entry.filename);
+        if !abs_path.exists() {
+            // Manifest references a file we no longer have. Skip it; the
+            // sweep on the next save will tidy the manifest itself.
+            continue;
+        }
+        // Drop expired plays and convert the survivors to monotonic
+        // Instants by subtracting their wall-clock age from `now_inst`.
+        let mut plays: VecDeque<Instant> = VecDeque::new();
+        for ms in entry.plays_unix_ms {
+            if ms < cutoff_ms {
+                continue;
+            }
+            let age_ms = (now_utc_ms - ms).max(0) as u64;
+            let age = Duration::from_millis(age_ms);
+            if let Some(inst) = now_inst.checked_sub(age) {
+                plays.push_back(inst);
+            }
+        }
+        if plays.is_empty() {
+            continue;
+        }
+        if let Some(front) = plays.front() {
+            oldest_play = Some(
+                oldest_play
+                    .map(|cur| cur.min(*front))
+                    .unwrap_or(*front),
+            );
+        }
+        let path = abs_path.to_string_lossy().into_owned();
+        map.insert(
+            entry.hash,
+            ArtEntry {
+                path,
+                plays,
+                songs: entry.songs,
+                album: entry.album,
+            },
+        );
+    }
+
+    // Mirror `Nrsc5App::rebuild_art_tiles` so the collage paints correctly
+    // on the very first frame after restore, before any new event arrives.
+    let mut entries: Vec<(&ArtEntry, Instant)> = map
+        .values()
+        .filter_map(|e| e.plays.front().map(|t| (e, *t)))
+        .collect();
+    entries.sort_by(|a, b| b.0.plays.len().cmp(&a.0.plays.len()));
+    entries.truncate(cap);
+    entries.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.path.cmp(&b.0.path)));
+    tiles = entries
+        .into_iter()
+        .map(|(e, _)| ArtTile {
+            path: e.path.clone(),
+            count: e.plays.len() as u32,
+            songs: e.songs.clone(),
+            album: e.album.clone(),
+        })
+        .collect();
+
+    (map, tiles, oldest_play)
+}
+
 /// Build the initial dock layout. Tries the captured RON first; falls back
 /// to a hand-built docked layout if parsing fails (e.g. after a future
 /// egui_dock version bump changes the serialization shape).
@@ -1348,8 +1747,10 @@ fn default_dock_state() -> DockState<DockTab> {
     let mut ds = DockState::new(vec![DockTab::NowPlaying]);
     let tree = ds.main_surface_mut();
     let [_old, left] = tree.split_left(NodeIndex::root(), 0.25, vec![DockTab::Tuner]);
+    // Signal + Constellation share a leaf so the user can flip between the
+    // numeric MER/BER readout and the visual scope without rearranging.
     let [_old_left, _left_bottom] =
-        tree.split_below(left, 0.35, vec![DockTab::Signal]);
+        tree.split_below(left, 0.35, vec![DockTab::Signal, DockTab::Constellation]);
     let [_old_root, right] =
         tree.split_right(NodeIndex::root(), 0.32, vec![DockTab::Traffic]);
     let [_old_right, _right_bottom] = tree.split_below(right, 0.5, vec![DockTab::Weather]);

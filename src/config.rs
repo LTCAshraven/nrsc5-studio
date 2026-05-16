@@ -24,10 +24,19 @@ pub struct AppConfig {
     pub volume: f32,
     #[serde(default)]
     pub muted: bool,
+    /// Maximum number of tiles shown in the album-art collage. The UI
+    /// snaps this to powers of two in [1, 512]; manual edits outside the
+    /// range are clamped on load.
+    #[serde(default = "default_collage_max_tiles")]
+    pub collage_max_tiles: u32,
 }
 
 fn default_volume() -> f32 {
     1.0
+}
+
+fn default_collage_max_tiles() -> u32 {
+    64
 }
 
 impl Default for AppConfig {
@@ -43,6 +52,7 @@ impl Default for AppConfig {
             presets: Vec::new(),
             volume: 1.0,
             muted: false,
+            collage_max_tiles: 64,
         }
     }
 }

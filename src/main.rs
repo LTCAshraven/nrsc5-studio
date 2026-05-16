@@ -4,12 +4,14 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod art_cache;
 mod collage;
 mod config;
 mod ffi;
 mod gui;
 mod icon;
 mod maps;
+mod sdr_detect;
 #[cfg(target_os = "windows")]
 mod winaudio;
 

@@ -45,6 +45,14 @@ impl TrafficMap {
         // Parse: TMT_{provider}_{X}_{Y}_{YYYYMMDD}_{HHMM}_{HEX}.png
         // We need X (1-3) and Y (1-3) to place the tile.
         if let Some((row, col)) = parse_tmt_position(raw) {
+            // If we already had a tile at this grid position, the previous
+            // file is dead — nrsc5 just dumped a fresher version under a
+            // new LOT ID. Delete the stale one so AAS doesn't accumulate.
+            if let Some(prev) = self.tiles[row][col].take() {
+                if prev != filename {
+                    let _ = std::fs::remove_file(self.aas_dir.join(&prev));
+                }
+            }
             self.tiles[row][col] = Some(filename.to_string());
 
             // Check if all 9 tiles are present.
@@ -58,9 +66,17 @@ impl TrafficMap {
         false
     }
 
-    /// Clear all tiles (e.g. on retune).
+    /// Clear all tiles (e.g. on retune). Best-effort delete the still-tracked
+    /// tile files so an old station's traffic tiles don't linger across a
+    /// retune.
     pub fn clear(&mut self) {
-        self.tiles = Default::default();
+        for row in 0..3 {
+            for col in 0..3 {
+                if let Some(name) = self.tiles[row][col].take() {
+                    let _ = std::fs::remove_file(self.aas_dir.join(&name));
+                }
+            }
+        }
         self.completed_path = None;
     }
 
@@ -122,6 +138,11 @@ pub struct WeatherMap {
     /// byte identical — we skip those instead of cluttering the animation
     /// with duplicate frames.
     last_overlay_hash: Option<u64>,
+    /// Whether the most recently composited frame used a real cropped
+    /// basemap. If a DWRO arrives before any DWRI/cached basemap is
+    /// available, the frame is rendered onto a dark fallback fill — we want
+    /// to throw that frame away once the real basemap finally lands.
+    last_frame_had_basemap: bool,
 }
 
 impl WeatherMap {
@@ -137,6 +158,7 @@ impl WeatherMap {
             frames: Vec::new(),
             frame_counter: 0,
             last_overlay_hash: None,
+            last_frame_had_basemap: false,
         };
 
         // nrsc5 deduplicates LOT files it has already received, so on a station
@@ -152,9 +174,28 @@ impl WeatherMap {
         let Ok(entries) = std::fs::read_dir(&self.aas_dir) else {
             return;
         };
+        // First pass: prefer a DWRI text file, which gives us both the
+        // coordinates and the area id so we know the cached basemap matches
+        // the current station.
+        let mut cached_basemap: Option<(std::path::PathBuf, std::time::SystemTime)> = None;
         for entry in entries.flatten() {
             let name = entry.file_name();
             let Some(name_str) = name.to_str() else { continue };
+            // Track the freshest cached BaseMap so we can fall back to it if
+            // no DWRI is on disk yet. This avoids the "first DWRO arrives
+            // before the broadcast cycle re-sends DWRI, so the first
+            // composite frame has no basemap" bug.
+            if name_str.starts_with("BaseMap_") && name_str.ends_with(".png") {
+                if let Ok(meta) = entry.metadata() {
+                    if let Ok(mtime) = meta.modified() {
+                        match &cached_basemap {
+                            Some((_, prev)) if *prev >= mtime => {}
+                            _ => cached_basemap = Some((entry.path(), mtime)),
+                        }
+                    }
+                }
+                continue;
+            }
             let raw = match name_str.find('_') {
                 Some(i) => &name_str[i + 1..],
                 None => continue,
@@ -164,6 +205,14 @@ impl WeatherMap {
                 if self.base_map_path.is_some() {
                     return;
                 }
+            }
+        }
+        // No DWRI on disk yet -- use the cached BaseMap as a starter. The
+        // next DWRI broadcast will reconcile area_id/coordinates and (if
+        // needed) rebuild the basemap for the actual station.
+        if self.base_map_path.is_none() {
+            if let Some((path, _)) = cached_basemap {
+                self.base_map_path = Some(path);
             }
         }
     }
@@ -192,6 +241,7 @@ impl WeatherMap {
         self.area_id = None;
         self.base_map_path = None;
         self.last_overlay_hash = None;
+        self.last_frame_had_basemap = false;
         // Best-effort delete old composited frames so the AAS dir doesn't grow
         // unbounded across sessions.
         for frame in &self.frames {
@@ -237,11 +287,24 @@ impl WeatherMap {
             // Rebuild base map if area changed.
             let changed = self.area_id.as_deref() != Some(&id)
                 || self.coordinates != Some(coords);
+            let had_basemap_before = self.base_map_path.is_some();
             self.area_id = Some(id.clone());
             self.coordinates = Some(coords);
             if changed {
                 self.base_map_path = None; // force rebuild
                 self.make_base_map(&id, coords);
+            }
+            // If we previously composited frames against the dark fallback
+            // (no real basemap), they look broken — drop them now that the
+            // basemap is available so the next DWRO re-renders cleanly. Also
+            // clear the dedup hash so an identical DWRO will be re-accepted.
+            let basemap_just_arrived = !had_basemap_before && self.base_map_path.is_some();
+            if (basemap_just_arrived || changed) && !self.last_frame_had_basemap && !self.frames.is_empty() {
+                for frame in &self.frames {
+                    let _ = std::fs::remove_file(&frame.path);
+                }
+                self.frames.clear();
+                self.last_overlay_hash = None;
             }
         }
     }
@@ -311,8 +374,10 @@ impl WeatherMap {
         let target_size = 981u32;
 
         // Try to load the cropped base map; fall back to a solid dark background.
+        let mut had_basemap = false;
         let mut canvas = if let Some(ref base_path) = self.base_map_path {
             if let Ok(base) = image::open(base_path) {
+                had_basemap = true;
                 image::imageops::resize(
                     &base.to_rgba8(),
                     target_size,
@@ -361,6 +426,11 @@ impl WeatherMap {
         if DynamicImage::ImageRgba8(canvas).save(&out_path).is_err() {
             return false;
         }
+        self.last_frame_had_basemap = had_basemap;
+        // The raw DWRO overlay has been baked into the composited frame and
+        // we never re-read it. Delete it so the AAS dir doesn't accumulate
+        // ~50 KB per overlay forever across long sessions.
+        let _ = std::fs::remove_file(&overlay_path);
         self.frames.push(WeatherFrame {
             path: out_path.to_string_lossy().to_string(),
             captured_at: Local::now(),
