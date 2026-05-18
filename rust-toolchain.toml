@@ -1,0 +1,8 @@
+[toolchain]
+# Project ships its own llvm-mingw at .toolchains/llvm-mingw-20260505-ucrt-x86_64/
+# and links via the gnullvm sysroot. Pinning here so plain `cargo build` /
+# `cargo run` from the workspace root just works without `+` toolchain
+# selection or the cargo-gnu.ps1 wrapper. build.rs prepends the bundled
+# toolchain bin to PATH so windres / dlltool are discoverable during the
+# embed-resource step.
+channel = "stable-x86_64-pc-windows-gnullvm"

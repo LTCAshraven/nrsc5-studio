@@ -12,11 +12,55 @@ fn main() {
     // non-Windows targets and warns (rather than failing the build) if the
     // resource compiler is missing.
     if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        ensure_bundled_toolchain_on_path();
         embed_app_icon();
     }
 
     // Optional bindgen generation, gated by NRSC5_GENERATE_BINDINGS.
     generate_bindings();
+}
+
+/// If the project's bundled llvm-mingw toolchain is present, prepend its
+/// `bin/` directory to PATH and create the `windres.exe` / `dlltool.exe`
+/// aliases that some host-tool code looks for under their non-prefixed
+/// names. Makes plain `cargo build` / `cargo run` from the workspace root
+/// "just work" without manual PATH setup or going through cargo-gnu.ps1.
+fn ensure_bundled_toolchain_on_path() {
+    let Some(manifest_dir) = env::var_os("CARGO_MANIFEST_DIR").map(PathBuf::from) else {
+        return;
+    };
+    let bin = manifest_dir
+        .join(".toolchains")
+        .join("llvm-mingw-20260505-ucrt-x86_64")
+        .join("bin");
+    if !bin.is_dir() {
+        return;
+    }
+
+    // Create canonical aliases for tools that embed_resource and similar
+    // host-side helpers look up by their unprefixed names. llvm-mingw ships
+    // them as `x86_64-w64-mingw32-{tool}.exe`; copy a same-named alias the
+    // first time we're invoked. Failures are non-fatal — the worst case is
+    // the user falls back to cargo-gnu.ps1.
+    for (alias, source) in [
+        ("windres.exe", "x86_64-w64-mingw32-windres.exe"),
+        ("dlltool.exe", "x86_64-w64-mingw32-dlltool.exe"),
+    ] {
+        let alias_path = bin.join(alias);
+        let source_path = bin.join(source);
+        if !alias_path.exists() && source_path.exists() {
+            let _ = std::fs::copy(&source_path, &alias_path);
+        }
+    }
+
+    // Prepend the bin dir to PATH for the rest of this build.rs invocation
+    // (and for any child processes embed_resource spawns).
+    let current_path = env::var_os("PATH").unwrap_or_default();
+    let mut paths: Vec<PathBuf> = vec![bin.clone()];
+    paths.extend(env::split_paths(&current_path));
+    if let Ok(new_path) = env::join_paths(paths) {
+        env::set_var("PATH", new_path);
+    }
 }
 
 fn embed_app_icon() {

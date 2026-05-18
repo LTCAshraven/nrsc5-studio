@@ -1,5 +1,6 @@
 use crate::config::Preset;
-use crate::gui::state::AppState;
+use crate::gui::state::{AppState, LogViewMode};
+use crate::play_log::PlayLog;
 use egui::{Color32, DragValue, RichText, Ui, Vec2, WidgetText};
 use egui_dock::TabViewer;
 use serde::{Deserialize, Serialize};
@@ -23,6 +24,9 @@ pub enum UiCommand {
     /// Set the maximum number of album-art tiles shown in the Collage tab.
     /// Snapped server-side to a power of two in [1, 512].
     SetCollageTileCap(u32),
+    /// Write the current play log to a CSV file. App resolves the path and
+    /// surfaces it through `AppState::log_export_status`.
+    ExportLogCsv,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -36,18 +40,27 @@ pub enum DockTab {
     /// QPSK constellation "scope" — animated scatter of synthesized symbol
     /// samples whose tightness is driven by per-sideband MER from nrsc5.
     Constellation,
+    /// 24-hour rolling song log. Closed by default; opened from the panel
+    /// toolbar.
+    Log,
+    /// SDR# / Gqrx-style spectrum + waterfall. Fed by the piped-SDR
+    /// FFT tap; renders idle when the tap has no data (e.g. before the
+    /// first Start, or in legacy USB / rtl_tcp modes).
+    Spectrum,
 }
 
 impl DockTab {
     /// All panel variants in the order they should appear in the View menu.
-    pub const ALL: [DockTab; 7] = [
+    pub const ALL: [DockTab; 9] = [
         DockTab::Tuner,
         DockTab::NowPlaying,
         DockTab::Collage,
+        DockTab::Spectrum,
         DockTab::Signal,
         DockTab::Constellation,
         DockTab::Traffic,
         DockTab::Weather,
+        DockTab::Log,
     ];
 
     /// Compact label (emoji + short name) for the top-toolbar tab toggles.
@@ -56,10 +69,12 @@ impl DockTab {
             DockTab::Tuner => "\u{1F4FB} Tuner",
             DockTab::NowPlaying => "\u{1F3B5} Now Playing",
             DockTab::Collage => "\u{1F5BC} Collage",
+            DockTab::Spectrum => "\u{1F4CA} Spectrum",
             DockTab::Signal => "\u{1F4F6} Signal",
             DockTab::Constellation => "\u{1F30C} Constellation",
             DockTab::Traffic => "\u{1F697} Traffic",
             DockTab::Weather => "\u{2601} Weather",
+            DockTab::Log => "\u{1F4DD} Log",
         }
     }
 }
@@ -68,6 +83,7 @@ pub struct DockViewer<'a> {
     pub app_state: &'a mut AppState,
     pub commands: &'a mut Vec<UiCommand>,
     pub presets: &'a [Preset],
+    pub play_log: &'a PlayLog,
 }
 
 impl TabViewer for DockViewer<'_> {
@@ -82,6 +98,8 @@ impl TabViewer for DockViewer<'_> {
             DockTab::Signal => "\u{1F4F6} Signal".into(),
             DockTab::Collage => "\u{1F5BC} Collage".into(),
             DockTab::Constellation => "\u{1F30C} Constellation".into(),
+            DockTab::Log => "\u{1F4DD} Log".into(),
+            DockTab::Spectrum => "\u{1F4CA} Spectrum".into(),
         }
     }
 
@@ -94,6 +112,8 @@ impl TabViewer for DockViewer<'_> {
             DockTab::Signal => self.signal_ui(ui),
             DockTab::Collage => self.collage_ui(ui),
             DockTab::Constellation => self.constellation_ui(ui),
+            DockTab::Log => self.log_ui(ui),
+            DockTab::Spectrum => self.spectrum_ui(ui),
         }
     }
 }
@@ -593,6 +613,305 @@ impl DockViewer<'_> {
         });
     }
 
+    /// SDR# / Gqrx-style spectrum + waterfall.
+    ///
+    /// Top half: live FFT line with a translucent gradient fill from the
+    /// trace down to the baseline, painted as a per-vertex-colored
+    /// triangle strip mesh, with a faint dB grid and frequency labels
+    /// overlaid. The HD digital sidebands (±129..±199 kHz from carrier)
+    /// are highlighted as faint colored regions so the user can see the
+    /// shoulders rise above the FM analog signal.
+    ///
+    /// Bottom half: rolling waterfall, 256 rows × 1024 bins. Each row is
+    /// a snapshot of the FFT mapped through a turbo-style colormap. The
+    /// texture is regenerated only when the spectrum tap's generation
+    /// counter advances; in-between frames just re-blit the cached image.
+    ///
+    /// Driven by [`crate::dsp::SpectrumTap`] which is fed by the piped
+    /// I/Q thread (see [`crate::ffi::Nrsc5Process::start_piped`]). When
+    /// the tap is absent or has no data, the panel renders a centered
+    /// "no data yet" message; the legacy USB and rtl_tcp paths don't
+    /// surface raw I/Q to us, so the panel is most useful in piped mode.
+    fn spectrum_ui(&mut self, ui: &mut Ui) {
+        use crate::dsp::{FFT_SIZE, WATERFALL_ROWS};
+        use egui::{
+            epaint::{Mesh, Vertex},
+            pos2, vec2, Color32, ColorImage, Pos2, Rect, Sense, Shape, Stroke,
+            TextureOptions,
+        };
+
+        let dim = Color32::from_gray(140);
+
+        // Header: live frequency + sample rate readout.
+        ui.add_space(2.0);
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(format!(
+                    "{:.4} MHz",
+                    self.app_state.frequency_mhz
+                ))
+                .monospace()
+                .strong(),
+            );
+            ui.add_space(8.0);
+            ui.label(
+                RichText::new("span 1.488 Msps")
+                    .small()
+                    .color(dim),
+            );
+            ui.add_space(8.0);
+            if !self.app_state.is_streaming {
+                ui.label(
+                    RichText::new("(stopped \u{2014} press Start to feed the FFT)")
+                        .small()
+                        .color(dim),
+                );
+            }
+        });
+        ui.add_space(2.0);
+
+        // Hand back if there's no tap installed at all (e.g. backend
+        // failed to initialize). The panel is informative even then,
+        // because a future Start might wire one up.
+        let Some(tap) = self.app_state.spectrum_tap.clone() else {
+            ui.centered_and_justified(|ui| {
+                ui.label(
+                    RichText::new("Spectrum unavailable: SDR backend not initialized")
+                        .color(dim),
+                );
+            });
+            return;
+        };
+
+        // Snapshot the current state. Allocations happen only on the
+        // first paint or after a resize of the underlying buffers.
+        tap.snapshot_into(&mut self.app_state.spectrum_snapshot);
+        let generation = self.app_state.spectrum_snapshot.generation;
+
+        // Reserve the full panel area, then split 40% spectrum / 60%
+        // waterfall vertically.
+        let total_rect = ui.available_rect_before_wrap();
+        let split_y = total_rect.top() + total_rect.height() * 0.40;
+        let spec_rect = Rect::from_min_max(total_rect.min, pos2(total_rect.right(), split_y));
+        let wf_rect = Rect::from_min_max(pos2(total_rect.left(), split_y + 2.0), total_rect.max);
+        ui.allocate_rect(total_rect, Sense::hover());
+        let painter = ui.painter_at(total_rect);
+
+        // Background panels (slightly different shades so the split is
+        // visually obvious without a hard divider).
+        let bg_spec = Color32::from_rgb(8, 10, 16);
+        let bg_wf = Color32::from_rgb(4, 5, 10);
+        painter.rect_filled(spec_rect, egui::CornerRadius::same(2), bg_spec);
+        painter.rect_filled(wf_rect, egui::CornerRadius::same(2), bg_wf);
+
+        // ---- Spectrum trace + fill ------------------------------------------------
+
+        // Map dB → pixel y. Top of `spec_rect` = -10 dB, bottom = -100 dB.
+        const DB_TOP: f32 = -10.0;
+        const DB_BOT: f32 = -100.0;
+        let db_to_y = |db: f32| -> f32 {
+            let t = ((db - DB_BOT) / (DB_TOP - DB_BOT)).clamp(0.0, 1.0);
+            spec_rect.bottom() - t * spec_rect.height()
+        };
+
+        // dB gridlines every 20 dB.
+        let grid_color = Color32::from_rgb(28, 36, 52);
+        let mut db_mark = DB_TOP;
+        while db_mark >= DB_BOT {
+            let y = db_to_y(db_mark);
+            painter.line_segment(
+                [pos2(spec_rect.left(), y), pos2(spec_rect.right(), y)],
+                Stroke::new(0.6, grid_color),
+            );
+            painter.text(
+                pos2(spec_rect.left() + 4.0, y - 2.0),
+                egui::Align2::LEFT_BOTTOM,
+                format!("{:.0}", db_mark),
+                egui::FontId::monospace(9.0),
+                Color32::from_rgb(110, 130, 160),
+            );
+            db_mark -= 20.0;
+        }
+
+        // HD sideband shading: the digital sidebands are bands of
+        // 0.129..0.199 of the sample rate either side of center.
+        let sample_rate = self.app_state.spectrum_snapshot.sample_rate_sps;
+        if sample_rate > 1.0 {
+            let bin_hz = sample_rate / FFT_SIZE as f32;
+            let nyquist = sample_rate * 0.5;
+            // Convert a "Hz from center" offset to a pixel x.
+            let hz_to_x = |hz: f32| -> f32 {
+                let t = (hz + nyquist) / (2.0 * nyquist);
+                spec_rect.left() + t.clamp(0.0, 1.0) * spec_rect.width()
+            };
+            let hd_inner = 129_000.0;
+            let hd_outer = 199_000.0;
+            let hd_color = Color32::from_rgba_unmultiplied(80, 160, 255, 18);
+            painter.rect_filled(
+                Rect::from_min_max(
+                    pos2(hz_to_x(-hd_outer), spec_rect.top()),
+                    pos2(hz_to_x(-hd_inner), spec_rect.bottom()),
+                ),
+                egui::CornerRadius::ZERO,
+                hd_color,
+            );
+            painter.rect_filled(
+                Rect::from_min_max(
+                    pos2(hz_to_x(hd_inner), spec_rect.top()),
+                    pos2(hz_to_x(hd_outer), spec_rect.bottom()),
+                ),
+                egui::CornerRadius::ZERO,
+                hd_color,
+            );
+            let _ = bin_hz;
+        }
+
+        // Build the spectrum line + filled triangle strip. We sample
+        // FFT_SIZE bins across the rect width; if the rect is narrower
+        // than FFT_SIZE we downsample by stepping.
+        let spec = &self.app_state.spectrum_snapshot.spectrum_db;
+        let n = spec.len().max(1);
+        let width = spec_rect.width().max(1.0);
+        let columns = (width.round() as usize).clamp(64, n);
+        let trace_color = Color32::from_rgb(220, 230, 255);
+        let fill_top = Color32::from_rgba_unmultiplied(80, 150, 255, 200);
+        let fill_bottom = Color32::from_rgba_unmultiplied(20, 50, 120, 30);
+
+        let mut mesh = Mesh::default();
+        let mut trace_pts: Vec<Pos2> = Vec::with_capacity(columns);
+        for i in 0..columns {
+            let x = spec_rect.left() + (i as f32 / (columns as f32 - 1.0)) * width;
+            // Pick the max bin in this column's slice for a "peak hold"
+            // feel that doesn't average away thin carrier spikes.
+            let bin_start = (i * n) / columns;
+            let bin_end = (((i + 1) * n) / columns).max(bin_start + 1).min(n);
+            let mut peak = f32::NEG_INFINITY;
+            for k in bin_start..bin_end {
+                if spec[k] > peak {
+                    peak = spec[k];
+                }
+            }
+            let y_top = db_to_y(peak);
+            let y_bot = spec_rect.bottom();
+            // Top vertex (line color, alpha fade based on dB height).
+            let h = ((peak - DB_BOT) / (DB_TOP - DB_BOT)).clamp(0.0, 1.0);
+            let top_col = lerp_color(fill_bottom, fill_top, h);
+            let idx_top = mesh.vertices.len() as u32;
+            mesh.vertices.push(Vertex {
+                pos: pos2(x, y_top),
+                uv: egui::epaint::WHITE_UV,
+                color: top_col,
+            });
+            mesh.vertices.push(Vertex {
+                pos: pos2(x, y_bot),
+                uv: egui::epaint::WHITE_UV,
+                color: fill_bottom,
+            });
+            if i > 0 {
+                // Two triangles per quad between this column and the previous.
+                let p = idx_top - 2; // previous top
+                let q = idx_top - 1; // previous bottom
+                let r = idx_top; // this top
+                let s = idx_top + 1; // this bottom
+                mesh.indices.extend_from_slice(&[p, q, s, p, s, r]);
+            }
+            trace_pts.push(pos2(x, y_top));
+        }
+        painter.add(Shape::mesh(mesh));
+        // Crisp trace line on top of the fill.
+        painter.add(Shape::line(trace_pts, Stroke::new(1.2, trace_color)));
+
+        // Frequency labels along the bottom of the spectrum rect.
+        let center_mhz = self.app_state.spectrum_snapshot.center_freq_hz / 1_000_000.0;
+        let half_span_mhz = sample_rate as f64 / 2.0 / 1_000_000.0;
+        for slot in 0..=4 {
+            let t = slot as f32 / 4.0;
+            let x = spec_rect.left() + t * spec_rect.width();
+            let mhz = center_mhz - half_span_mhz + (t as f64) * 2.0 * half_span_mhz;
+            painter.text(
+                pos2(x, spec_rect.bottom() - 2.0),
+                if slot == 0 {
+                    egui::Align2::LEFT_BOTTOM
+                } else if slot == 4 {
+                    egui::Align2::RIGHT_BOTTOM
+                } else {
+                    egui::Align2::CENTER_BOTTOM
+                },
+                format!("{:.3} MHz", mhz),
+                egui::FontId::monospace(10.0),
+                Color32::from_rgb(150, 170, 200),
+            );
+        }
+
+        // ---- Waterfall ------------------------------------------------------------
+
+        // Rebuild the waterfall texture only when the tap has advanced.
+        if self.app_state.spectrum_texture.is_none()
+            || self.app_state.spectrum_last_drawn_generation != generation
+        {
+            let wf = &self.app_state.spectrum_snapshot.waterfall;
+            let head = self.app_state.spectrum_snapshot.waterfall_head;
+            // We want the NEWEST row at the TOP of the image. The ring's
+            // newest row is one slot before `head` (mod ROWS), and the
+            // oldest row is at `head`. So image row `r` (top-to-bottom)
+            // pulls from ring row `(head + WATERFALL_ROWS - 1 - r)
+            // % WATERFALL_ROWS`.
+            let mut pixels = Vec::with_capacity(WATERFALL_ROWS * FFT_SIZE);
+            for r in 0..WATERFALL_ROWS {
+                let ring_row = (head + WATERFALL_ROWS - 1 - r) % WATERFALL_ROWS;
+                let row_start = ring_row * FFT_SIZE;
+                for k in 0..FFT_SIZE {
+                    pixels.push(turbo_colormap(wf[row_start + k]));
+                }
+            }
+            let img = ColorImage {
+                size: [FFT_SIZE, WATERFALL_ROWS],
+                pixels,
+                source_size: vec2(FFT_SIZE as f32, WATERFALL_ROWS as f32),
+            };
+            match self.app_state.spectrum_texture.as_mut() {
+                Some(handle) => handle.set(img, TextureOptions::LINEAR),
+                None => {
+                    let new = ui.ctx().load_texture(
+                        "spectrum_waterfall",
+                        img,
+                        TextureOptions::LINEAR,
+                    );
+                    self.app_state.spectrum_texture = Some(new);
+                }
+            }
+            self.app_state.spectrum_last_drawn_generation = generation;
+        }
+
+        if let Some(tex) = self.app_state.spectrum_texture.as_ref() {
+            let mut mesh = Mesh::with_texture(tex.id());
+            mesh.add_rect_with_uv(
+                wf_rect,
+                Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                Color32::WHITE,
+            );
+            painter.add(Shape::mesh(mesh));
+        }
+
+        // Vertical center-frequency tick across both halves so the
+        // carrier line is obvious.
+        let cx = spec_rect.center().x;
+        painter.line_segment(
+            [pos2(cx, spec_rect.top()), pos2(cx, spec_rect.bottom())],
+            Stroke::new(0.7, Color32::from_rgba_unmultiplied(255, 60, 60, 110)),
+        );
+        painter.line_segment(
+            [pos2(cx, wf_rect.top()), pos2(cx, wf_rect.bottom())],
+            Stroke::new(0.7, Color32::from_rgba_unmultiplied(255, 60, 60, 110)),
+        );
+
+        // Keep repainting while the panel is on screen so we get smooth
+        // waterfall scroll even when no other UI is animating.
+        if self.app_state.is_streaming {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(33));
+        }
+    }
+
     fn signal_ui(&mut self, ui: &mut Ui) {
         let dim = Color32::from_gray(140);
 
@@ -978,6 +1297,243 @@ impl DockViewer<'_> {
             }
         }
     }
+
+    fn log_ui(&mut self, ui: &mut Ui) {
+        // Header strip: title, view toggle, count, export.
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("\u{1F4DD} Log").strong());
+            ui.separator();
+            let mut mode = self.app_state.log_view_mode;
+            ui.selectable_value(&mut mode, LogViewMode::Timeline, "Timeline");
+            ui.selectable_value(&mut mode, LogViewMode::TopPlayed, "Top Played");
+            self.app_state.log_view_mode = mode;
+            ui.separator();
+            let label = match self.play_log.len() {
+                1 => "1 play".to_string(),
+                n => format!("{n} plays"),
+            };
+            ui.label(RichText::new(label).color(Color32::from_gray(170)));
+            ui.label(
+                RichText::new("\u{2022} rolling 24h")
+                    .small()
+                    .color(Color32::from_gray(140)),
+            )
+            .on_hover_text(
+                "The log keeps up to the last 24 hours of plays \
+                 (capped at 5,000 entries). Older entries roll off \
+                 automatically.",
+            );
+            ui.separator();
+            if ui
+                .button("\u{1F4BE} Export CSV")
+                .on_hover_text("Write the current log to a CSV file")
+                .clicked()
+            {
+                self.commands.push(UiCommand::ExportLogCsv);
+            }
+            if let Some(status) = self.app_state.log_export_status.clone() {
+                ui.label(
+                    RichText::new(status)
+                        .small()
+                        .color(Color32::from_rgb(120, 180, 240)),
+                );
+            }
+        });
+        ui.separator();
+
+        if self.play_log.is_empty() {
+            ui.vertical_centered(|ui| {
+                ui.add_space(40.0);
+                ui.label(
+                    RichText::new("No plays logged yet.")
+                        .color(Color32::from_gray(180)),
+                );
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new(
+                        "Tune to a station with HD metadata and listen for a few minutes.",
+                    )
+                    .small()
+                    .color(Color32::from_gray(120)),
+                );
+            });
+            return;
+        }
+
+        match self.app_state.log_view_mode {
+            LogViewMode::Timeline => self.log_timeline_table(ui),
+            LogViewMode::TopPlayed => self.log_top_played_table(ui),
+        }
+
+        // Drop any stale export status if the user clicked elsewhere.
+        if ui.input(|i| i.pointer.any_click()) {
+            self.app_state.log_export_status = None;
+        }
+    }
+
+    fn log_timeline_table(&self, ui: &mut Ui) {
+        use egui_extras::{Column, TableBuilder};
+        // Snapshot to a Vec<&PlayEntry> so we can index by row.
+        let entries: Vec<_> = self.play_log.entries().iter().rev().collect();
+
+        TableBuilder::new(ui)
+            .striped(true)
+            .resizable(true)
+            .column(Column::initial(60.0).at_least(50.0))
+            .column(Column::initial(180.0).at_least(80.0))
+            .column(Column::remainder().at_least(140.0))
+            .column(Column::initial(100.0).at_least(70.0))
+            .header(20.0, |mut h| {
+                h.col(|ui| {
+                    ui.strong("Time");
+                });
+                h.col(|ui| {
+                    ui.strong("Artist");
+                });
+                h.col(|ui| {
+                    ui.strong("Title");
+                });
+                h.col(|ui| {
+                    ui.strong("Station");
+                });
+            })
+            .body(|body| {
+                body.rows(18.0, entries.len(), |mut row| {
+                    let e = entries[row.index()];
+                    row.col(|ui| {
+                        ui.monospace(crate::play_log::fmt_local_hhmm(e.ts_millis));
+                    });
+                    row.col(|ui| {
+                        ui.label(&e.artist);
+                    });
+                    row.col(|ui| {
+                        ui.label(&e.title);
+                    });
+                    row.col(|ui| {
+                        ui.monospace(e.station_label());
+                    });
+                });
+            });
+    }
+
+    fn log_top_played_table(&self, ui: &mut Ui) {
+        use egui_extras::{Column, TableBuilder};
+        use std::collections::HashMap;
+
+        struct Grouped<'a> {
+            title: &'a str,
+            artist: &'a str,
+            plays: u32,
+            last_ts: i64,
+        }
+
+        let mut groups: HashMap<(&str, &str), Grouped> = HashMap::new();
+        for e in self.play_log.entries() {
+            let key = (e.artist.as_str(), e.title.as_str());
+            let g = groups.entry(key).or_insert_with(|| Grouped {
+                title: &e.title,
+                artist: &e.artist,
+                plays: 0,
+                last_ts: 0,
+            });
+            g.plays += 1;
+            if e.ts_millis > g.last_ts {
+                g.last_ts = e.ts_millis;
+            }
+        }
+        let mut grouped: Vec<_> = groups.into_values().collect();
+        grouped.sort_by(|a, b| {
+            b.plays
+                .cmp(&a.plays)
+                .then_with(|| b.last_ts.cmp(&a.last_ts))
+        });
+
+        TableBuilder::new(ui)
+            .striped(true)
+            .resizable(true)
+            .column(Column::initial(50.0).at_least(40.0))
+            .column(Column::initial(180.0).at_least(80.0))
+            .column(Column::remainder().at_least(140.0))
+            .column(Column::initial(70.0).at_least(50.0))
+            .header(20.0, |mut h| {
+                h.col(|ui| {
+                    ui.strong("Plays");
+                });
+                h.col(|ui| {
+                    ui.strong("Artist");
+                });
+                h.col(|ui| {
+                    ui.strong("Title");
+                });
+                h.col(|ui| {
+                    ui.strong("Last");
+                });
+            })
+            .body(|body| {
+                body.rows(18.0, grouped.len(), |mut row| {
+                    let g = &grouped[row.index()];
+                    row.col(|ui| {
+                        ui.monospace(g.plays.to_string());
+                    });
+                    row.col(|ui| {
+                        ui.label(g.artist);
+                    });
+                    row.col(|ui| {
+                        ui.label(g.title);
+                    });
+                    row.col(|ui| {
+                        ui.monospace(crate::play_log::fmt_local_hhmm(g.last_ts));
+                    });
+                });
+            });
+    }
+}
+
+/// Linear interpolation between two `Color32` values in straight-alpha
+/// space. Used to fade the spectrum fill from a bright top edge into a
+/// near-transparent baseline.
+fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
+    let t = t.clamp(0.0, 1.0);
+    let mix = |x: u8, y: u8| -> u8 {
+        let xf = x as f32;
+        let yf = y as f32;
+        (xf + (yf - xf) * t).round().clamp(0.0, 255.0) as u8
+    };
+    Color32::from_rgba_unmultiplied(
+        mix(a.r(), b.r()),
+        mix(a.g(), b.g()),
+        mix(a.b(), b.b()),
+        mix(a.a(), b.a()),
+    )
+}
+
+/// "Turbo"-style colormap (Google's polynomial approximation, simplified).
+/// Maps an 8-bit intensity to a perceptually-uniform blue→cyan→green→
+/// yellow→red gradient. We hand-roll a cheap piecewise-linear version
+/// rather than pulling in another dependency; visually indistinguishable
+/// from the real turbo at the per-pixel sizes we render.
+fn turbo_colormap(v: u8) -> Color32 {
+    // 6-stop gradient: black → deep blue → cyan → yellow → red → white.
+    // Tuned to match the SDR# / Gqrx "waterfall" feel the user asked for.
+    const STOPS: [(u8, u8, u8); 6] = [
+        (0, 0, 16),     // near-black at floor
+        (32, 60, 160),  // deep blue
+        (40, 200, 220), // cyan
+        (240, 220, 60), // yellow
+        (240, 80, 40),  // red-orange
+        (255, 240, 220),// near-white at ceiling
+    ];
+    let t = v as f32 / 255.0;
+    let n = STOPS.len() - 1;
+    let scaled = t * n as f32;
+    let idx = (scaled.floor() as usize).min(n - 1);
+    let frac = scaled - idx as f32;
+    let (r0, g0, b0) = STOPS[idx];
+    let (r1, g1, b1) = STOPS[idx + 1];
+    let mix = |a: u8, b: u8| -> u8 {
+        (a as f32 + (b as f32 - a as f32) * frac).round() as u8
+    };
+    Color32::from_rgb(mix(r0, r1), mix(g0, g1), mix(b0, b1))
 }
 
 /// Render a single rounded colored "pill" with a label and numeric value,

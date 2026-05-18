@@ -7,10 +7,13 @@ mod app;
 mod art_cache;
 mod collage;
 mod config;
+mod dsp;
 mod ffi;
 mod gui;
 mod icon;
 mod maps;
+mod play_log;
+mod sdr;
 mod sdr_detect;
 #[cfg(target_os = "windows")]
 mod winaudio;

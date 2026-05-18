@@ -75,11 +75,28 @@ fn lib() -> Option<&'static ProbeLib> {
     static LIB: OnceLock<Option<ProbeLib>> = OnceLock::new();
     LIB.get_or_init(|| {
         let path = find_librtlsdr()?;
-        // SAFETY: passing an absolute path causes `LoadLibraryExW` to be
-        // called with `LOAD_WITH_ALTERED_SEARCH_PATH`, which adds the DLL's
-        // own directory to the search path. That's how librtlsdr's sibling
-        // `libusb-1.0.dll` in `bin/` resolves correctly.
-        let library = unsafe { libloading::Library::new(&path).ok()? };
+        // SAFETY: load with `LOAD_WITH_ALTERED_SEARCH_PATH` (0x8) so
+        // `librtlsdr.dll`'s own directory (e.g. `bin/`) is the search
+        // base for its dependencies. Otherwise Windows looks in the
+        // calling process's directory, which doesn't contain the
+        // sibling `libusb-1.0.dll` that modern librtlsdr builds
+        // dynamically link against.
+        let library = unsafe {
+            #[cfg(target_os = "windows")]
+            {
+                const LOAD_WITH_ALTERED_SEARCH_PATH: u32 = 0x0000_0008;
+                libloading::os::windows::Library::load_with_flags(
+                    &path,
+                    LOAD_WITH_ALTERED_SEARCH_PATH,
+                )
+                .ok()
+                .map(libloading::Library::from)?
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                libloading::Library::new(&path).ok()?
+            }
+        };
         // SAFETY: `rtlsdr_get_device_count` is a stable librtlsdr export
         // with the documented signature `uint32_t (*)(void)`.
         let get_count: RtlsdrGetDeviceCount = unsafe {

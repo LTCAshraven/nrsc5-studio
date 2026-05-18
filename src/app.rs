@@ -139,6 +139,14 @@ pub struct Nrsc5App {
     /// Layout snapshot from the previous frame, used to detect tabs that
     /// were closed via the dock area's own "X" button.
     prev_layout: LayoutSnapshot,
+    /// 24-hour rolling song log. Survives restarts via RON file under
+    /// `%LOCALAPPDATA%\nrsc5-studio\play-log.ron`.
+    play_log: crate::play_log::PlayLog,
+    /// Unix-millis timestamp of the last new-play cover event. Used to
+    /// gate play-log pushes from the metadata handler so station slogans
+    /// (which arrive via title/artist updates but without a fresh cover)
+    /// don't pollute the log.
+    last_cover_play_at: Option<i64>,
 }
 
 impl Nrsc5App {
@@ -158,6 +166,15 @@ impl Nrsc5App {
             }
             Err(err) => (None, format!("NRSC5 unavailable: {err}")),
         };
+
+        // Install the shared FFT tap so the Spectrum panel has a feed
+        // every time the piped path starts. Done once at app startup
+        // (and again when the backend is recreated on a config switch).
+        let spectrum_tap = crate::dsp::SpectrumTap::new(1_488_375.0);
+        let nrsc5 = nrsc5.map(|mut backend| {
+            backend.set_spectrum_tap(spectrum_tap.clone());
+            backend
+        });
 
         let aas_dir = nrsc5
             .as_ref()
@@ -188,6 +205,7 @@ impl Nrsc5App {
                 art_tiles,
                 art_session_started,
                 collage_tile_cap: collage_tile_cap(&config) as u32,
+                spectrum_tap: Some(spectrum_tap),
                 ..AppState::default()
             },
             dock_state,
@@ -209,6 +227,8 @@ impl Nrsc5App {
             last_art_prune_at: None,
             closed_tab_locations: HashMap::new(),
             prev_layout: LayoutSnapshot::default(),
+            play_log: crate::play_log::PlayLog::load(),
+            last_cover_play_at: None,
         }
     }
 }
@@ -270,6 +290,8 @@ impl eframe::App for Nrsc5App {
             {
                 self.app_state.dark_mode = !self.app_state.dark_mode;
                 Self::apply_theme(ui.ctx(), self.app_state.dark_mode);
+                self.config.dark_mode = self.app_state.dark_mode;
+                save_config(&self.config);
             }
             ui.separator();
             ui.label(
@@ -326,6 +348,7 @@ impl eframe::App for Nrsc5App {
             app_state: &mut self.app_state,
             commands: &mut commands,
             presets: &self.config.presets,
+            play_log: &self.play_log,
         };
         // Snapshot the layout before show_inside so we can detect tabs that
         // the user closes via the "X" button in this frame.
@@ -360,6 +383,12 @@ impl eframe::App for Nrsc5App {
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         eframe::set_value(storage, "dock_state", &self.dock_state);
+        // Flush runtime state to the TOML config too, so a crash or
+        // Task-Manager kill doesn't lose the user's last frequency,
+        // subchannel, theme, volume, or mute state. eframe calls save()
+        // on its own ~30 s auto-save cadence and again on clean exit.
+        self.sync_runtime_to_config();
+        save_config(&self.config);
     }
 
     fn on_exit(&mut self) {
@@ -367,11 +396,7 @@ impl eframe::App for Nrsc5App {
             nrsc5.stop();
         }
 
-        self.config.frequency_mhz = self.app_state.frequency_mhz;
-        self.config.selected_program = self.app_state.selected_program;
-        self.config.dark_mode = self.app_state.dark_mode;
-        self.config.volume = self.app_state.volume;
-        self.config.muted = self.app_state.muted;
+        self.sync_runtime_to_config();
         save_config(&self.config);
 
         // Last-chance flush of the album-art history. The cache is also
@@ -379,10 +404,26 @@ impl eframe::App for Nrsc5App {
         // preserves most of the data — this just covers any tail changes
         // (e.g. expirations from a prune that happened after the last play).
         self.persist_art_history();
+
+        // Same belt-and-braces flush for the rolling play log.
+        self.play_log.save();
     }
 }
 
 impl Nrsc5App {
+    /// Copy the live UI state (frequency, subchannel, theme, volume, mute)
+    /// into the persisted `AppConfig`. Called from both `save()` (eframe's
+    /// periodic ~30 s auto-save) and `on_exit()`, plus a handful of eager
+    /// call sites in command handlers so deliberate user changes survive
+    /// a hard kill even within the auto-save window.
+    fn sync_runtime_to_config(&mut self) {
+        self.config.frequency_mhz = self.app_state.frequency_mhz;
+        self.config.selected_program = self.app_state.selected_program;
+        self.config.dark_mode = self.app_state.dark_mode;
+        self.config.volume = self.app_state.volume;
+        self.config.muted = self.app_state.muted;
+    }
+
     /// Record any tabs that existed in `pre` but are missing from `post`.
     /// Their previous location and neighbours are stashed so the next click
     /// on the panel toolbar can restore them to (roughly) the same spot.
@@ -824,6 +865,36 @@ impl Nrsc5App {
         }
         self.rebuild_art_tiles();
         self.persist_art_history();
+
+        // A genuinely new play just landed (the cover-hash cooldown has
+        // gated this code path). Remember the moment so the metadata
+        // handler can decide whether subsequent title/artist updates
+        // belong to a real song vs. a station-slogan flap, and try to push
+        // the play to the rolling 24-hour log right now.
+        self.last_cover_play_at = Some(crate::play_log::now_millis());
+        self.try_record_play();
+    }
+
+    /// Try to record the currently-displayed song into the rolling play
+    /// log. Idempotent — the log's own gate (pair-equality dedup +
+    /// rate-limit) drops noisy re-calls. Persists on success.
+    fn try_record_play(&mut self) {
+        let now_ms = crate::play_log::now_millis();
+        let title = self.app_state.title.clone();
+        let artist = self.app_state.artist.clone();
+        let freq = self.config.frequency_mhz;
+        let program = self.app_state.selected_program;
+        let call_sign = self.app_state.call_sign.clone();
+        if self.play_log.try_push(
+            now_ms,
+            &title,
+            &artist,
+            freq,
+            program,
+            &call_sign,
+        ) {
+            self.play_log.save();
+        }
     }
 
     /// Rebuild the AppState's tile list from `art_history`. We first keep
@@ -892,6 +963,14 @@ impl Nrsc5App {
         if any_changed || before != self.art_history.len() {
             self.rebuild_art_tiles();
             self.persist_art_history();
+        }
+
+        // Keep the rolling 24-hour play log honest on the same cadence.
+        // Cheap walk — the log holds at most a few hundred entries.
+        let pre = self.play_log.len();
+        self.play_log.prune();
+        if self.play_log.len() != pre {
+            self.play_log.save();
         }
     }
 
@@ -1027,6 +1106,18 @@ impl Nrsc5App {
                 if !genre.is_empty() {
                     self.app_state.genre = genre;
                 }
+
+                // Try to record this metadata update to the play log only
+                // if a fresh cover-art change happened recently. Station
+                // slogans / IDs arrive through the same title/artist
+                // events but without a corresponding cover swap, so this
+                // recent-cover gate filters them out without a blocklist.
+                if let Some(last) = self.last_cover_play_at {
+                    let now_ms = crate::play_log::now_millis();
+                    if now_ms - last < 30_000 {
+                        self.try_record_play();
+                    }
+                }
             }
             NrscEvent::LotFile { lot, name } => {
                 // Try to derive the broadcaster call sign from the filename.
@@ -1113,7 +1204,12 @@ impl Nrsc5App {
 
                 if self.nrsc5.is_none() {
                     match Nrsc5Process::new() {
-                        Ok(p) => self.nrsc5 = Some(p),
+                        Ok(mut p) => {
+                            if let Some(tap) = self.app_state.spectrum_tap.clone() {
+                                p.set_spectrum_tap(tap);
+                            }
+                            self.nrsc5 = Some(p);
+                        }
                         Err(err) => {
                             self.app_state.nrsc5_status =
                                 format!("NRSC5 unavailable: {err}");
@@ -1133,6 +1229,12 @@ impl Nrsc5App {
                         &self.config.rtl_tcp_host,
                         self.config.rtl_tcp_port,
                     )
+                } else if self.config.use_piped_sdr {
+                    // In-process librtlsdr path. The SDR is opened lazily
+                    // on the first call and kept alive for the lifetime
+                    // of the app — see `Nrsc5Process::sdr` for why the
+                    // bundled DLL forces this open-once architecture.
+                    nrsc5.start_piped(mhz, program, self.config.rtl_device_index)
                 } else {
                     nrsc5.start(mhz, program, self.config.rtl_device_index)
                 };
@@ -1184,6 +1286,8 @@ impl Nrsc5App {
                 self.app_state.frequency_mhz = mhz;
                 self.app_state.station_name =
                     format!("HD{}", self.app_state.selected_program + 1);
+                self.config.frequency_mhz = mhz;
+                save_config(&self.config);
 
                 if self.retune_task.is_some() {
                     self.app_state.nrsc5_status = "retune already in progress...".to_string();
@@ -1228,6 +1332,8 @@ impl Nrsc5App {
 
                 self.app_state.selected_program = clamped;
                 self.app_state.station_name = format!("HD{}", clamped + 1);
+                self.config.selected_program = clamped;
+                save_config(&self.config);
 
                 // If streaming, restart with the new program.
                 if self.app_state.is_streaming {
@@ -1346,6 +1452,23 @@ impl Nrsc5App {
                 self.app_state.collage_tile_cap = snapped;
                 self.rebuild_art_tiles();
                 save_config(&self.config);
+            }
+            UiCommand::ExportLogCsv => {
+                let Some(path) = crate::play_log::suggested_csv_path() else {
+                    self.app_state.log_export_status =
+                        Some("export failed: no destination directory".to_string());
+                    return;
+                };
+                match self.play_log.export_csv(&path) {
+                    Ok(()) => {
+                        self.app_state.log_export_status =
+                            Some(format!("saved to {}", path.display()));
+                    }
+                    Err(err) => {
+                        self.app_state.log_export_status =
+                            Some(format!("export failed: {err}"));
+                    }
+                }
             }
         }
     }

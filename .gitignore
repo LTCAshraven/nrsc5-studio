@@ -12,6 +12,9 @@
 # Packaging output ------------------------------------------------------
 /dist/
 
+# Local backups of bundled binaries before swapping (e.g. DLL upgrades) -
+bin.backup-*/
+
 # Editor & IDE ----------------------------------------------------------
 .vscode/
 .idea/

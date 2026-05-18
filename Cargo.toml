@@ -1,6 +1,6 @@
 [package]
 name = "nrsc5-studio"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2021"
 authors = ["LTCAshraven"]
 license = "MIT"
@@ -21,6 +21,7 @@ egui_extras = { version = "0.34", features = ["image", "file"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 libloading = "0.8"
 ron = "0.8"
+rustfft = { version = "6", default-features = false }
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
 thiserror = "2"

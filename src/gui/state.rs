@@ -1,6 +1,7 @@
 use std::time::Instant;
 
 pub use crate::maps::WeatherFrame;
+use crate::dsp::{SpectrumSnapshot, SpectrumTap};
 
 /// One tile in the album-art heat-map collage: the file path to the image,
 /// the number of times it has appeared, and the unique (title, artist) pairs
@@ -15,7 +16,7 @@ pub struct ArtTile {
     pub album: String,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Default)]
 pub struct AppState {
     pub frequency_mhz: f32,
     pub selected_program: u32,
@@ -113,4 +114,31 @@ pub struct AppState {
     /// to drive its tile-cap controls; the app updates it whenever the
     /// user changes the cap, then persists to config.
     pub collage_tile_cap: u32,
+    /// Which view the Log tab is currently rendering.
+    pub log_view_mode: LogViewMode,
+    /// Transient status line shown next to the Log tab's Export button
+    /// (e.g. the path the CSV was written to). Cleared by the next interaction.
+    pub log_export_status: Option<String>,
+    /// Optional FFT tap shared with the piped I/Q thread. `None` when no
+    /// piped stream has been started yet, or when the backend failed to
+    /// initialize. The Spectrum panel reads through this every paint.
+    pub spectrum_tap: Option<SpectrumTap>,
+    /// Reusable snapshot buffer for the Spectrum panel so it doesn't
+    /// allocate on every paint.
+    pub spectrum_snapshot: SpectrumSnapshot,
+    /// Last generation drawn into `spectrum_texture`. Used to skip the
+    /// per-frame texture re-upload when nothing has changed.
+    pub spectrum_last_drawn_generation: u64,
+    /// Cached GPU texture for the scrolling waterfall. Re-uploaded when
+    /// `spectrum_last_drawn_generation` falls behind the tap.
+    pub spectrum_texture: Option<egui::TextureHandle>,
+}
+
+/// Render mode for the Log tab — chronological list of every play, or a
+/// `(artist, title)`-grouped view sorted by play count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LogViewMode {
+    #[default]
+    Timeline,
+    TopPlayed,
 }

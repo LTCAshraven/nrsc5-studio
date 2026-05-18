@@ -18,6 +18,14 @@ pub struct AppConfig {
     pub rtl_device_index: u32,
     pub rtl_tcp_host: String,
     pub rtl_tcp_port: u16,
+    /// **Dev-only** (v0.2.0 step 4): when `true`, the Start command
+    /// drives `nrsc5.exe` from our own in-process [`Sdr`](crate::sdr)
+    /// backend via stdin (`-r -`) instead of letting nrsc5 open the USB
+    /// device itself. Off by default — flip in `config.toml` to test the
+    /// piped path. Once the waterfall (step 5+) is wired in, this will
+    /// become the default and the flag will graduate to a real UI toggle.
+    #[serde(default)]
+    pub use_piped_sdr: bool,
     #[serde(default)]
     pub presets: Vec<Preset>,
     #[serde(default = "default_volume")]
@@ -49,6 +57,7 @@ impl Default for AppConfig {
             rtl_device_index: 0,
             rtl_tcp_host: "127.0.0.1".to_string(),
             rtl_tcp_port: 1234,
+            use_piped_sdr: false,
             presets: Vec::new(),
             volume: 1.0,
             muted: false,
