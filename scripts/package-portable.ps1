@@ -37,6 +37,17 @@ if (Test-Path (Join-Path $Root "res\config.toml")) {
     Copy-Item -Path (Join-Path $Root "res\config.toml") -Destination $OutDir -Force
 }
 
+# Portable-mode marker. Its presence beside nrsc5-studio.exe makes the
+# app write all persistent state (config, art cache, play log, dock
+# layout, traffic/weather scratch) into a `data\` folder next to the
+# executable instead of into %APPDATA% / %LOCALAPPDATA%. Shipping it by
+# default makes the released zip fully self-contained on extract; users
+# who prefer the standard "writes to user profile" behavior can delete
+# this file.
+if (Test-Path (Join-Path $Root "res\portable.txt")) {
+    Copy-Item -Path (Join-Path $Root "res\portable.txt") -Destination $OutDir -Force
+}
+
 # Licensing / documentation (required by MIT and GPL bundled DLLs)
 foreach ($doc in @("README.md", "LICENSE", "THIRD_PARTY_NOTICES.md")) {
     $src = Join-Path $Root $doc

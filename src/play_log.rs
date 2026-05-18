@@ -1,9 +1,11 @@
-//! 24-hour rolling song log.
+//! Rolling song log with user-configurable retention window.
 //!
 //! Records every observed `(title, artist)` play on a station with a
 //! wall-clock timestamp. Survives restarts via a RON file under
-//! `%LOCALAPPDATA%\nrsc5-studio\play-log.ron`. Entries older than 24 h are
-//! pruned on every push and on load.
+//! `<data>/play-log.ron` (`%LOCALAPPDATA%\\nrsc5-studio\\` installed, or
+//! `<exe>\\data\\` portable). Entries older than the configured retention
+//! window are pruned on every push and on load. The window defaults to
+//! 24 hours and is configurable via [`AppConfig::play_log_retention_hours`].
 //!
 //! Designed to feed:
 //! - A live in-app "Log" panel (chronological + grouped views)
@@ -13,11 +15,21 @@
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-/// Rolling retention window — entries older than this are dropped on every
-/// push and on every load.
-const RETENTION_MS: i64 = 24 * 60 * 60 * 1000;
+/// Default rolling retention window in hours. Used when no explicit
+/// retention has been set on the log (e.g. before [`PlayLog::load`]
+/// returns into the app, or in tests).
+pub const DEFAULT_RETENTION_HOURS: u32 = 24;
+
+/// Hard floor/ceiling for retention. The ceiling matches the practical
+/// max imposed by `HARD_CAP` at typical play rates (≈7 days).
+pub const MIN_RETENTION_HOURS: u32 = 1;
+pub const MAX_RETENTION_HOURS: u32 = 168;
+
+/// Allowed dropdown choices surfaced in the UI. Kept in module scope so
+/// the config validator and the UI agree on the set.
+pub const RETENTION_CHOICES: &[u32] = &[1, 6, 12, 24, 48, 72, 168];
 
 /// Defensive cap on entries held in memory. Far above the realistic max
 /// (~30 plays/h × 24 h = 720) so it only ever activates in pathological
@@ -55,6 +67,10 @@ struct OnDiskFormat {
 #[derive(Debug, Default)]
 pub struct PlayLog {
     entries: VecDeque<PlayEntry>,
+    /// Active retention window in hours. Defaults to
+    /// [`DEFAULT_RETENTION_HOURS`]; the app overrides this with the
+    /// configured value via [`PlayLog::set_retention_hours`].
+    retention_hours: u32,
 }
 
 impl PlayLog {
@@ -62,8 +78,11 @@ impl PlayLog {
     /// empty log — failure is always non-fatal. Entries older than the
     /// retention window are dropped immediately.
     pub fn load() -> Self {
-        let mut log = Self::default();
-        if let Some(path) = log_path() {
+        let mut log = Self {
+            entries: VecDeque::new(),
+            retention_hours: DEFAULT_RETENTION_HOURS,
+        };
+        if let Some(path) = crate::paths::play_log_path() {
             if let Ok(raw) = fs::read_to_string(&path) {
                 if let Ok(parsed) = ron::from_str::<OnDiskFormat>(&raw) {
                     log.entries = parsed.entries.into();
@@ -72,6 +91,23 @@ impl PlayLog {
         }
         log.prune();
         log
+    }
+
+    /// Update the retention window and immediately prune entries that
+    /// fall outside it. Caller is responsible for persisting after the
+    /// change if the prune mutated the log.
+    pub fn set_retention_hours(&mut self, hours: u32) {
+        self.retention_hours = clamp_retention(hours);
+        self.prune();
+    }
+
+    pub fn retention_hours(&self) -> u32 {
+        self.retention_hours
+    }
+
+    /// Drop every entry from the in-memory log. Caller persists.
+    pub fn clear_all(&mut self) {
+        self.entries.clear();
     }
 
     /// Try to record a new play. Returns `true` if an entry was pushed.
@@ -125,7 +161,13 @@ impl PlayLog {
 
     /// Drop entries older than the retention window. Safe to call often.
     pub fn prune(&mut self) {
-        let cutoff = now_millis() - RETENTION_MS;
+        let hours = if self.retention_hours == 0 {
+            DEFAULT_RETENTION_HOURS
+        } else {
+            self.retention_hours
+        };
+        let retention_ms = (hours as i64) * 60 * 60 * 1000;
+        let cutoff = now_millis() - retention_ms;
         while self.entries.front().is_some_and(|e| e.ts_millis < cutoff) {
             self.entries.pop_front();
         }
@@ -143,10 +185,10 @@ impl PlayLog {
         self.entries.len()
     }
 
-    /// Persist atomically to `%LOCALAPPDATA%\nrsc5-studio\play-log.ron`.
-    /// Failure is non-fatal — the log keeps working in memory.
+    /// Persist atomically (tmp + rename). Failure is non-fatal — the log
+    /// keeps working in memory.
     pub fn save(&self) {
-        let Some(path) = log_path() else { return };
+        let Some(path) = crate::paths::play_log_path() else { return };
         let Some(parent) = path.parent() else { return };
         if fs::create_dir_all(parent).is_err() {
             return;
@@ -213,21 +255,16 @@ pub fn fmt_local_rfc3339(ts_millis: i64) -> String {
         .unwrap_or_default()
 }
 
-/// Suggested CSV export destination: `Documents\nrsc5-studio-playlog-<ts>.csv`.
-/// Falls back to the play-log dir if Documents can't be resolved.
-pub fn suggested_csv_path() -> Option<PathBuf> {
+/// Build the default CSV filename used as the initial filename in the
+/// Save-As dialog: `nrsc5-studio-playlog-<YYYYMMDD-HHMMSS>.csv`.
+pub fn suggested_csv_filename() -> String {
     let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
-    let filename = format!("nrsc5-studio-playlog-{stamp}.csv");
-    if let Some(docs) = dirs::document_dir() {
-        return Some(docs.join(&filename));
-    }
-    let parent = log_path()?.parent()?.to_path_buf();
-    Some(parent.join(filename))
+    format!("nrsc5-studio-playlog-{stamp}.csv")
 }
 
-fn log_path() -> Option<PathBuf> {
-    let base = dirs::data_local_dir()?;
-    Some(base.join("nrsc5-studio").join("play-log.ron"))
+/// Snap an arbitrary retention value to the supported range.
+pub fn clamp_retention(hours: u32) -> u32 {
+    hours.clamp(MIN_RETENTION_HOURS, MAX_RETENTION_HOURS)
 }
 
 fn csv_field(s: &str) -> String {

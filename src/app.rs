@@ -170,6 +170,7 @@ pub struct Nrsc5App {
 impl Nrsc5App {
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         egui_extras::install_image_loaders(&_cc.egui_ctx);
+        Self::install_fonts(&_cc.egui_ctx);
         let config = load_config();
         Self::apply_theme(&_cc.egui_ctx, config.dark_mode);
         let dock_state = _cc
@@ -197,7 +198,7 @@ impl Nrsc5App {
         let aas_dir = nrsc5
             .as_ref()
             .map(|n| n.aas_dir().to_path_buf())
-            .unwrap_or_else(|| std::env::temp_dir().join("nrsc5-tui-aas"));
+            .unwrap_or_else(crate::paths::aas_temp_dir);
 
         // Open the on-disk art cache and load any history from previous
         // sessions. Failure here is non-fatal — we just start with an
@@ -205,6 +206,10 @@ impl Nrsc5App {
         let art_cache = crate::art_cache::ArtCache::new();
         let (art_history, art_tiles, art_session_started) =
             restore_art_history(art_cache.as_ref(), collage_tile_cap(&config));
+
+        // Snapshot any per-field config values needed after `config` is
+        // moved into the struct literal below.
+        let play_log_retention_hours = config.play_log_retention_hours;
 
         Self {
             app_state: AppState {
@@ -247,7 +252,11 @@ impl Nrsc5App {
             last_art_prune_at: None,
             closed_tab_locations: HashMap::new(),
             prev_layout: LayoutSnapshot::default(),
-            play_log: crate::play_log::PlayLog::load(),
+            play_log: {
+                let mut log = crate::play_log::PlayLog::load();
+                log.set_retention_hours(play_log_retention_hours);
+                log
+            },
             last_cover_play_at: None,
         }
     }
@@ -524,8 +533,37 @@ impl Nrsc5App {
         self.dock_state.push_to_focused_leaf(tab);
     }
 
+    /// Extend egui's default font fallback chain so glyphs that ship in
+    /// `Hack-Regular.ttf` (geometric shapes like `\u{25CF}` / `\u{25CB}`,
+    /// math arrows, etc.) also render in `FontFamily::Proportional`
+    /// text. By default egui only puts Hack in the Monospace chain,
+    /// which means a label like "● LOCK" rendered as ordinary
+    /// proportional text would show a tofu box. We keep the existing
+    /// chain order and just append Hack at the end so coverage degrades
+    /// gracefully without affecting which font gets picked for normal
+    /// letters.
+    ///
+    /// See `scripts/probe-glyphs.ps1` for the full audit of which
+    /// codepoints each bundled font covers.
+    fn install_fonts(ctx: &egui::Context) {
+        let mut fonts = egui::FontDefinitions::default();
+        if let Some(chain) =
+            fonts.families.get_mut(&egui::FontFamily::Proportional)
+        {
+            if !chain.iter().any(|n| n == "Hack") {
+                chain.push("Hack".to_owned());
+            }
+        }
+        ctx.set_fonts(fonts);
+    }
+
     fn apply_theme(ctx: &egui::Context, dark: bool) {
         let accent = egui::Color32::from_rgb(100, 160, 255);
+        let theme = if dark {
+            egui::Theme::Dark
+        } else {
+            egui::Theme::Light
+        };
 
         let mut visuals = if dark {
             let mut v = egui::Visuals::dark();
@@ -568,7 +606,15 @@ impl Nrsc5App {
         visuals.selection.stroke = egui::Stroke::new(1.0, accent);
         visuals.hyperlink_color = accent;
 
-        ctx.set_visuals(visuals);
+        // egui 0.34 has a dual-theme system with `ThemePreference::System`
+        // as the default, which means it follows the OS. Without an
+        // explicit `set_theme`, calling `set_visuals` only updates the
+        // visuals slot for the currently-active theme \u2014 and on the next
+        // pass egui re-resolves the system theme and overwrites them with
+        // its built-ins. Pin the preference AND install our visuals into
+        // the matching theme slot.
+        ctx.set_theme(theme);
+        ctx.set_visuals_of(theme, visuals);
 
         let mut style = (*ctx.global_style()).clone();
         style.spacing.item_spacing = egui::vec2(6.0, 4.0);
@@ -1330,6 +1376,7 @@ impl Nrsc5App {
                 self.app_state.weather_frames.clear();
                 self.app_state.weather_current_frame = 0;
                 self.app_state.weather_playing = false;
+                self.app_state.call_sign.clear();
                 self.traffic_map.clear();
                 self.weather_map.clear();
                 self.app_state.nrsc5_status = "stream stopped".to_string();
@@ -1338,6 +1385,11 @@ impl Nrsc5App {
                 self.app_state.frequency_mhz = mhz;
                 self.app_state.station_name =
                     format!("HD{}", self.app_state.selected_program + 1);
+                // Wipe per-station identity/state so a stale call sign
+                // or LOT filename from the previous station can't bleed
+                // into the new one before its first LOT arrives.
+                self.app_state.call_sign.clear();
+                self.lot_files.clear();
                 self.config.frequency_mhz = mhz;
                 save_config(&self.config);
 
@@ -1527,9 +1579,20 @@ impl Nrsc5App {
                 save_config(&self.config);
             }
             UiCommand::ExportLogCsv => {
-                let Some(path) = crate::play_log::suggested_csv_path() else {
-                    self.app_state.log_export_status =
-                        Some("export failed: no destination directory".to_string());
+                // Native Save-As dialog defaults to Documents with a
+                // timestamped filename. User can redirect anywhere (e.g.
+                // OneDrive, a USB stick, the portable bundle's own folder).
+                let suggested_filename = crate::play_log::suggested_csv_filename();
+                let start_dir = crate::paths::documents_dir()
+                    .unwrap_or_else(|| std::path::PathBuf::from("."));
+                let chosen = rfd::FileDialog::new()
+                    .set_title("Export play log as CSV")
+                    .set_directory(&start_dir)
+                    .set_file_name(&suggested_filename)
+                    .add_filter("CSV", &["csv"])
+                    .save_file();
+                let Some(path) = chosen else {
+                    // User cancelled — silent, matching Windows convention.
                     return;
                 };
                 match self.play_log.export_csv(&path) {
@@ -1541,6 +1604,27 @@ impl Nrsc5App {
                         self.app_state.log_export_status =
                             Some(format!("export failed: {err}"));
                     }
+                }
+            }
+            UiCommand::ClearLog => {
+                if self.play_log.is_empty() {
+                    return;
+                }
+                self.play_log.clear_all();
+                self.play_log.save();
+                self.app_state.log_export_status = Some("log cleared".to_string());
+            }
+            UiCommand::SetPlayLogRetention(hours) => {
+                let snapped = crate::play_log::clamp_retention(hours);
+                if snapped == self.config.play_log_retention_hours {
+                    return;
+                }
+                self.config.play_log_retention_hours = snapped;
+                save_config(&self.config);
+                let pre = self.play_log.len();
+                self.play_log.set_retention_hours(snapped);
+                if self.play_log.len() != pre {
+                    self.play_log.save();
                 }
             }
         }

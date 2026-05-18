@@ -1,0 +1,16 @@
+This file enables portable mode for NRSC5 Studio.
+
+When this file is present beside nrsc5-studio.exe, the app writes all of
+its persistent state into the `data\` subfolder beside the executable
+instead of into the user profile (`%APPDATA%` / `%LOCALAPPDATA%`):
+
+  data\config.toml      - preset list, gain mode, volume, theme, etc.
+  data\art-cache\       - cached album covers and manifest
+  data\play-log.ron     - 24-hour rolling song log
+  data\eframe\          - window geometry + saved dock layout
+  data\aas\             - per-session traffic / weather scratch files
+
+Delete this file (or rename it) to fall back to the standard installed
+behavior, where state is stored under the Windows user profile.
+
+The contents of this file are ignored; only its presence matters.

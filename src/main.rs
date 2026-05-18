@@ -12,6 +12,7 @@ mod ffi;
 mod gui;
 mod icon;
 mod maps;
+mod paths;
 mod play_log;
 mod sdr;
 mod sdr_detect;
@@ -30,6 +31,11 @@ fn main() -> eframe::Result<()> {
             .with_min_inner_size([960.0, 600.0])
             .with_icon(icon::build_window_icon()),
         persist_window: true,
+        // In portable mode, route eframe's persistence (window geometry +
+        // serialized dock layout) into `<exe_dir>\data\eframe\app.ron` so
+        // the bundle leaves no traces on the host. `None` falls back to
+        // eframe's default location under `%APPDATA%`.
+        persistence_path: paths::eframe_storage_file(),
         ..Default::default()
     };
     eframe::run_native(

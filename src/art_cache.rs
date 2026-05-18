@@ -66,12 +66,12 @@ pub struct ArtCache {
 }
 
 impl ArtCache {
-    /// Resolve and create the cache directory under the user's local data
-    /// folder. Returns `None` if neither the dir lookup nor the directory
-    /// creation succeeds (very rare — e.g. truly read-only profile).
+    /// Resolve and create the cache directory. In installed mode this is
+    /// under `%LOCALAPPDATA%\nrsc5-studio\art-cache`; in portable mode
+    /// it's `<exe_dir>\data\art-cache`. Returns `None` if path resolution
+    /// or directory creation fails (very rare — e.g. read-only profile).
     pub fn new() -> Option<Self> {
-        let base = dirs::data_local_dir()?;
-        let dir = base.join("nrsc5-studio").join("art-cache");
+        let dir = crate::paths::art_cache_dir()?;
         std::fs::create_dir_all(&dir).ok()?;
         Some(Self { dir })
     }

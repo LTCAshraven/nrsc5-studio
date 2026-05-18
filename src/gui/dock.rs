@@ -27,6 +27,13 @@ pub enum UiCommand {
     /// Write the current play log to a CSV file. App resolves the path and
     /// surfaces it through `AppState::log_export_status`.
     ExportLogCsv,
+    /// Drop every entry from the in-memory play log and persist the
+    /// empty state to disk.
+    ClearLog,
+    /// Update the rolling-window retention (in hours) for the play log
+    /// and persist the new value to config. Value is clamped to the
+    /// supported range on apply.
+    SetPlayLogRetention(u32),
     /// Switch tuner gain control mode (Auto / Manual / HardwareAgc).
     /// Persisted to config; takes effect on the next piped Start.
     SetGainMode(GainMode),
@@ -1477,13 +1484,42 @@ impl DockViewer<'_> {
                 n => format!("{n} plays"),
             };
             ui.label(RichText::new(label).color(Color32::from_gray(170)));
-            ui.label(
-                RichText::new("\u{2022} rolling 24h").color(Color32::from_gray(140)),
-            )
-            .on_hover_text(
-                "The log keeps up to the last 24 hours of plays \
-                 (capped at 5,000 entries). Older entries roll off \
-                 automatically.",
+
+            // Retention dropdown — click the "rolling Xh" label to change
+            // the rolling window. Persisted to config.toml.
+            let cur_hours = self.play_log.retention_hours();
+            let cur_label = format_retention(cur_hours);
+            let menu_label = format!("\u{2022} rolling {cur_label}");
+            let menu_resp = ui
+                .menu_button(
+                    RichText::new(&menu_label).color(Color32::from_gray(140)),
+                    |ui| {
+                        ui.label(
+                            RichText::new("Rolling window")
+                                .strong()
+                                .small(),
+                        );
+                        ui.separator();
+                        for &hours in crate::play_log::RETENTION_CHOICES {
+                            let label = format!(
+                                "{}{}",
+                                if hours == cur_hours { "\u{2714} " } else { "  " },
+                                format_retention(hours),
+                            );
+                            if ui.button(label).clicked() {
+                                if hours != cur_hours {
+                                    self.commands
+                                        .push(UiCommand::SetPlayLogRetention(hours));
+                                }
+                                ui.close();
+                            }
+                        }
+                    },
+                )
+                .response;
+            menu_resp.on_hover_text(
+                "How far back the log keeps entries before pruning them. \
+                 Capped at 5,000 entries regardless of window.",
             );
             ui.separator();
             if ui
@@ -1492,6 +1528,18 @@ impl DockViewer<'_> {
                 .clicked()
             {
                 self.commands.push(UiCommand::ExportLogCsv);
+            }
+            let clear_enabled = !self.play_log.is_empty();
+            let clear_resp = ui.add_enabled(
+                clear_enabled,
+                egui::Button::new("\u{1F5D1} Clear"),
+            );
+            let clear_resp = clear_resp.on_hover_text(
+                "Drop every entry from the play log. The on-disk \
+                 file is rewritten to an empty log immediately.",
+            );
+            if clear_resp.clicked() {
+                self.commands.push(UiCommand::ClearLog);
             }
             if let Some(status) = self.app_state.log_export_status.clone() {
                 ui.label(
@@ -1648,6 +1696,18 @@ impl DockViewer<'_> {
                     });
                 });
             });
+    }
+}
+
+/// Render an integer-hour retention window as a compact human label
+/// (`6h`, `24h`, `7d`). Used by the log header and its dropdown so the
+/// visible value and the menu items stay in sync.
+fn format_retention(hours: u32) -> String {
+    if hours >= 24 && hours % 24 == 0 {
+        let days = hours / 24;
+        format!("{days}d")
+    } else {
+        format!("{hours}h")
     }
 }
 

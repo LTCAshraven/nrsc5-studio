@@ -4,6 +4,93 @@ All notable changes to NRSC5 Studio are documented here. The format roughly
 follows [Keep a Changelog](https://keepachangelog.com/), and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.2.2] - 2026-05-18
+
+A polish + portability release on top of 0.2.1. No architectural
+changes — the piped-SDR backend, closed-loop AGC, and spectrum panel
+behave identically.
+
+### Added
+
+- **Portable mode.** A zero-byte `portable.txt` next to
+  `nrsc5-studio.exe` redirects every persistent path
+  (`config.toml`, AAS file cache, album-art cache, play log, egui
+  window-state DB) from `%APPDATA%\nrsc5-studio\` into a
+  `./data/` folder next to the executable. New module
+  `src/paths.rs` owns the portable-vs-roaming dispatch and is
+  the single source of truth for all paths; callers go through
+  `paths::config_path()`, `paths::play_log_path()`,
+  `paths::aas_dir()`, `paths::art_cache_db()`, etc.
+- **Portable-zip wiring.** `scripts/package-portable.ps1` now
+  seeds `portable.txt` and a fresh `./data/` next to the exe so
+  the shipped zip is self-contained.
+- **`eframe::NativeOptions::persistence_path`** wired to
+  `paths::egui_persistence_db()` so window state honors portable
+  mode alongside the rest of the per-install data.
+- **Configurable play-log retention.** New
+  `play_log_retention_hours` config field (1..168, default 24).
+  Surfaced in the `📝 Log` tab as a **Rolling window** dropdown
+  with seven choices (1h / 6h / 12h / 1d / 2d / 3d / 7d).
+  Persisted to `config.toml` and applied on the next prune cycle.
+- **Clear log button** in the `📝 Log` tab — wipes both the
+  in-memory log and the on-disk `play_log.csv`.
+- **Native Save As dialog for CSV export** (replaces the silent
+  fixed-path save). Powered by `rfd 0.15`.
+- **Glyph audit script** (`scripts/probe-glyphs.ps1`). Reads each
+  bundled TTF's `cmap` via `System.Windows.Media.GlyphTypeface`
+  and prints a per-codepoint coverage table. Reproducible audit
+  for any future emoji additions.
+
+### Changed
+
+- **`use_piped_sdr` default → `true`.** Fresh installs now ship
+  with the in-process piped backend enabled out of the box. Both
+  the closed-loop AGC and the spectrum FFT tap are wired only
+  through `start_piped`, so the legacy USB default silently
+  disabled the v0.2.x flagship features. With the corrected
+  default, AGC and spectrum work on first launch without
+  editing the config file.
+- **Proportional font fallback.** Appended `Hack-Regular.ttf`
+  to egui's default `FontFamily::Proportional` chain via a new
+  `Nrsc5App::install_fonts` step. egui's stock proportional
+  chain (Ubuntu-Light → NotoEmoji → emoji-icon-font) excludes
+  Hack, so geometric shapes (●, ○, ■, □, →, ▸, ◆) rendered
+  as tofu in label text. Now they resolve to Hack as a final
+  fallback without affecting Latin letter selection.
+- **Retention dropdown selected indicator** changed from `✓`
+  (U+2713, uncovered by any bundled font) to `✔` (U+2714,
+  covered by NotoEmoji + emoji-icon-font).
+- **`play_log::Log`** gained `retention_hours`, `set_retention_hours`,
+  `clear_all`, plus `RETENTION_CHOICES`, `MIN_RETENTION_HOURS`,
+  `MAX_RETENTION_HOURS`, `DEFAULT_RETENTION_HOURS`, and
+  `clamp_retention`.
+
+### Fixed
+
+- **Dark mode pin.** Explicit `egui::ThemePreference` set during
+  theme install so a saved `dark_mode = true` is honored on a
+  light-OS desktop (and vice versa). Previously the OS theme
+  could override the saved preference.
+- **Stale call sign cleared on Stop / TuneMhz.** Retuning to a
+  station that doesn't broadcast a SIS call sign no longer
+  leaves the previous letters frozen in the Tuner panel.
+- **Weather radar without basemap.** `WeatherMap::process_overlay`
+  now bails early when no basemap is in hand instead of
+  compositing radar onto a transparent background. Frame state
+  is reset on basemap change so the loop replays correctly.
+- **Album-art cache invalidation.** Switching backends or
+  stopping a stream now clears stale tile state so a previous
+  cover doesn't linger.
+
+### Internal
+
+- New `UiCommand::ClearLog` and
+  `UiCommand::SetPlayLogRetention(u32)` variants; both round-trip
+  through `AppConfig`.
+- `AppConfig::sanitize` clamps `play_log_retention_hours` on load
+  via `play_log::clamp_retention`.
+- `rfd 0.15` added as a dependency for native file dialogs.
+
 ## [0.2.1] - 2026-05-18
 
 Closed-loop AGC for the piped-SDR backend, plus a user-facing gain

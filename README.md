@@ -24,7 +24,7 @@ NRSC5 Studio gives you everything `nrsc5.exe` already does — tuning, demodulat
 
 - **Full HD Radio playback** — HD1/HD2/HD3/HD4 subchannel selection, automatic retune on frequency change, persistent presets you can save, recall, rename, and re-target via a double-click edit dialog.
 - **Now-Playing pane** — title / artist / album / genre from broadcast metadata, plus cover art and the station logo if the station you are listening to transmits it.
-- **Album-Art Collage** — a rolling 8-hour squarified-treemap heat-map of every unique cover seen on the station. Frequent plays grow into bigger tiles; the layout re-flows as new art comes in. **Survives restarts** — covers are cached to `%LOCALAPPDATA%\nrsc5-studio\art-cache\` so the heat-map repopulates instantly on relaunch (within the 8-hour window).
+- **Album-Art Collage** — a rolling 8-hour squarified-treemap heat-map of every unique cover seen on the station. Frequent plays grow into bigger tiles; the layout re-flows as new art comes in. **Survives restarts** — covers are cached to disk (`data\art-cache\` in portable mode, `%LOCALAPPDATA%\nrsc5-studio\art-cache\` otherwise) so the heat-map repopulates instantly on relaunch (within the 8-hour window).
 - **24-Hour Song Log** — every play the station broadcasts metadata for is captured with a timestamp and persisted across restarts. Two views: a **Timeline** of the most recent plays and a **Top Played** grouping by `(title, artist)`. Export to RFC-4180 CSV for the scrobbler crowd. Aggressive filtering keeps station IDs, slogans, and call signs out of the log.
 - **Spectrum + Waterfall** — a dedicated SDR scope tab with a 1024-bin live FFT trace (SDR#-style translucent gradient fill, ±20 dB grid, faint shading at the HD digital sidebands at ±129–199 kHz) and a 256-row scrolling waterfall underneath with a turbo colormap. Driven from a tap on the same I/Q stream that feeds the decoder, so what you see is what nrsc5 sees.
 - **QPSK Constellation** — a phosphor-green scope showing the OFDM-subcarrier constellation cloud, with cloud spread driven by live MER per sideband. Watch the cloud tighten as signal quality improves — especially satisfying while the AGC walks into its sweet spot.
@@ -56,7 +56,11 @@ If you don't already have working RTL-SDR drivers, install [Zadig](https://zadig
 3. Plug in your RTL-SDR dongle.
 4. Run `nrsc5-studio.exe`.
 
-No installer, no registry edits, no admin rights required. Everything the app needs is inside the zip. Settings (presets, volume, theme, window layout) are saved to `%APPDATA%\nrsc5-studio\`.
+No installer, no registry edits, no admin rights required.
+
+By default the zip ships in **portable mode** (a `portable.txt` marker file lives next to the executable). In this mode the app keeps everything it writes — presets, theme, window layout, album-art cache, 24-hour song log, traffic/weather scratch — inside a `data\` folder beside the exe. Move the folder, the whole state moves with it. Plug the USB stick into a different Windows machine and it just works.
+
+If you'd rather use the standard Windows convention (state under `%APPDATA%\nrsc5-studio\` and `%LOCALAPPDATA%\nrsc5-studio\`), delete `portable.txt` and relaunch.
 
 ---
 

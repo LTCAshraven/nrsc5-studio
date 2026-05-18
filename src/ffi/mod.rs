@@ -170,7 +170,7 @@ impl Nrsc5Process {
     pub fn new() -> Result<Self, Nrsc5Error> {
         let exe_path = find_nrsc5_exe().ok_or(Nrsc5Error::ExeNotFound)?;
         let (tx, rx) = unbounded();
-        let aas_dir = std::env::temp_dir().join("nrsc5-tui-aas");
+        let aas_dir = crate::paths::aas_temp_dir();
         let _ = std::fs::create_dir_all(&aas_dir);
         Ok(Self {
             child: None,

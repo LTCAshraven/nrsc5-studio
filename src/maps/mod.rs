@@ -138,11 +138,6 @@ pub struct WeatherMap {
     /// byte identical — we skip those instead of cluttering the animation
     /// with duplicate frames.
     last_overlay_hash: Option<u64>,
-    /// Whether the most recently composited frame used a real cropped
-    /// basemap. If a DWRO arrives before any DWRI/cached basemap is
-    /// available, the frame is rendered onto a dark fallback fill — we want
-    /// to throw that frame away once the real basemap finally lands.
-    last_frame_had_basemap: bool,
 }
 
 impl WeatherMap {
@@ -158,7 +153,6 @@ impl WeatherMap {
             frames: Vec::new(),
             frame_counter: 0,
             last_overlay_hash: None,
-            last_frame_had_basemap: false,
         };
 
         // nrsc5 deduplicates LOT files it has already received, so on a station
@@ -241,7 +235,6 @@ impl WeatherMap {
         self.area_id = None;
         self.base_map_path = None;
         self.last_overlay_hash = None;
-        self.last_frame_had_basemap = false;
         // Best-effort delete old composited frames so the AAS dir doesn't grow
         // unbounded across sessions.
         for frame in &self.frames {
@@ -287,24 +280,22 @@ impl WeatherMap {
             // Rebuild base map if area changed.
             let changed = self.area_id.as_deref() != Some(&id)
                 || self.coordinates != Some(coords);
-            let had_basemap_before = self.base_map_path.is_some();
             self.area_id = Some(id.clone());
             self.coordinates = Some(coords);
             if changed {
                 self.base_map_path = None; // force rebuild
                 self.make_base_map(&id, coords);
-            }
-            // If we previously composited frames against the dark fallback
-            // (no real basemap), they look broken — drop them now that the
-            // basemap is available so the next DWRO re-renders cleanly. Also
-            // clear the dedup hash so an identical DWRO will be re-accepted.
-            let basemap_just_arrived = !had_basemap_before && self.base_map_path.is_some();
-            if (basemap_just_arrived || changed) && !self.last_frame_had_basemap && !self.frames.is_empty() {
-                for frame in &self.frames {
-                    let _ = std::fs::remove_file(&frame.path);
+                // Existing composited frames are for the prior area and
+                // would render the new radar overlay against the wrong
+                // map. Drop them and reset the dedup so the next DWRO
+                // is freshly composited.
+                if !self.frames.is_empty() {
+                    for frame in &self.frames {
+                        let _ = std::fs::remove_file(&frame.path);
+                    }
+                    self.frames.clear();
+                    self.last_overlay_hash = None;
                 }
-                self.frames.clear();
-                self.last_overlay_hash = None;
             }
         }
     }
@@ -350,8 +341,24 @@ impl WeatherMap {
             return false;
         }
 
+        // If we don't yet have a cropped basemap for this station,
+        // refuse to composite. Otherwise the composite renders the
+        // radar onto a flat dark fill (no map underneath) and those
+        // frames live on in the rolling buffer until a basemap finally
+        // arrives \u2014 which can be many minutes later, since nrsc5
+        // dedups identical LOTs across its broadcast cycle. The UI
+        // already shows "Waiting for weather radar overlay\u2026" while
+        // `frames` is empty, so this is the better degraded state.
+        //
+        // We deliberately do NOT delete or hash-record the raw DWRO
+        // here: keeping it on disk lets the next call (after a DWRI
+        // arrives and `make_base_map` runs) re-attempt the composite.
+        if self.base_map_path.is_none() {
+            return false;
+        }
+
         // Dedup: if the raw overlay bytes match the last accepted one, the
-        // underlying radar imagery hasn't updated yet — skip so the animation
+        // underlying radar imagery hasn't updated yet \u2014 skip so the animation
         // doesn't accrue identical frames.
         let Ok(bytes) = std::fs::read(&overlay_path) else {
             return false;
@@ -366,30 +373,29 @@ impl WeatherMap {
         let Ok(overlay) = image::load_from_memory(&bytes) else {
             return false;
         };
-        // Only commit the hash *after* we know the bytes decode — a corrupt
+        // Only commit the hash *after* we know the bytes decode \u2014 a corrupt
         // file shouldn't prevent the next attempt.
         self.last_overlay_hash = Some(hash);
 
         // Target size for the final weather map.
         let target_size = 981u32;
 
-        // Try to load the cropped base map; fall back to a solid dark background.
-        let mut had_basemap = false;
-        let mut canvas = if let Some(ref base_path) = self.base_map_path {
-            if let Ok(base) = image::open(base_path) {
-                had_basemap = true;
-                image::imageops::resize(
-                    &base.to_rgba8(),
-                    target_size,
-                    target_size,
-                    image::imageops::FilterType::Lanczos3,
-                )
-            } else {
-                RgbaImage::from_pixel(target_size, target_size, image::Rgba([30, 30, 40, 255]))
-            }
-        } else {
-            RgbaImage::from_pixel(target_size, target_size, image::Rgba([30, 30, 40, 255]))
+        // Load the cropped base map. The early-return above guarantees
+        // `base_map_path` is set, but `image::open` can still fail (file
+        // pruned externally, permissions, corrupted PNG). In that case
+        // bail out so we don't fall back to the dark-fill again.
+        let Some(ref base_path) = self.base_map_path else {
+            return false;
         };
+        let Ok(base) = image::open(base_path) else {
+            return false;
+        };
+        let mut canvas = image::imageops::resize(
+            &base.to_rgba8(),
+            target_size,
+            target_size,
+            image::imageops::FilterType::Lanczos3,
+        );
 
         // Resize the overlay to match.
         let overlay_rgba = overlay.to_rgba8();
@@ -426,7 +432,6 @@ impl WeatherMap {
         if DynamicImage::ImageRgba8(canvas).save(&out_path).is_err() {
             return false;
         }
-        self.last_frame_had_basemap = had_basemap;
         // The raw DWRO overlay has been baked into the composited frame and
         // we never re-read it. Delete it so the AAS dir doesn't accumulate
         // ~50 KB per overlay forever across long sessions.
