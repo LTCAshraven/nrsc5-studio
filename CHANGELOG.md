@@ -4,6 +4,67 @@ All notable changes to NRSC5 Studio are documented here. The format roughly
 follows [Keep a Changelog](https://keepachangelog.com/), and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.2.1] - 2026-05-18
+
+Closed-loop AGC for the piped-SDR backend, plus a user-facing gain
+mode picker in the Signal panel. No architectural changes from 0.2.0.
+
+### Added
+
+- **Closed-loop AGC controller** (`src/dsp/agc.rs`). Explored-set
+  hill-climber over the 29-step R820T2 gain table (0.0 dB → 49.6 dB).
+  ~5 s probe period per step, 15-probe bail budget, MER metric is
+  `min(MER_lower, MER_upper)` EMA-smoothed (α = 0.4) against
+  single-frame noise. Starts at 19.7 dB (mid-table) and walks down
+  first to find the noise floor, then up. Settled state is sticky;
+  re-evaluates only on retune or sustained MER drops. Driver thread
+  in `Nrsc5Process` polls the controller every 500 ms and pushes a
+  new gain via `rtlsdr_set_tuner_gain` when a step is taken.
+- **Gain mode picker** in the `📶 Signal` dock tab. Three modes:
+  `Auto` (the new closed-loop controller, default), `Manual`
+  (slider over the R820T2 gain table), and `HardwareAgc` (hand
+  control to the tuner chip's built-in AGC). Mode + manual value
+  persist in `config.toml` as `gain_mode` and `manual_gain_tenths`.
+- **Live AGC readout** in the Signal panel: current gain in dB,
+  time since last gain change, and a status badge (probing /
+  settled / bailed) sourced from `AgcController::snapshot()`.
+- **"Restart stream to apply" hint** next to the gain mode dropdown
+  whenever the active stream's mode disagrees with the chosen
+  one. Avoids the silent-no-op trap if the user changes the mode
+  mid-stream.
+- **`NrscEvent::AgcDecision { tenths, reason }`** event variant
+  emitted by the AGC driver thread on every gain change. Mirrored
+  into `AppState::agc_db` so the existing Tuner-panel gain
+  readout stays accurate on the piped backend (where `nrsc5.exe`
+  doesn't emit its own `Agc` line).
+
+### Changed
+
+- **`AgcController` owns its gain table** as a `Vec<i32>` rather
+  than borrowing a slice from the SDR backend. Eliminates the
+  lifetime tie to `Sdr::gain_table_tenths()` and lets the
+  controller outlive a stream restart without dancing around
+  borrow checking.
+
+### Internal
+
+- New `pub use` re-exports in `src/dsp/mod.rs`:
+  `AgcConfig`, `AgcController`, `AgcSnapshot`, `AgcStatus`.
+- `R820T2_GAINS_TENTHS` exposed from `src/sdr/mod.rs` so the
+  manual-gain slider can snap to legal table values.
+- `Nrsc5Process::start_piped` now takes `gain_mode` +
+  `manual_gain_tenths` and branches three ways at startup,
+  installing the AGC controller and driver thread only in the
+  `Auto` case.
+- `UiCommand::SetGainMode(GainMode)` and
+  `UiCommand::SetManualGainTenths(i32)` added; both update the
+  in-memory `AppState`, write through to `AppConfig`, and persist
+  to `config.toml` immediately.
+- `src/dsp/agc.rs` ships with 4 unit tests covering the EMA
+  smoothing, the explored-set walk, the bail budget, and the
+  settled-state stickiness. All passing on
+  `x86_64-pc-windows-gnullvm`.
+
 ## [0.2.0] - 2026-05-17
 
 The "we own the radio now" release. The single biggest architectural change

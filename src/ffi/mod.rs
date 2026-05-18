@@ -2,10 +2,13 @@ use crossbeam_channel::{unbounded, Receiver, Sender};
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use thiserror::Error;
 
+use crate::config::GainMode;
+use crate::dsp::{AgcConfig, AgcController, AgcSnapshot};
 use crate::sdr::{Sdr, SdrConfig, SdrError, StreamControl};
 
 // -- Events -----------------------------------------------------------
@@ -53,6 +56,14 @@ pub enum NrscEvent {
     EmergencyAlert,
     HereImage,
     Agc { gain_db: f32 },
+    /// Closed-loop AGC controller applied a new tuner gain. Emitted
+    /// from the AGC driver thread immediately after the
+    /// `Sdr::set_tuner_gain_tenths` call returns. UI uses this to
+    /// freshen the "last changed" timestamp on the gain readout.
+    AgcDecision {
+        tenths: i32,
+        reason: String,
+    },
 }
 
 impl NrscEvent {
@@ -72,6 +83,7 @@ impl NrscEvent {
             Self::EmergencyAlert => "emergency-alert",
             Self::HereImage => "here-image",
             Self::Agc { .. } => "agc",
+            Self::AgcDecision { .. } => "agc-decision",
         }
     }
 }
@@ -126,6 +138,28 @@ pub struct Nrsc5Process {
     /// work). The Spectrum dock panel reads through a shared clone of
     /// this same handle.
     spectrum_tap: Option<crate::dsp::SpectrumTap>,
+    /// Closed-loop AGC controller. `Some` only while a piped Start is
+    /// active. Shared between the stderr-parser thread (which feeds it
+    /// MER events via `on_event`) and the dedicated AGC driver thread
+    /// (which calls `tick` periodically and applies any returned
+    /// `AgcAction` via the SDR Arc). The UI reads `snapshot()` for the
+    /// gain readout in the Signal panel.
+    agc: Option<Arc<Mutex<AgcController>>>,
+    /// Driver thread that periodically `tick`s the AGC controller and
+    /// applies gain changes mid-stream. Joined in `stop`.
+    agc_thread: Option<JoinHandle<()>>,
+    /// Stop flag for the AGC driver thread. Set in `stop` before
+    /// joining.
+    agc_stop: Option<Arc<AtomicBool>>,
+    /// Gain mode in effect for the currently-running (or most recent)
+    /// piped stream. Preserved across `stop()` so `retune` can reuse it
+    /// without the caller having to plumb it back through. `None` until
+    /// the first piped Start.
+    last_gain_mode: Option<GainMode>,
+    /// Manual gain in tenths of dB that was applied (or would be applied
+    /// in `GainMode::Manual`) for the current/last piped stream.
+    /// Preserved across `stop()` for the same reason as `last_gain_mode`.
+    last_manual_gain_tenths: Option<i32>,
     tx: Sender<NrscEvent>,
     rx: Receiver<NrscEvent>,
     exe_path: PathBuf,
@@ -145,6 +179,11 @@ impl Nrsc5Process {
             sdr: None,
             last_mode: None,
             spectrum_tap: None,
+            agc: None,
+            agc_thread: None,
+            agc_stop: None,
+            last_gain_mode: None,
+            last_manual_gain_tenths: None,
             tx,
             rx,
             exe_path,
@@ -158,6 +197,30 @@ impl Nrsc5Process {
     /// read on every paint.
     pub fn set_spectrum_tap(&mut self, tap: crate::dsp::SpectrumTap) {
         self.spectrum_tap = Some(tap);
+    }
+
+    /// Read-only snapshot of the closed-loop AGC controller for the UI.
+    /// Returns `None` when no piped stream is active (USB / rtl_tcp
+    /// backends don't run our AGC \u2014 nrsc5 owns the dongle there).
+    /// Cheap to call every frame.
+    pub fn agc_snapshot(&self) -> Option<AgcSnapshot> {
+        self.agc.as_ref().and_then(|h| h.lock().ok().map(|g| g.snapshot()))
+    }
+
+    /// Gain mode in effect for the currently-running (or most recent)
+    /// piped stream. `None` until the first piped Start. The UI uses
+    /// this to detect whether the user's desired `config.gain_mode`
+    /// differs from what's actually running (in which case a
+    /// "restart to apply" hint is shown).
+    pub fn active_gain_mode(&self) -> Option<GainMode> {
+        self.last_gain_mode
+    }
+
+    /// Manual gain (tenths of dB) in effect for the current/last piped
+    /// stream. Mirrors `active_gain_mode` and lets the UI detect a
+    /// pending change to `manual_gain_tenths` while streaming.
+    pub fn active_manual_gain_tenths(&self) -> Option<i32> {
+        self.last_manual_gain_tenths
     }
 
     pub fn events(&self) -> &Receiver<NrscEvent> {
@@ -211,7 +274,7 @@ impl Nrsc5Process {
         let stderr = child.stderr.take().expect("stderr was piped");
         let tx = self.tx.clone();
         let stderr_thread = std::thread::spawn(move || {
-            parse_stderr(stderr, tx, program);
+            parse_stderr(stderr, tx, program, None);
         });
 
         self.child = Some(child);
@@ -251,7 +314,7 @@ impl Nrsc5Process {
         let stderr = child.stderr.take().expect("stderr was piped");
         let tx = self.tx.clone();
         let stderr_thread = std::thread::spawn(move || {
-            parse_stderr(stderr, tx, program);
+            parse_stderr(stderr, tx, program, None);
         });
 
         self.child = Some(child);
@@ -276,18 +339,34 @@ impl Nrsc5Process {
         frequency_mhz: f32,
         program: u32,
         device_index: u32,
+        gain_mode: GainMode,
+        manual_gain_tenths: i32,
     ) -> Result<(), Nrsc5Error> {
         self.stop();
         while self.rx.try_recv().is_ok() {}
 
-        // Open + configure a fresh SDR for this stream.
+        // Open + configure a fresh SDR for this stream. The initial
+        // gain depends on which mode we're operating in:
+        //
+        //   * `Auto`        — leave gain alone here; the AGC controller
+        //                    constructed below will set the starting
+        //                    value via its own `initial_action`.
+        //   * `Manual`      — force manual gain mode at the user-chosen
+        //                    value. Snapping happens inside the SDR.
+        //   * `HardwareAgc` — leave gain alone so the R820T2's hardware
+        //                    AGC stays in charge (librtlsdr's default).
+        let initial_gain_tenths = match gain_mode {
+            GainMode::Auto => None,
+            GainMode::Manual => Some(manual_gain_tenths),
+            GainMode::HardwareAgc => None,
+        };
         let rtl = crate::sdr::RtlSdr::open(device_index)?;
         rtl.configure(&SdrConfig {
             center_freq_hz: (frequency_mhz * 1_000_000.0) as u32,
             sample_rate_sps: 1_488_375,
             ppm_correction: 0,
             direct_sampling: 0,
-            initial_gain_tenths: None,
+            initial_gain_tenths,
         })?;
         let sdr: Arc<dyn Sdr> = Arc::new(rtl);
 
@@ -319,9 +398,53 @@ impl Nrsc5Process {
         let mut child_stdin = child.stdin.take().expect("stdin was piped");
         let stderr = child.stderr.take().expect("stderr was piped");
 
+        // ----- AGC controller (only in `Auto` mode) -----------------
+        // Build the controller, apply its initial gain to the SDR, and
+        // wrap in `Arc<Mutex<_>>` so the stderr-parser thread (tee) and
+        // the AGC driver thread (tick + apply) can share it. In
+        // `Manual` / `HardwareAgc` we leave these `None` and skip the
+        // driver thread entirely — the dongle's gain is set once by
+        // `configure` above and never touched again for this stream.
+        let (agc, agc_stderr_handle) = if gain_mode == GainMode::Auto {
+            let agc_ctrl = AgcController::new(
+                sdr.gain_table_tenths(),
+                AgcConfig::default(),
+            );
+            let agc = Arc::new(Mutex::new(agc_ctrl));
+            let initial = agc
+                .lock()
+                .expect("AGC mutex poisoned at startup")
+                .initial_action();
+            let _ = sdr.set_tuner_gain_tenths(initial.new_tenths);
+            let _ = self
+                .tx
+                .send(NrscEvent::AgcDecision {
+                    tenths: initial.new_tenths,
+                    reason: initial.reason,
+                });
+            let stderr_handle = Arc::clone(&agc);
+            (Some(agc), Some(stderr_handle))
+        } else {
+            // Surface the chosen mode on the status line so the user
+            // can see what's running without checking config.toml.
+            let label = match gain_mode {
+                GainMode::Manual => format!(
+                    "manual gain: {:.1} dB",
+                    manual_gain_tenths as f32 / 10.0
+                ),
+                GainMode::HardwareAgc => "hardware AGC".to_string(),
+                GainMode::Auto => unreachable!(),
+            };
+            let _ = self.tx.send(NrscEvent::AgcDecision {
+                tenths: manual_gain_tenths,
+                reason: label,
+            });
+            (None, None)
+        };
+
         let stderr_tx = self.tx.clone();
         let stderr_thread = std::thread::spawn(move || {
-            parse_stderr(stderr, stderr_tx, program);
+            parse_stderr(stderr, stderr_tx, program, agc_stderr_handle);
         });
 
         // I/Q pump. Owns the SDR (via Arc clone) and `child_stdin`
@@ -375,6 +498,51 @@ impl Nrsc5Process {
         self.iq_thread = Some(iq_thread);
         self.sdr = Some(sdr);
         self.last_mode = Some(LastStartMode::Piped);
+        self.last_gain_mode = Some(gain_mode);
+        self.last_manual_gain_tenths = Some(manual_gain_tenths);
+
+        // ----- AGC driver thread (only when AGC is active) ----------
+        // Ticks the controller every ~500 ms and applies any gain
+        // change it asks for via the shared SDR Arc. Sends an
+        // `AgcDecision` event so the UI's "last changed" timestamp
+        // matches the moment of the real FFI call. Skipped entirely in
+        // `Manual` / `HardwareAgc` modes — there's no controller to
+        // tick and no decisions to apply.
+        if let Some(agc) = agc {
+            let agc_for_driver = Arc::clone(&agc);
+            let sdr_for_agc: Arc<dyn Sdr> =
+                Arc::clone(self.sdr.as_ref().expect("sdr just set"));
+            let agc_stop = Arc::new(AtomicBool::new(false));
+            let agc_stop_for_driver = Arc::clone(&agc_stop);
+            let agc_tx = self.tx.clone();
+            let agc_thread = std::thread::spawn(move || {
+                while !agc_stop_for_driver.load(Ordering::Relaxed) {
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    if agc_stop_for_driver.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    // Lock briefly to extract any pending action;
+                    // release the lock BEFORE the FFI call so the
+                    // stderr-parser thread can keep feeding events
+                    // without contention.
+                    let action = match agc_for_driver.lock() {
+                        Ok(mut ctrl) => ctrl.tick(),
+                        Err(_) => break, // mutex poisoned — give up gracefully
+                    };
+                    if let Some(action) = action {
+                        let _ = sdr_for_agc.set_tuner_gain_tenths(action.new_tenths);
+                        let _ = agc_tx.send(NrscEvent::AgcDecision {
+                            tenths: action.new_tenths,
+                            reason: action.reason,
+                        });
+                    }
+                }
+            });
+
+            self.agc = Some(agc);
+            self.agc_thread = Some(agc_thread);
+            self.agc_stop = Some(agc_stop);
+        }
         Ok(())
     }
 
@@ -386,11 +554,22 @@ impl Nrsc5Process {
     /// the legacy USB and rtl_tcp paths this is a no-op for the SDR
     /// state (nrsc5 owns it directly there).
     pub fn stop(&mut self) {
+        // Signal the AGC driver thread to stop first — it borrows the
+        // SDR Arc and we want it joined before we drop the SDR below.
+        if let Some(flag) = self.agc_stop.as_ref() {
+            flag.store(true, Ordering::Relaxed);
+        }
         // Cancel the SDR stream first so the I/Q pump exits cleanly
         // and drops its `ChildStdin`, sending EOF to nrsc5. The cancel
         // call is idempotent and safe even when no stream is running.
         if let Some(sdr) = self.sdr.as_ref() {
             let _ = sdr.cancel_stream();
+        }
+        // Join the AGC driver thread now that its stop flag is set
+        // and the stream is being torn down. Holds the SDR Arc clone;
+        // must be joined before `self.sdr = None` below.
+        if let Some(handle) = self.agc_thread.take() {
+            let _ = handle.join();
         }
         // Join the I/Q pump first so its `ChildStdin` is released
         // before we try to wait on the child (avoids a deadlock where
@@ -412,6 +591,10 @@ impl Nrsc5Process {
         // and `RtlSdr::Drop` runs `rtlsdr_close`. Safe on the modern
         // osmocom librtlsdr.dll (≥ 2022-01).
         self.sdr = None;
+        // Clear AGC handles last — all references (driver thread,
+        // stderr-parser thread tee) are gone by this point.
+        self.agc = None;
+        self.agc_stop = None;
     }
 
     /// Retune: stop the active stream and restart in the same mode
@@ -433,7 +616,12 @@ impl Nrsc5Process {
         std::thread::sleep(std::time::Duration::from_millis(250));
         match mode {
             Some(LastStartMode::Piped) => {
-                self.start_piped(frequency_mhz, program, device_index)
+                // Reuse the gain settings from the previous start. New
+                // piped streams always come from the GUI which sources
+                // these from `AppConfig`; retune doesn't need to know.
+                let gain_mode = self.last_gain_mode.unwrap_or_default();
+                let manual = self.last_manual_gain_tenths.unwrap_or(197);
+                self.start_piped(frequency_mhz, program, device_index, gain_mode, manual)
             }
             Some(LastStartMode::RtlTcp { host, port }) => {
                 self.start_rtltcp(frequency_mhz, program, &host, port)
@@ -453,7 +641,12 @@ impl Drop for Nrsc5Process {
 
 // -- Stderr Parser ----------------------------------------------------
 
-fn parse_stderr<R: std::io::Read>(stderr: R, tx: Sender<NrscEvent>, program: u32) {
+fn parse_stderr<R: std::io::Read>(
+    stderr: R,
+    tx: Sender<NrscEvent>,
+    program: u32,
+    agc: Option<Arc<Mutex<AgcController>>>,
+) {
     let reader = std::io::BufReader::new(stderr);
     let mut got_first_audio_bitrate = false;
 
@@ -471,6 +664,15 @@ fn parse_stderr<R: std::io::Read>(stderr: R, tx: Sender<NrscEvent>, program: u32
         };
 
         if let Some(evt) = parse_line(msg, program, &mut got_first_audio_bitrate) {
+            // Tee MER/Sync events into the AGC controller (cheap;
+            // controller filters internally to the variants it cares
+            // about). Done before sending so the controller's state is
+            // up-to-date by the time anyone observes the event.
+            if let Some(handle) = agc.as_ref() {
+                if let Ok(mut ctrl) = handle.lock() {
+                    ctrl.on_event(&evt);
+                }
+            }
             if tx.send(evt).is_err() {
                 break;
             }

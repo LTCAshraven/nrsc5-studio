@@ -4,6 +4,7 @@ use crate::ffi::{Nrsc5Process, NrscEvent};
 use crate::gui::dock::{DockTab, DockViewer, UiCommand};
 use crate::gui::state::{AppState, ArtTile};
 use crate::maps::{TrafficMap, WeatherMap};
+use crate::sdr::R820T_GAINS_TENTHS;
 use chrono::Utc;
 use egui_dock::{DockArea, DockState, NodeIndex, NodePath, SurfaceIndex};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -29,6 +30,23 @@ fn collage_tile_cap(cfg: &AppConfig) -> usize {
         .min(ART_TILES_HARD_MAX)
         .next_power_of_two()
         .min(ART_TILES_HARD_MAX)
+}
+
+/// Snap an arbitrary tenths-of-dB gain value to the nearest entry in the
+/// R820T2 tuner's discrete gain table. The dongle silently rounds
+/// off-table values to its nearest step, so we do the same here and
+/// store the snapped value — keeps the UI readout honest.
+fn snap_to_gain_table(tenths: i32) -> i32 {
+    let mut best = R820T_GAINS_TENTHS[0];
+    let mut best_diff = (tenths - best).abs();
+    for &step in &R820T_GAINS_TENTHS[1..] {
+        let d = (tenths - step).abs();
+        if d < best_diff {
+            best_diff = d;
+            best = step;
+        }
+    }
+    best
 }
 /// Rolling window for the album-art collage. Plays older than this are
 /// pruned on every new event so the heat-map keeps moving instead of
@@ -197,6 +215,8 @@ impl Nrsc5App {
                 nrsc5_status,
                 volume: config.volume.clamp(0.0, 1.0),
                 muted: config.muted,
+                gain_mode: config.gain_mode,
+                manual_gain_tenths: config.manual_gain_tenths,
                 // Default to "present" + "probe available" so the no-SDR
                 // overlay only appears once we've actually probed and seen
                 // zero devices — avoids a flash on launch.
@@ -567,6 +587,18 @@ impl Nrsc5App {
             .last_signal_at
             .map(|t| t.elapsed().as_secs_f32())
             .unwrap_or(0.0);
+
+        // Refresh the AGC snapshot for the Signal panel readout. Cheap
+        // (Mutex try-lock + shallow Clone) and only `Some` while a
+        // piped stream is active; cleared back to `None` on stop.
+        self.app_state.agc_snapshot = self.nrsc5.as_ref().and_then(|n| n.agc_snapshot());
+        // Refresh the active gain-mode mirrors so the dropdown can show
+        // a "(restart stream to apply)" hint when the user changes the
+        // selection mid-stream.
+        self.app_state.active_gain_mode =
+            self.nrsc5.as_ref().and_then(|n| n.active_gain_mode());
+        self.app_state.active_manual_gain_tenths =
+            self.nrsc5.as_ref().and_then(|n| n.active_manual_gain_tenths());
     }
 
     /// Periodically attempt to (re)discover the nrsc5 audio session. The
@@ -1066,6 +1098,20 @@ impl Nrsc5App {
                 self.app_state.agc_db = gain_db;
                 self.app_state.nrsc5_status = format!("best gain: {:.1} dB", gain_db);
             }
+            NrscEvent::AgcDecision { tenths, reason: _ } => {
+                // Closed-loop AGC just applied a new gain. Mirror it
+                // into `agc_db` so the existing readout stays accurate
+                // even on the piped backend (where nrsc5 won't emit an
+                // `Agc { gain_db }` line of its own). The detailed
+                // status (probing/settled/bailed, reason, time since
+                // change) is surfaced via `agc_snapshot` in the Signal
+                // panel — we deliberately do NOT clobber
+                // `nrsc5_status` here, because that string is the
+                // single source of truth for stream sync state used by
+                // other panels (Constellation lock indicator, etc).
+                let db = tenths as f32 / 10.0;
+                self.app_state.agc_db = db;
+            }
             NrscEvent::AudioStarted { .. } => {
                 self.last_signal_at = Some(Instant::now());
                 self.app_state.active_program = self.app_state.selected_program;
@@ -1234,7 +1280,13 @@ impl Nrsc5App {
                     // on the first call and kept alive for the lifetime
                     // of the app — see `Nrsc5Process::sdr` for why the
                     // bundled DLL forces this open-once architecture.
-                    nrsc5.start_piped(mhz, program, self.config.rtl_device_index)
+                    nrsc5.start_piped(
+                        mhz,
+                        program,
+                        self.config.rtl_device_index,
+                        self.config.gain_mode,
+                        self.config.manual_gain_tenths,
+                    )
                 } else {
                     nrsc5.start(mhz, program, self.config.rtl_device_index)
                 };
@@ -1451,6 +1503,27 @@ impl Nrsc5App {
                 self.config.collage_max_tiles = snapped;
                 self.app_state.collage_tile_cap = snapped;
                 self.rebuild_art_tiles();
+                save_config(&self.config);
+            }
+            UiCommand::SetGainMode(mode) => {
+                if self.config.gain_mode == mode {
+                    self.app_state.gain_mode = mode;
+                    return;
+                }
+                self.config.gain_mode = mode;
+                self.app_state.gain_mode = mode;
+                save_config(&self.config);
+            }
+            UiCommand::SetManualGainTenths(tenths) => {
+                // Snap to the nearest R820T2 table step so the UI's
+                // readout matches what the SDR will actually do.
+                let snapped = snap_to_gain_table(tenths);
+                if self.config.manual_gain_tenths == snapped {
+                    self.app_state.manual_gain_tenths = snapped;
+                    return;
+                }
+                self.config.manual_gain_tenths = snapped;
+                self.app_state.manual_gain_tenths = snapped;
                 save_config(&self.config);
             }
             UiCommand::ExportLogCsv => {

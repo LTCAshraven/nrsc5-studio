@@ -1,7 +1,8 @@
 use std::time::Instant;
 
 pub use crate::maps::WeatherFrame;
-use crate::dsp::{SpectrumSnapshot, SpectrumTap};
+use crate::config::GainMode;
+use crate::dsp::{AgcSnapshot, SpectrumSnapshot, SpectrumTap};
 
 /// One tile in the album-art heat-map collage: the file path to the image,
 /// the number of times it has appeared, and the unique (title, artist) pairs
@@ -132,6 +133,28 @@ pub struct AppState {
     /// Cached GPU texture for the scrolling waterfall. Re-uploaded when
     /// `spectrum_last_drawn_generation` falls behind the tap.
     pub spectrum_texture: Option<egui::TextureHandle>,
+    /// Latest snapshot of the closed-loop AGC controller, refreshed once
+    /// per frame from `Nrsc5Process::agc_snapshot()`. `None` whenever no
+    /// piped stream is active (USB / rtl_tcp backends don't run our AGC;
+    /// `agc_db` carries nrsc5's own reading there).
+    pub agc_snapshot: Option<AgcSnapshot>,
+    /// User-selected tuner gain control mode. Mirrors
+    /// `AppConfig.gain_mode`; the UI mutates this and the app pushes
+    /// the change back into config on `UiCommand::SetGainMode`.
+    pub gain_mode: GainMode,
+    /// User-selected manual tuner gain in tenths of dB. Mirrors
+    /// `AppConfig.manual_gain_tenths`. Only meaningful when
+    /// `gain_mode == Manual`.
+    pub manual_gain_tenths: i32,
+    /// Gain mode actually in effect for the currently-running piped
+    /// stream, or `None` when nothing is streaming on the piped backend.
+    /// Compared against `gain_mode` to decide whether to show the
+    /// "(restart stream to apply)" hint next to the dropdown.
+    pub active_gain_mode: Option<GainMode>,
+    /// Manual gain tenths actually in effect for the current piped
+    /// stream. Compared against `manual_gain_tenths` for the same
+    /// "restart to apply" purpose.
+    pub active_manual_gain_tenths: Option<i32>,
 }
 
 /// Render mode for the Log tab — chronological list of every play, or a

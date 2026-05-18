@@ -8,11 +8,15 @@ NRSC5 Studio gives you everything `nrsc5.exe` already does — tuning, demodulat
 
 ---
 
-## Screenshot
+## Screenshots
 
+![NRSC5 Studio default layout](docs/screenshot01.png)
 
-![NRSC5 Studio main window](docs/screenshot01.png)
-![NRSC5 Studio main window collage focus](docs/screenshot02.png)
+*The default dock layout — Tuner, Now-Playing, Spectrum, Constellation, Traffic, Weather, and the rolling Album-Art Collage all visible at once.*
+
+![NRSC5 Studio collage-focused layout](docs/screenshot02.png)
+
+*The egui-based dock is fully configurable: drag tabs into floating panes, close the ones you don't need, and feature the ones you do. Here the album-art collage takes center stage on a station that doesn't broadcast traffic or weather.*
 
 ---
 
@@ -21,10 +25,13 @@ NRSC5 Studio gives you everything `nrsc5.exe` already does — tuning, demodulat
 - **Full HD Radio playback** — HD1/HD2/HD3/HD4 subchannel selection, automatic retune on frequency change, persistent presets you can save, recall, rename, and re-target via a double-click edit dialog.
 - **Now-Playing pane** — title / artist / album / genre from broadcast metadata, plus cover art and the station logo if the station you are listening to transmits it.
 - **Album-Art Collage** — a rolling 8-hour squarified-treemap heat-map of every unique cover seen on the station. Frequent plays grow into bigger tiles; the layout re-flows as new art comes in. **Survives restarts** — covers are cached to `%LOCALAPPDATA%\nrsc5-studio\art-cache\` so the heat-map repopulates instantly on relaunch (within the 8-hour window).
-- **QPSK Constellation** — a phosphor-green scope showing the OFDM-subcarrier constellation cloud, with cloud spread driven by live MER per sideband. Watch the cloud tighten as signal quality improves.
+- **24-Hour Song Log** — every play the station broadcasts metadata for is captured with a timestamp and persisted across restarts. Two views: a **Timeline** of the most recent plays and a **Top Played** grouping by `(title, artist)`. Export to RFC-4180 CSV for the scrobbler crowd. Aggressive filtering keeps station IDs, slogans, and call signs out of the log.
+- **Spectrum + Waterfall** — a dedicated SDR scope tab with a 1024-bin live FFT trace (SDR#-style translucent gradient fill, ±20 dB grid, faint shading at the HD digital sidebands at ±129–199 kHz) and a 256-row scrolling waterfall underneath with a turbo colormap. Driven from a tap on the same I/Q stream that feeds the decoder, so what you see is what nrsc5 sees.
+- **QPSK Constellation** — a phosphor-green scope showing the OFDM-subcarrier constellation cloud, with cloud spread driven by live MER per sideband. Watch the cloud tighten as signal quality improves — especially satisfying while the AGC walks into its sweet spot.
+- **Closed-Loop AGC** — a host-side automatic-gain-control loop (separate from the dongle's built-in AGC) that walks the R820T2 gain table to find the setting that maximizes per-sideband MER for whatever signal you're tuned to. Switch between **Auto** / **Manual** / **Hardware AGC** in the Signal panel; choice persists between runs.
 - **Traffic Map** — TPEG traffic-tile decode, stitched into a single map image the moment all tiles for an area arrive. Only IHeartMedia stations transmit this. [IHeartMedia Stations](https://www.iheartmedia.com/stations)
 - **Weather Radar Animation** — every weather overlay frame from the broadcast is captured with its real wall-clock timestamp. Play / pause / scrub through up to 90 minutes of frames with a rocker slider; duplicate frames are deduplicated by content hash so the loop only advances when the station actually pushes new radar. Only IHeartMedia stations transmit this. [IHeartMedia Stations](https://www.iheartmedia.com/stations)
-- **Signal Quality** — live MER (lower / upper sidebands), BER counters.
+- **Signal Quality** — live MER (lower / upper sidebands), BER counters, and the current AGC gain in dB with a status badge (probing / settled / bailed) and time-since-last-change.
 - **Per-app Volume** — Windows COM-based per-process volume / mute, so NRSC5 Studio's volume slider only changes NRSC5 Studio's audio (not the whole system).
 - **Friendly first-run experience** — if no RTL-SDR is plugged in, a centered "Plug in an RTL-SDR and press Refresh" overlay replaces the cryptic empty state. The overlay auto-dismisses the moment a dongle is detected.
 - **Persistent dock layout** — drag tabs into floating sub-panes, split horizontally or vertically. Your layout is restored on the next launch.
@@ -114,10 +121,15 @@ src/
   main.rs           entry point, window/viewport setup
   app.rs            top-level eframe app, event loop, command dispatch
   icon.rs           procedurally-rendered broadcast-tower window icon
-  config.rs         persisted user settings (presets, theme, volume, etc.)
-  ffi/              spawns nrsc5.exe and parses its stderr stream
+  config.rs         persisted user settings (presets, theme, volume, gain mode, ...)
+  art_cache.rs      content-addressed on-disk cache for album art + station logos
+  play_log.rs       24-hour rolling song log + RFC-4180 CSV export
+  sdr_detect.rs     librtlsdr presence probe for the no-SDR overlay
+  ffi/              spawns nrsc5.exe, parses its stderr stream, runs the AGC driver thread
+  sdr/              in-process RTL-SDR backend (modern librtlsdr.dll, I/Q pipe to nrsc5.exe)
+  dsp/              FFT-based spectrum tap and the closed-loop AGC controller
   gui/
-    dock.rs         tab definitions and tab UIs (Tuner, Weather, …)
+    dock.rs         tab definitions and tab UIs (Tuner, Spectrum, Signal, Log, ...)
     state.rs        runtime state shared with the GUI
   collage/          album-art history / squarified-treemap layout
   maps/             traffic + weather map composition (PNG outputs)

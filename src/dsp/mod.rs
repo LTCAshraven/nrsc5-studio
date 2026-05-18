@@ -1,8 +1,10 @@
 //! Digital-signal processing helpers that sit alongside the audio pipeline.
 //!
-//! Currently exposes the [`spectrum`] module, which provides the FFT tap
-//! consumed by the Spectrum / waterfall panel.
+//! * [`spectrum`] — FFT tap consumed by the Spectrum / waterfall panel.
+//! * [`agc`] — closed-loop AGC state machine driven by nrsc5's MER stream.
 
+pub mod agc;
 pub mod spectrum;
 
+pub use agc::{AgcConfig, AgcController, AgcSnapshot, AgcStatus};
 pub use spectrum::{SpectrumSnapshot, SpectrumTap, FFT_SIZE, WATERFALL_ROWS};

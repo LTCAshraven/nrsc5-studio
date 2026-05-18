@@ -2,6 +2,25 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum GainMode {
+    /// Closed-loop software AGC (the controller in `src/dsp/agc.rs`).
+    /// This is the default — it's what makes weak/marginal stations
+    /// usable on the R820T2 without per-station hand-tuning.
+    #[default]
+    Auto,
+    /// Hold a fixed manual gain (value in `manual_gain_tenths`). Useful
+    /// for A/B testing or when a station is known to want a specific
+    /// gain. The value is snapped to the nearest table step at apply time.
+    Manual,
+    /// Hand control to the R820T2's hardware AGC. Almost always wrong
+    /// for HD Radio (it over-amplifies the analog carrier and clips the
+    /// ADC, killing MER) but kept as an escape hatch for debugging and
+    /// for parity with USB / rtl_tcp paths where nrsc5 owns the dongle.
+    HardwareAgc,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Preset {
     pub name: String,
@@ -37,6 +56,15 @@ pub struct AppConfig {
     /// range are clamped on load.
     #[serde(default = "default_collage_max_tiles")]
     pub collage_max_tiles: u32,
+    /// How the tuner gain is controlled on the piped backend. Defaults
+    /// to `Auto` (closed-loop AGC); see [`GainMode`] for the alternatives.
+    #[serde(default)]
+    pub gain_mode: GainMode,
+    /// Tuner gain in tenths of dB used when `gain_mode == Manual`.
+    /// Snapped to the nearest R820T2 table step at apply time. Default
+    /// 197 (19.7 dB), the mid-range starting point inherited from the AGC.
+    #[serde(default = "default_manual_gain_tenths")]
+    pub manual_gain_tenths: i32,
 }
 
 fn default_volume() -> f32 {
@@ -45,6 +73,10 @@ fn default_volume() -> f32 {
 
 fn default_collage_max_tiles() -> u32 {
     64
+}
+
+fn default_manual_gain_tenths() -> i32 {
+    197
 }
 
 impl Default for AppConfig {
@@ -62,6 +94,8 @@ impl Default for AppConfig {
             volume: 1.0,
             muted: false,
             collage_max_tiles: 64,
+            gain_mode: GainMode::Auto,
+            manual_gain_tenths: 197,
         }
     }
 }

@@ -1,4 +1,4 @@
-use crate::config::Preset;
+use crate::config::{GainMode, Preset};
 use crate::gui::state::{AppState, LogViewMode};
 use crate::play_log::PlayLog;
 use egui::{Color32, DragValue, RichText, Ui, Vec2, WidgetText};
@@ -27,6 +27,13 @@ pub enum UiCommand {
     /// Write the current play log to a CSV file. App resolves the path and
     /// surfaces it through `AppState::log_export_status`.
     ExportLogCsv,
+    /// Switch tuner gain control mode (Auto / Manual / HardwareAgc).
+    /// Persisted to config; takes effect on the next piped Start.
+    SetGainMode(GainMode),
+    /// Set the manual tuner gain in tenths of dB. Snapped to the nearest
+    /// R820T2 step at apply time. Persisted to config; takes effect on
+    /// the next piped Start.
+    SetManualGainTenths(i32),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -941,6 +948,163 @@ impl DockViewer<'_> {
         signal_badge(ui, "BER", &format!("{:.5}", ber), ber_color);
         ui.add_space(6.0);
 
+        // ----- AGC readout ----------------------------------------------
+        // Only meaningful while the closed-loop AGC is actually running
+        // (piped backend, stream active). The snapshot is `None`
+        // otherwise — fall back to the existing `agc_db` line in the
+        // status row below in that case.
+        if let Some(snap) = self.app_state.agc_snapshot.as_ref() {
+            use crate::dsp::AgcStatus;
+            // Status icons are drawn from blocks egui's default font
+            // covers (General Punctuation, Latin-1) — the Geometric
+            // Shapes block (● ○ ◐) renders as tofu. Color is still the
+            // primary cue; the glyph is decoration that disambiguates
+            // for anyone color-blind.
+            let (status_text, status_color) = match snap.status {
+                AgcStatus::Probing => (
+                    "\u{2026} PROBING",      // U+2026 HORIZONTAL ELLIPSIS — "in motion"
+                    Color32::from_rgb(200, 160, 50),
+                ),
+                AgcStatus::Settled => (
+                    "\u{2022} SETTLED",      // U+2022 BULLET — "locked in"
+                    Color32::from_rgb(60, 170, 90),
+                ),
+                AgcStatus::Bailed => (
+                    "\u{00D7} BAILED",       // U+00D7 MULTIPLICATION SIGN — "gave up"
+                    Color32::from_rgb(200, 70, 70),
+                ),
+            };
+            let gain_db = snap.current_tenths as f32 / 10.0;
+            let secs_since_change = snap.last_change_at.elapsed().as_secs();
+            let ago = if secs_since_change < 60 {
+                format!("{}s ago", secs_since_change)
+            } else if secs_since_change < 3600 {
+                format!("{}m ago", secs_since_change / 60)
+            } else {
+                format!("{}h ago", secs_since_change / 3600)
+            };
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("AGC").small().strong().color(dim));
+                ui.add_space(4.0);
+                ui.label(RichText::new(status_text).small().color(status_color));
+            });
+            ui.label(
+                RichText::new(format!("Gain: {:.1} dB \u{00B7} {}", gain_db, ago))
+                    .small()
+                    .color(dim),
+            )
+            .on_hover_text(&snap.last_reason);
+            ui.add_space(6.0);
+        }
+
+        // ----- Gain mode control ----------------------------------------
+        // Always visible, regardless of whether anything is streaming so
+        // the user can pick a mode before pressing Start. Selection is
+        // persisted immediately; takes effect on the next piped Start.
+        // The "(restart to apply)" hint surfaces when the live stream's
+        // mode differs from the user's choice.
+        ui.separator();
+        ui.label(RichText::new("Gain mode").small().strong().color(dim));
+        let selected = self.app_state.gain_mode;
+        let mut new_mode: Option<GainMode> = None;
+        egui::ComboBox::from_id_salt("gain_mode_combo")
+            .selected_text(match selected {
+                GainMode::Auto => "Auto (closed-loop)",
+                GainMode::Manual => "Manual",
+                GainMode::HardwareAgc => "Hardware AGC",
+            })
+            .width(180.0)
+            .show_ui(ui, |ui| {
+                for (variant, label, hint) in [
+                    (
+                        GainMode::Auto,
+                        "Auto (closed-loop)",
+                        "Software AGC that walks the R820T2 gain table to maximize MER. Default — best choice for most stations.",
+                    ),
+                    (
+                        GainMode::Manual,
+                        "Manual",
+                        "Hold a fixed tuner gain. Use the slider below to pick a value from the 29-step R820T2 table.",
+                    ),
+                    (
+                        GainMode::HardwareAgc,
+                        "Hardware AGC",
+                        "Let the R820T2's own hardware AGC drive gain. Usually wrong for HD Radio (over-amplifies the analog carrier) — escape hatch only.",
+                    ),
+                ] {
+                    if ui
+                        .selectable_label(selected == variant, label)
+                        .on_hover_text(hint)
+                        .clicked()
+                    {
+                        new_mode = Some(variant);
+                    }
+                }
+            });
+        if let Some(mode) = new_mode {
+            self.commands.push(UiCommand::SetGainMode(mode));
+        }
+
+        // Manual-gain slider, only visible when Manual is selected.
+        if self.app_state.gain_mode == GainMode::Manual {
+            let table = crate::sdr::R820T_GAINS_TENTHS;
+            let mut idx = table
+                .iter()
+                .position(|&t| t == self.app_state.manual_gain_tenths)
+                .unwrap_or_else(|| {
+                    // Off-table value (hand-edited config); pick the
+                    // nearest step so the slider has something to anchor.
+                    let target = self.app_state.manual_gain_tenths;
+                    table
+                        .iter()
+                        .enumerate()
+                        .min_by_key(|(_, &t)| (t - target).abs())
+                        .map(|(i, _)| i)
+                        .unwrap_or(0)
+                });
+            let initial_idx = idx;
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Gain").small().color(dim));
+                ui.add(
+                    egui::Slider::new(&mut idx, 0..=(table.len() - 1))
+                        .show_value(false)
+                        .clamping(egui::SliderClamping::Always),
+                );
+                ui.label(
+                    RichText::new(format!("{:.1} dB", table[idx] as f32 / 10.0))
+                        .small()
+                        .monospace()
+                        .color(dim),
+                );
+            });
+            if idx != initial_idx {
+                self.commands
+                    .push(UiCommand::SetManualGainTenths(table[idx]));
+            }
+        }
+
+        // "(restart to apply)" hint when the live stream's mode/value
+        // doesn't match the user's current choice.
+        let needs_restart = match self.app_state.active_gain_mode {
+            Some(active) => {
+                active != self.app_state.gain_mode
+                    || (self.app_state.gain_mode == GainMode::Manual
+                        && self.app_state.active_manual_gain_tenths
+                            != Some(self.app_state.manual_gain_tenths))
+            }
+            None => false,
+        };
+        if needs_restart {
+            ui.label(
+                RichText::new("(restart stream to apply)")
+                    .small()
+                    .italics()
+                    .color(Color32::from_rgb(200, 160, 50)),
+            );
+        }
+        ui.add_space(6.0);
+
         ui.separator();
         ui.label(
             RichText::new(format!("Status: {}", self.app_state.nrsc5_status))
@@ -1314,9 +1478,7 @@ impl DockViewer<'_> {
             };
             ui.label(RichText::new(label).color(Color32::from_gray(170)));
             ui.label(
-                RichText::new("\u{2022} rolling 24h")
-                    .small()
-                    .color(Color32::from_gray(140)),
+                RichText::new("\u{2022} rolling 24h").color(Color32::from_gray(140)),
             )
             .on_hover_text(
                 "The log keeps up to the last 24 hours of plays \
