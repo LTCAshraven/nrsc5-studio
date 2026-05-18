@@ -37,6 +37,20 @@ if (Test-Path (Join-Path $Root "res\config.toml")) {
     Copy-Item -Path (Join-Path $Root "res\config.toml") -Destination $OutDir -Force
 }
 
+# Resources required at runtime. `res\map.png` is the full US base map
+# the WeatherMap crops cached basemaps from — without it on disk the
+# weather radar pipeline silently no-ops because no basemap can be
+# produced. `find_map_file` walks up from the exe dir looking for
+# `res/map.png`, so we preserve the `res\` subfolder in the portable
+# layout.
+$ResOutDir = Join-Path $OutDir "res"
+if (-not (Test-Path $ResOutDir)) {
+    New-Item -ItemType Directory -Path $ResOutDir -Force | Out-Null
+}
+if (Test-Path (Join-Path $Root "res\map.png")) {
+    Copy-Item -Path (Join-Path $Root "res\map.png") -Destination $ResOutDir -Force
+}
+
 # Portable-mode marker. Its presence beside nrsc5-studio.exe makes the
 # app write all persistent state (config, art cache, play log, dock
 # layout, traffic/weather scratch) into a `data\` folder next to the
