@@ -220,7 +220,6 @@ impl Nrsc5App {
                 frequency_mhz: config.frequency_mhz,
                 selected_program: config.selected_program,
                 dark_mode: config.dark_mode,
-                station_name: format!("HD{}", config.selected_program + 1),
                 nrsc5_status,
                 volume: config.volume.clamp(0.0, 1.0),
                 muted: config.muted,
@@ -1196,9 +1195,18 @@ impl Nrsc5App {
             }
             NrscEvent::Sync => {
                 self.last_signal_at = Some(Instant::now());
+                self.app_state.currently_synced = true;
+                self.app_state.lost_sync_at = None;
                 self.app_state.nrsc5_status = "synced".to_string();
             }
             NrscEvent::LostSync => {
+                // Stamp the loss; the dock's `available_programs()` and
+                // `sync_data_stale()` honor a grace window before
+                // actually blanking the UI.
+                self.app_state.currently_synced = false;
+                if self.app_state.lost_sync_at.is_none() {
+                    self.app_state.lost_sync_at = Some(Instant::now());
+                }
                 self.app_state.nrsc5_status = "sync lost".to_string();
             }
             NrscEvent::Mer { lower, upper } => {
@@ -1230,8 +1238,6 @@ impl Nrsc5App {
             NrscEvent::AudioStarted { .. } => {
                 self.last_signal_at = Some(Instant::now());
                 self.app_state.active_program = self.app_state.selected_program;
-                self.app_state.station_name =
-                    format!("HD{}", self.app_state.selected_program + 1);
 
                 if let Some(started) = self.start_requested_at.take() {
                     self.app_state.nrsc5_status = format!(
@@ -1239,6 +1245,26 @@ impl Nrsc5App {
                         self.app_state.selected_program + 1,
                         started.elapsed().as_secs_f32()
                     );
+                }
+            }
+            NrscEvent::AudioBitRate { program, kbps } => {
+                // Per-program audio bit rate readout for the Station
+                // Info panel. nrsc5 only decodes one program at a time,
+                // so this always lands on whatever subchannel the user
+                // is currently tuned to. Upsert the slot in case
+                // bit-rate lines arrive before any SIG Service / Audio
+                // Program line (rare but possible on weak signals).
+                let idx = program as usize;
+                if idx < 8 {
+                    let slot = &mut self.app_state.station_info.programs[idx];
+                    let info = slot.get_or_insert_with(|| {
+                        crate::station_info::ProgramInfo::from_short_name(
+                            String::new(),
+                        )
+                    });
+                    info.bit_rate_kbps = Some(kbps);
+                    self.app_state.station_info.last_updated =
+                        Some(Instant::now());
                 }
             }
             NrscEvent::Metadata {
@@ -1342,14 +1368,103 @@ impl Nrsc5App {
                 }
             }
             NrscEvent::StationName(name) => {
-                self.app_state.station_name = name;
+                self.app_state.station_info.call_sign = Some(name);
+                self.app_state.station_info.last_updated = Some(Instant::now());
+            }
+            NrscEvent::Slogan(text) => {
+                self.app_state.station_info.slogan = Some(text);
+                self.app_state.station_info.last_updated = Some(Instant::now());
+            }
+            NrscEvent::Message(text) => {
+                self.app_state.station_info.message = Some(text);
+                self.app_state.station_info.last_updated = Some(Instant::now());
+            }
+            NrscEvent::Location {
+                latitude,
+                longitude,
+                altitude_m,
+            } => {
+                self.app_state.station_info.location =
+                    Some(crate::station_info::Location {
+                        latitude,
+                        longitude,
+                        altitude_m,
+                    });
+                self.app_state.station_info.last_updated = Some(Instant::now());
+            }
+            NrscEvent::CountryFcc {
+                country,
+                facility_id,
+            } => {
+                self.app_state.station_info.country = Some(country);
+                self.app_state.station_info.fcc_facility_id = Some(facility_id);
+                self.app_state.station_info.last_updated = Some(Instant::now());
             }
             NrscEvent::SigServiceAudio { number, name } => {
-                // `number` is 1-indexed; store under the matching program slot.
-                if number >= 1 && number <= 4 {
+                // `number` is 1-indexed (HD1..HD8). Upsert into the
+                // 0-indexed program slot — create if missing, update
+                // the short name if a slot already exists from an
+                // earlier AudioProgram event.
+                if (1..=8).contains(&number) {
                     let idx = (number - 1) as usize;
-                    self.app_state.short_names[idx] = name;
+                    let slot = &mut self.app_state.station_info.programs[idx];
+                    match slot {
+                        Some(info) => info.short_name = name,
+                        None => {
+                            *slot = Some(
+                                crate::station_info::ProgramInfo::from_short_name(
+                                    name,
+                                ),
+                            );
+                        }
+                    }
+                    self.app_state.station_info.last_updated =
+                        Some(Instant::now());
                 }
+            }
+            NrscEvent::AudioProgram {
+                number,
+                program_type,
+                sound_experience,
+            } => {
+                // Same upsert pattern as SigServiceAudio — either event
+                // can arrive first depending on the SIS cycle.
+                if (1..=8).contains(&number) {
+                    let idx = (number - 1) as usize;
+                    let slot = &mut self.app_state.station_info.programs[idx];
+                    let info = slot.get_or_insert_with(|| {
+                        crate::station_info::ProgramInfo::from_short_name(
+                            String::new(),
+                        )
+                    });
+                    info.program_type = Some(program_type);
+                    info.sound_experience = Some(sound_experience);
+                    self.app_state.station_info.last_updated =
+                        Some(Instant::now());
+                }
+            }
+            NrscEvent::SigServiceData { number, name } => {
+                // Dedup by SIS-assigned number: SIS repeats every few
+                // seconds, so replace any existing entry rather than
+                // appending duplicates.
+                let services = &mut self.app_state.station_info.data_services;
+                if let Some(existing) =
+                    services.iter_mut().find(|s| s.number == number)
+                {
+                    existing.name = name;
+                } else {
+                    services.push(crate::station_info::DataService {
+                        number,
+                        name,
+                        mime: None,
+                        service_data_type: None,
+                    });
+                }
+                self.app_state.station_info.last_updated = Some(Instant::now());
+            }
+            NrscEvent::EmergencyAlert { text } => {
+                self.app_state.station_info.alert = Some(text);
+                self.app_state.station_info.last_updated = Some(Instant::now());
             }
             _ => {}
         }
@@ -1432,6 +1547,8 @@ impl Nrsc5App {
                 self.app_state.is_streaming = false;
                 self.start_requested_at = None;
                 self.last_signal_at = None;
+                self.app_state.currently_synced = false;
+                self.app_state.lost_sync_at = None;
                 self.lot_files.clear();
                 self.app_state.cover_art_path = None;
                 self.app_state.station_logo_path = None;
@@ -1440,17 +1557,25 @@ impl Nrsc5App {
                 self.app_state.weather_current_frame = 0;
                 self.app_state.weather_playing = false;
                 self.app_state.call_sign.clear();
+                // Clear aggregated SIS so a fresh Start re-discovers identity
+                // from scratch rather than rendering stale fields from the
+                // last session.
+                self.app_state.station_info.reset();
                 self.traffic_map.clear();
                 self.weather_map.clear();
                 self.app_state.nrsc5_status = "stream stopped".to_string();
             }
             UiCommand::TuneMhz(mhz) => {
                 self.app_state.frequency_mhz = mhz;
-                self.app_state.station_name =
-                    format!("HD{}", self.app_state.selected_program + 1);
-                // Wipe per-station identity/state so a stale call sign
-                // or LOT filename from the previous station can't bleed
-                // into the new one before its first LOT arrives.
+                // Wipe per-station identity/state so a stale call sign,
+                // SIS data, or LOT filename from the previous station
+                // can't bleed into the new one before its first SIS
+                // cycle arrives. Step 12 will add LostSync-grace-period
+                // handling on top so brief flickers don't blank the
+                // panel.
+                self.app_state.station_info.reset();
+                self.app_state.currently_synced = false;
+                self.app_state.lost_sync_at = None;
                 self.app_state.call_sign.clear();
                 self.lot_files.clear();
                 self.config.frequency_mhz = mhz;
@@ -1498,7 +1623,6 @@ impl Nrsc5App {
                 }
 
                 self.app_state.selected_program = clamped;
-                self.app_state.station_name = format!("HD{}", clamped + 1);
                 self.config.selected_program = clamped;
                 save_config(&self.config);
 
@@ -1530,18 +1654,32 @@ impl Nrsc5App {
                     format!("selected HD{} (staged)", clamped + 1);
             }
             UiCommand::SavePreset(slot) => {
+                // Fallback chain for the preset's display name:
+                //   1. SIS per-program short name (e.g. "The Eagle")
+                //   2. currently-playing artist (when audio is up)
+                //   3. SIS-reported station call sign (e.g. "KEGL-FM")
+                //   4. LOT-derived call sign (heuristic from filenames)
+                //   5. bare "HDn" label
+                let idx = self.app_state.selected_program as usize;
                 let short = self
                     .app_state
-                    .short_names
-                    .get(self.app_state.selected_program as usize)
-                    .cloned()
+                    .station_info
+                    .programs
+                    .get(idx)
+                    .and_then(|s| s.as_ref())
+                    .map(|p| p.short_name.clone())
                     .unwrap_or_default();
                 let name = if !short.is_empty() {
                     short
                 } else if !self.app_state.artist.is_empty() {
                     self.app_state.artist.clone()
+                } else if let Some(cs) = self.app_state.station_info.call_sign.clone()
+                {
+                    cs
+                } else if !self.app_state.call_sign.is_empty() {
+                    self.app_state.call_sign.clone()
                 } else {
-                    self.app_state.station_name.clone()
+                    format!("HD{}", idx + 1)
                 };
                 let preset = crate::config::Preset {
                     name,
@@ -1579,8 +1717,6 @@ impl Nrsc5App {
                 if let Some(preset) = self.config.presets.get(slot).cloned() {
                     self.app_state.frequency_mhz = preset.frequency_mhz;
                     self.app_state.selected_program = preset.program;
-                    self.app_state.station_name =
-                        format!("HD{}", preset.program + 1);
                     self.app_state.nrsc5_status = format!(
                         "preset {}: {:.1} HD{}",
                         slot + 1,

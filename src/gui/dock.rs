@@ -87,6 +87,11 @@ pub enum UiCommand {
 pub enum DockTab {
     Tuner,
     NowPlaying,
+    /// Aggregated SIS readout for the currently tuned station — call
+    /// sign, slogan, location, inferred service mode, per-program
+    /// info, data services, alerts. Closed by default; opened from
+    /// the toolbar's panel toggle row.
+    StationInfo,
     Traffic,
     Weather,
     Signal,
@@ -105,9 +110,10 @@ pub enum DockTab {
 
 impl DockTab {
     /// All panel variants in the order they should appear in the View menu.
-    pub const ALL: [DockTab; 9] = [
+    pub const ALL: [DockTab; 10] = [
         DockTab::Tuner,
         DockTab::NowPlaying,
+        DockTab::StationInfo,
         DockTab::Collage,
         DockTab::Spectrum,
         DockTab::Signal,
@@ -122,6 +128,7 @@ impl DockTab {
         match self {
             DockTab::Tuner => "\u{1F4FB} Tuner",
             DockTab::NowPlaying => "\u{1F3B5} Now Playing",
+            DockTab::StationInfo => "\u{1F4DA} Station Info",
             DockTab::Collage => "\u{1F5BC} Collage",
             DockTab::Spectrum => "\u{1F4CA} Spectrum",
             DockTab::Signal => "\u{1F4F6} Signal",
@@ -147,6 +154,7 @@ impl TabViewer for DockViewer<'_> {
         match tab {
             DockTab::Tuner => "\u{1F4FB} Tuner".into(),
             DockTab::NowPlaying => "\u{1F3B5} Now Playing".into(),
+            DockTab::StationInfo => "\u{1F4DA} Station Info".into(),
             DockTab::Traffic => "\u{1F697} Traffic".into(),
             DockTab::Weather => "\u{2601} Weather".into(),
             DockTab::Signal => "\u{1F4F6} Signal".into(),
@@ -161,6 +169,7 @@ impl TabViewer for DockViewer<'_> {
         match tab {
             DockTab::Tuner => self.tuner_ui(ui),
             DockTab::NowPlaying => self.now_playing_ui(ui),
+            DockTab::StationInfo => self.station_info_ui(ui),
             DockTab::Traffic => self.traffic_ui(ui),
             DockTab::Weather => self.weather_ui(ui),
             DockTab::Signal => self.signal_ui(ui),
@@ -192,18 +201,45 @@ impl DockViewer<'_> {
         ui.horizontal(|ui| {
             ui.label(RichText::new("Program").strong());
 
-            let mut selected = self.app_state.selected_program.min(3);
-            let mut changed = false;
-            for i in 0..4u32 {
-                let label = format!("HD{}", i + 1);
-                if ui.selectable_value(&mut selected, i, label).changed() {
-                    changed = true;
-                }
-            }
+            // Snapshot the "which subchannels has the station advertised"
+            // gate up-front so the closure doesn't borrow `self.app_state`
+            // mutably while we're still reading it.
+            let available = self.app_state.available_programs();
+            let current = self.app_state.selected_program.min(7);
 
-            if changed {
-                self.commands.push(UiCommand::SelectProgram(selected));
-            }
+            // 2 rows of 4 buttons. The split mirrors the HD Radio
+            // partition layout (HD1-4 on P1+P3, HD5-8 on the P4 that
+            // MP11 adds) and stacks better on narrow dock widths than
+            // a single row of 8. Unlit buttons render with `.weak()`
+            // text but stay clickable — presets tune blind and SIS
+            // takes a second to light up, so blocking clicks on
+            // unadvertised programs would be wrong.
+            ui.vertical(|ui| {
+                for row in 0..2u32 {
+                    ui.horizontal(|ui| {
+                        for col in 0..4u32 {
+                            let i = row * 4 + col;
+                            let lit = available[i as usize];
+                            let mut text = RichText::new(format!("HD{}", i + 1));
+                            if !lit {
+                                text = text.weak();
+                            }
+                            let mut resp =
+                                ui.selectable_label(current == i, text);
+                            if !lit {
+                                resp = resp.on_hover_text(
+                                    "Not advertised by this station. \
+                                     Click to tune anyway.",
+                                );
+                            }
+                            if resp.clicked() && current != i {
+                                self.commands
+                                    .push(UiCommand::SelectProgram(i));
+                            }
+                        }
+                    });
+                }
+            });
         });
         ui.add_space(4.0);
         ui.separator();
@@ -385,13 +421,23 @@ impl DockViewer<'_> {
                             ui.end_row();
 
                             ui.label("Subchannel");
-                            ui.horizontal(|ui| {
-                                for sub in 0..4u32 {
-                                    ui.selectable_value(
-                                        &mut self.app_state.editing_preset_program,
-                                        sub,
-                                        format!("HD{}", sub + 1),
-                                    );
+                            // 2x4 grid of HD1..HD8 — mirrors the tuner
+                            // panel's layout. Always all enabled here
+                            // (this is a config editor; the user may
+                            // save a preset for a subchannel they
+                            // haven't tuned to yet).
+                            ui.vertical(|ui| {
+                                for row in 0..2u32 {
+                                    ui.horizontal(|ui| {
+                                        for col in 0..4u32 {
+                                            let sub = row * 4 + col;
+                                            ui.selectable_value(
+                                                &mut self.app_state.editing_preset_program,
+                                                sub,
+                                                format!("HD{}", sub + 1),
+                                            );
+                                        }
+                                    });
                                 }
                             });
                             ui.end_row();
@@ -463,7 +509,6 @@ impl DockViewer<'_> {
     fn now_playing_ui(&mut self, ui: &mut Ui) {
         let accent = Color32::from_rgb(100, 160, 255);
         let dim = Color32::from_gray(160);
-        let muted = Color32::from_gray(120);
 
         // Line 1: Artist (long station name OR song artist — changes with broadcast).
         if !self.app_state.artist.is_empty() {
@@ -483,22 +528,9 @@ impl DockViewer<'_> {
             );
         }
 
-        // Line 3: Derived station identity — "KEGL 97.1 HD2".
-        let hd = self.app_state.selected_program + 1;
-        let identity = if !self.app_state.call_sign.is_empty() {
-            format!(
-                "{} {:.1} HD{}",
-                self.app_state.call_sign, self.app_state.frequency_mhz, hd
-            )
-        } else {
-            format!("{:.1} HD{}", self.app_state.frequency_mhz, hd)
-        };
-        ui.label(
-            RichText::new(&identity)
-                .monospace()
-                .small()
-                .color(muted),
-        );
+        // (Station identity line removed — the upcoming Station Information
+        // panel (0.3.5) is the canonical surface for call sign / frequency /
+        // subchannel. Avoids the stale-callsign bug here.)
         ui.add_space(6.0);
 
         // Album art
@@ -513,6 +545,199 @@ impl DockViewer<'_> {
             );
         } else {
             ui.label(RichText::new("Waiting for album art...").color(dim));
+        }
+    }
+
+    /// Aggregated SIS readout for the currently tuned station. Renders
+    /// fields harvested from nrsc5 stderr (call sign, slogan, message,
+    /// alert, country/FCC ID, transmitter location, per-program info,
+    /// data services) plus an inferred service-mode badge. Stays
+    /// empty with a "Waiting for SIS\u2026" placeholder until any field
+    /// is populated. Survives brief LostSync flickers because the
+    /// underlying [`StationInfo`] is only cleared on retune / Stop.
+    fn station_info_ui(&mut self, ui: &mut Ui) {
+        let info = &self.app_state.station_info;
+        let accent = Color32::from_rgb(100, 160, 255);
+        let dim = Color32::from_gray(160);
+        let muted = Color32::from_gray(120);
+        let alert_red = Color32::from_rgb(220, 80, 80);
+
+        if !info.has_any_data() {
+            ui.add_space(8.0);
+            ui.vertical_centered(|ui| {
+                ui.label(
+                    RichText::new("Waiting for SIS\u{2026}")
+                        .italics()
+                        .color(dim),
+                );
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(
+                        "Station identity, slogan, programs, and location\nappear here once HD sync stabilizes.",
+                    )
+                    .small()
+                    .color(muted),
+                );
+            });
+            return;
+        }
+
+        // Alert banner pinned to the top when active.
+        if let Some(text) = info.alert.clone() {
+            egui::Frame::new()
+                .fill(Color32::from_rgba_unmultiplied(220, 80, 80, 40))
+                .corner_radius(egui::CornerRadius::same(4))
+                .inner_margin(egui::Margin::symmetric(8, 6))
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new(format!("\u{26A0} {}", text))
+                            .color(alert_red)
+                            .strong(),
+                    );
+                });
+            ui.add_space(6.0);
+        }
+
+        // Header row: call sign + inferred service-mode badge.
+        ui.horizontal(|ui| {
+            let call_sign = info
+                .call_sign
+                .clone()
+                .unwrap_or_else(|| "(unknown call sign)".to_string());
+            ui.label(RichText::new(call_sign).heading().color(accent));
+            if let Some(mode) = info.infer_service_mode() {
+                ui.add_space(10.0);
+                let resp = ui.label(
+                    RichText::new(format!("[{} \u{2022} inferred]", mode.label()))
+                        .small()
+                        .color(muted),
+                );
+                resp.on_hover_text(
+                    "HD Radio service mode inferred from the highest subchannel\nadvertised in SIS. nrsc5 does not report the mode directly.",
+                );
+            }
+        });
+
+        if let Some(slogan) = &info.slogan {
+            ui.label(RichText::new(slogan).italics().color(dim));
+        }
+        if let Some(message) = &info.message {
+            ui.label(RichText::new(message).color(dim));
+        }
+
+        ui.add_space(6.0);
+        ui.separator();
+        ui.add_space(4.0);
+
+        // Identity: country + FCC facility ID on one row.
+        if info.country.is_some() || info.fcc_facility_id.is_some() {
+            ui.horizontal(|ui| {
+                if let Some(country) = &info.country {
+                    ui.label(RichText::new("Country:").color(muted));
+                    ui.label(RichText::new(country).monospace());
+                }
+                if let Some(fcc) = info.fcc_facility_id {
+                    ui.add_space(14.0);
+                    ui.label(RichText::new("FCC ID:").color(muted));
+                    ui.label(RichText::new(fcc.to_string()).monospace());
+                }
+            });
+        }
+
+        // Transmitter location.
+        if let Some(loc) = info.location {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Location:").color(muted));
+                ui.label(
+                    RichText::new(format!(
+                        "{:.4}\u{00B0}, {:.4}\u{00B0}  (alt {} m)",
+                        loc.latitude, loc.longitude, loc.altitude_m
+                    ))
+                    .monospace(),
+                );
+            });
+        }
+
+        ui.add_space(6.0);
+        ui.separator();
+        ui.add_space(4.0);
+
+        // Subchannels — only show rows for slots SIS has actually advertised.
+        ui.label(RichText::new("Subchannels").color(muted).small());
+        if info.program_count() == 0 {
+            ui.label(
+                RichText::new("none advertised yet")
+                    .italics()
+                    .color(dim),
+            );
+        } else {
+            egui::Grid::new("station_info_programs_grid")
+                .num_columns(5)
+                .spacing([10.0, 2.0])
+                .show(ui, |ui| {
+                    for (i, slot) in info.programs.iter().enumerate() {
+                        let Some(prog) = slot else { continue };
+                        ui.label(
+                            RichText::new(format!("HD{}", i + 1))
+                                .strong()
+                                .color(accent),
+                        );
+                        let name_txt = if prog.short_name.is_empty() {
+                            "\u{2014}".to_string()
+                        } else {
+                            prog.short_name.clone()
+                        };
+                        ui.label(RichText::new(name_txt));
+                        ui.label(
+                            RichText::new(prog.program_type.as_deref().unwrap_or("\u{2014}"))
+                                .color(dim),
+                        );
+                        ui.label(
+                            RichText::new(
+                                prog.sound_experience.as_deref().unwrap_or("\u{2014}"),
+                            )
+                            .color(dim),
+                        );
+                        // Bit rate column \u2014 only the currently-decoded
+                        // program will have a value, since nrsc5 emits
+                        // `Audio bit rate:` for whatever subchannel it's
+                        // tuned to. Other rows render an em-dash.
+                        let bitrate_txt = prog
+                            .bit_rate_kbps
+                            .map(|k| format!("{:.0} kbps", k))
+                            .unwrap_or_else(|| "\u{2014}".to_string());
+                        ui.label(RichText::new(bitrate_txt).color(dim).monospace());
+                        ui.end_row();
+                    }
+                });
+        }
+
+        // Data services (only if any).
+        if !info.data_services.is_empty() {
+            ui.add_space(6.0);
+            ui.separator();
+            ui.add_space(4.0);
+            ui.label(RichText::new("Data Services").color(muted).small());
+            for svc in &info.data_services {
+                ui.label(RichText::new(format!("#{}  {}", svc.number, svc.name)));
+            }
+        }
+
+        // Footer: relative "last updated" timestamp. Request a follow-up
+        // repaint so the counter ticks while the panel is visible.
+        if let Some(ts) = info.last_updated {
+            ui.add_space(8.0);
+            let secs = ts.elapsed().as_secs();
+            let txt = if secs < 1 {
+                "updated just now".to_string()
+            } else if secs < 60 {
+                format!("updated {}s ago", secs)
+            } else {
+                format!("updated {}m ago", secs / 60)
+            };
+            ui.label(RichText::new(txt).small().color(muted));
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_secs(1));
         }
     }
 

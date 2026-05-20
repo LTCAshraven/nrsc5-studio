@@ -1,9 +1,10 @@
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 pub use crate::maps::WeatherFrame;
 use crate::config::GainMode;
 use crate::dsp::{AgcSnapshot, SpectrumSnapshot, SpectrumTap};
 use crate::sdr::{DeviceInfo, GainElement};
+use crate::station_info::StationInfo;
 
 /// One tile in the album-art heat-map collage: the file path to the image,
 /// the number of times it has appeared, and the unique (title, artist) pairs
@@ -25,10 +26,29 @@ pub struct AppState {
     pub dark_mode: bool,
     pub active_program: u32,
     pub is_streaming: bool,
-    pub station_name: String,
-    /// Short per-program station names from SIG Service, indexed by program (0..4).
-    pub short_names: [String; 4],
+    /// True while nrsc5 reports OFDM sync against the current station.
+    /// Distinct from `is_streaming` (which only means the child process
+    /// is up) and from `lost_sync_at` (which is `Some` only *after* a
+    /// known sync was lost). Used by [`AppState::available_programs`]
+    /// to gate the implicit HD1 light — a station with no HD signal
+    /// at all never sets this true, so HD1 stays dark.
+    pub currently_synced: bool,
+    /// Wall-clock time we last received `NrscEvent::LostSync` since the
+    /// most recent `Sync`. `None` when we're currently synced (or have
+    /// never synced). Combined with [`AppState::LOST_SYNC_GRACE`] this
+    /// distinguishes brief sync fades (don't blank the UI) from
+    /// sustained loss of signal (blank advertised-but-now-unreachable
+    /// HD subchannel buttons).
+    pub lost_sync_at: Option<Instant>,
+    /// Aggregated SIS data for the currently tuned station — call sign,
+    /// slogan, location, per-program info, data services, etc. Populated
+    /// by the event dispatcher in `app.rs`; rendered by the Station
+    /// Information panel (0.3.5). Reset on every retune.
+    pub station_info: StationInfo,
     /// Broadcaster call sign (e.g. "KEGL"), derived from LOT filenames.
+    /// Distinct from `station_info.call_sign` (which is the SIS-reported
+    /// `Station name:` line). Used by the play log heuristics and as a
+    /// fallback when SIS hasn't arrived yet.
     pub call_sign: String,
     pub title: String,
     pub artist: String,
@@ -176,6 +196,62 @@ pub struct AppState {
     /// throttle automatic refreshes and to show "Last refreshed Xs ago"
     /// in the modal.
     pub sdr_devices_last_refreshed: Option<Instant>,
+}
+
+impl AppState {
+    /// Grace period after a `LostSync` during which the HD subchannel
+    /// selector keeps its previously-observed lit buttons lit. Real HD
+    /// Radio reception fades and recovers on the order of one to a few
+    /// seconds in moving vehicles; greying out HD2..HD8 on every
+    /// flicker would make the UI feel broken. Five seconds is long
+    /// enough to ride out typical fades, short enough that a truly
+    /// lost signal blanks the selector promptly.
+    pub const LOST_SYNC_GRACE: Duration = Duration::from_secs(5);
+
+    /// True if we've been out of sync for longer than [`Self::LOST_SYNC_GRACE`].
+    /// The dock uses this to decide whether the cached SIS program list
+    /// should be considered stale for display purposes — the underlying
+    /// `station_info` data is *not* cleared (step 12 is the dedicated
+    /// lifecycle pass), only its UI surface dims.
+    pub fn sync_data_stale(&self) -> bool {
+        self.lost_sync_at
+            .map(|t| t.elapsed() >= Self::LOST_SYNC_GRACE)
+            .unwrap_or(false)
+    }
+
+    /// Derived `[bool; 8]` indicating which HD subchannels should be
+    /// rendered as "lit up" in the program selector (indices 0..7
+    /// correspond to HD1..HD8).
+    ///
+    /// Derivation rules:
+    /// - Not streaming → all `false` (the selector greys out entirely).
+    /// - Out of sync past the grace window → all `false`.
+    /// - HD1 is force-lit whenever we've been synced this session
+    ///   (currently synced *or* within the LostSync grace window).
+    ///   nrsc5 doesn't always emit a `SIG Service` line for the
+    ///   implicit main program, so we light HD1 by reception, not by
+    ///   SIS advertisement.
+    /// - Otherwise per-slot: `true` for any slot the station has
+    ///   advertised in SIS (i.e. `station_info.programs[i].is_some()`).
+    pub fn available_programs(&self) -> [bool; 8] {
+        if !self.is_streaming || self.sync_data_stale() {
+            return [false; 8];
+        }
+        let mut out = [false; 8];
+        // HD1 implicit-light rule: synced now, or synced recently
+        // (within the grace window — `sync_data_stale()` already
+        // returned false above, so any `lost_sync_at` value here is
+        // fresh). Either way we have sync confidence on this station.
+        if self.currently_synced || self.lost_sync_at.is_some() {
+            out[0] = true;
+        }
+        for (i, slot) in self.station_info.programs.iter().enumerate() {
+            if slot.is_some() {
+                out[i] = true;
+            }
+        }
+        out
+    }
 }
 
 /// Render mode for the Log tab — chronological list of every play, or a

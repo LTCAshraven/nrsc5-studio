@@ -4,6 +4,97 @@ All notable changes to NRSC5 Studio are documented here. The format roughly
 follows [Keep a Changelog](https://keepachangelog.com/), and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.3.5] - 2026-05-20
+
+Identity release. Everything nrsc5 prints from a station's SIS table —
+call sign, slogan, message banner, country / FCC facility ID,
+transmitter lat / lon / altitude, per-subchannel program metadata,
+data services, emergency alerts — now has a first-class home in a new
+**📚 Station Information** dock tab. The Tuner panel's HD1–HD8
+selector is SIS-aware: subchannels that the station actually
+advertises light up; the rest stay clickable but dimmed with a
+"Not advertised by this station" tooltip. No SDR backend or DSP
+changes; both RTL-SDR and SDRplay behave identically to 0.3.1.
+
+### Added
+
+- **`📚 Station Information` dock tab.** New panel surfacing the
+  full SIS table:
+  - **Call sign** + service mode badge (`MP1` / `MP3` / `MP11`,
+    marked "inferred" since nrsc5 doesn't emit the mode directly
+    — derived from the highest populated program slot).
+  - **Slogan** and **station message** (the rolling text banner
+    some stations broadcast).
+  - **Emergency alerts** rendered in a red callout banner when set.
+  - **Country** and **FCC facility ID** with the FCC ID linked to
+    `fcc.gov`'s public facility lookup.
+  - **Transmitter location** — latitude, longitude, altitude in
+    meters.
+  - **Subchannel grid** with five columns per program slot:
+    program number, short name, program type, sound experience,
+    and audio bit rate in kbps.
+  - **Data services** list (SIG-table service number, name, MIME
+    type, service-data-type label).
+  - **"Last updated" footer** so it's clear how recently each
+    field has been refreshed by the broadcast cycle.
+  - A `Waiting for SIS…` placeholder while the table is still
+    being filled in after sync.
+- **SIS-aware HD1–HD8 program selector.** The Tuner panel's
+  subchannel buttons now consult `station_info.programs[]`:
+  advertised subchannels render at full intensity; the rest are
+  dimmed but still clickable with a tooltip explaining the station
+  doesn't list that program (you can still probe in case SIS hasn't
+  caught up).
+- **`src/station_info.rs`** — new domain module with `StationInfo`,
+  `ProgramInfo`, `Location`, `DataService`, and `ServiceMode`
+  types. `infer_service_mode()` derives MP1 / MP3 / MP11 from the
+  highest populated program slot. `reset()` is called on every
+  retune and Stop so an old station's identity doesn't carry over.
+- **Six new SIS stderr-parser events** in `src/ffi/mod.rs` with
+  format-locked unit tests against nrsc5's literal output lines:
+  `Slogan`, `Message`, `Location`, `CountryFcc`, `AudioProgram`,
+  `SigServiceData`.
+- **Per-program audio bit rate parsing.** New
+  `NrscEvent::AudioBitRate { program, kbps }` variant emitted on
+  every `Audio bit rate:` line nrsc5 prints (not just the first),
+  with the value pushed into `station_info.programs[program]
+  .bit_rate_kbps` and rendered in the subchannel grid's new
+  fifth column.
+- **Diagnostic stderr for SoapySDR stream failures.** When the
+  in-process SoapySDR backend's `run_stream` returns an error,
+  the actual `SoapySDR` error text is now printed as
+  `[sdr] run_stream failed: <error>` immediately before the
+  `LostDevice` event is sent. Makes triaging SDRplay `device
+  lost` reports straightforward — the underlying USB / API /
+  timeout reason now shows up in the log instead of being
+  swallowed.
+
+### Changed
+
+- **Now Playing tab no longer claims station identity.** The old
+  "KEGL 101.1 HD2" line (call sign + frequency + active program)
+  was removed; that information now lives in the Station
+  Information panel where it can be shown alongside slogan,
+  message, location, and the rest of the SIS table.
+- **Preset save fallback chain.** When saving a tune as a preset,
+  the auto-derived label now falls back through SIS short name →
+  artist → SIS call sign → LOT-derived call sign → `HDn` (was:
+  just the legacy `station_name`).
+- **`station_name` / `short_names` migrated to `station_info
+  .programs[]`.** The legacy fields are gone from
+  `gui::AppState`; the rest of the code now reads from the
+  unified `station_info` aggregate. Saved presets and play-log
+  entries from prior versions continue to load unchanged — only
+  the in-memory representation changed.
+
+### Internal
+
+- **5 s `sync_data_stale()` grace window.** Brief `LostSync`
+  flickers (sub-second sync drops during fades / multipath) no
+  longer blank the Station Info panel. Fields are only cleared on
+  retune, Stop, or a sustained sync loss exceeding the grace
+  window.
+
 ## [0.3.1] - 2026-05-19
 
 Follow-up to 0.3.0 that actually makes SDRplay work end-to-end. The

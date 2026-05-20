@@ -16,6 +16,7 @@ mod paths;
 mod play_log;
 mod sdr;
 mod sdr_detect;
+mod station_info;
 #[cfg(target_os = "windows")]
 mod winaudio;
 

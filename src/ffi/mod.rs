@@ -28,6 +28,16 @@ pub enum NrscEvent {
         #[allow(dead_code)] // surfaced for future per-program plumbing
         program: u32,
     },
+    /// Per-program audio bit rate from `Audio bit rate: 96.0 kbps …`.
+    /// Emitted on every occurrence (not just the first —
+    /// `AudioStarted` carries the one-shot "audio is alive"
+    /// signal). `program` is 0-indexed and matches the program
+    /// nrsc5 was launched with, so it always corresponds to the
+    /// currently-decoded subchannel.
+    AudioBitRate {
+        program: u32,
+        kbps: f32,
+    },
     Metadata {
         #[allow(dead_code)] // surfaced for future per-program plumbing
         program: u32,
@@ -48,13 +58,51 @@ pub enum NrscEvent {
         lot: String,
     },
     StationName(String),
+    /// Long-form station identifier from `Slogan: …`. Sent by SIS
+    /// every few seconds while synced; receivers display it alongside
+    /// the call sign.
+    Slogan(String),
+    /// Free-text broadcaster message from `Message: …`. Used for
+    /// promos, "now playing on HD2", etc. — distinct from `Alert:`.
+    Message(String),
+    /// Transmitter location from `Location: <lat>, <lon>, <alt> m`.
+    /// `altitude_m` is height above mean sea level.
+    Location {
+        latitude: f64,
+        longitude: f64,
+        altitude_m: i32,
+    },
+    /// Country code + FCC facility ID from
+    /// `Country code: US, FCC facility ID: 12345`.
+    CountryFcc {
+        country: String,
+        facility_id: u32,
+    },
+    /// Per-program descriptor from
+    /// `Audio program N: <MPS|SPSx>, type: <Music|Talk|…>, sound experience: <Mono|Stereo|…>`.
+    /// `number` is 1-indexed to match the wire format (HD1..HD8).
+    AudioProgram {
+        number: u32,
+        program_type: String,
+        sound_experience: String,
+    },
     /// Per-program short station name, e.g. (1, "The Eagle") for HD1.
     /// `number` is the 1-indexed program (matches the wire format).
     SigServiceAudio {
         number: u32,
         name: String,
     },
-    EmergencyAlert,
+    /// Non-audio data service from `SIG Service: type=data number=N name=…`.
+    /// Inner `Component: …` lines (mime, service_data_type) are not yet
+    /// captured — added when the panel needs them.
+    SigServiceData {
+        number: u32,
+        name: String,
+    },
+    /// Emergency alert text from `Alert: …`. Empty alerts are dropped.
+    EmergencyAlert {
+        text: String,
+    },
     HereImage,
     Agc { gain_db: f32 },
     /// Closed-loop AGC controller applied a new tuner gain. Emitted
@@ -76,12 +124,19 @@ impl NrscEvent {
             Self::Mer { .. } => "mer",
             Self::Ber { .. } => "ber",
             Self::AudioStarted { .. } => "audio-started",
+            Self::AudioBitRate { .. } => "audio-bitrate",
             Self::Metadata { .. } => "metadata",
             Self::LotFile { .. } => "lot",
             Self::Xhdr { .. } => "xhdr",
             Self::StationName(_) => "station-name",
+            Self::Slogan(_) => "slogan",
+            Self::Message(_) => "message",
+            Self::Location { .. } => "location",
+            Self::CountryFcc { .. } => "country-fcc",
+            Self::AudioProgram { .. } => "audio-program",
             Self::SigServiceAudio { .. } => "sig-service-audio",
-            Self::EmergencyAlert => "emergency-alert",
+            Self::SigServiceData { .. } => "sig-service-data",
+            Self::EmergencyAlert { .. } => "emergency-alert",
             Self::HereImage => "here-image",
             Self::Agc { .. } => "agc",
             Self::AgcDecision { .. } => "agc-decision",
@@ -627,6 +682,14 @@ impl Nrsc5Process {
             // flag, which the rtl backend translates to Ok per
             // `stop_flag` discriminator in `src/sdr/rtl.rs`. A clean
             // BrokenPipe-driven exit (write_err_seen) also returns Ok.
+            if let Err(e) = &run_res {
+                // Surface the real Soapy error on stderr so a user
+                // hitting "device lost" can see whether it was a
+                // timeout, an overflow, an API-service disconnect,
+                // etc. Cheap diagnostic; only fires on actual
+                // backend failure, not on user Stop.
+                eprintln!("[sdr] run_stream failed: {e}");
+            }
             if run_res.is_err() {
                 let _ = evt_tx.send(NrscEvent::LostDevice);
             }
@@ -831,6 +894,20 @@ fn parse_stderr<R: std::io::Read>(
                 break;
             }
         }
+
+        // "Audio bit rate:" is also surfaced as a recurring
+        // `AudioBitRate` event so the Station Info panel can show a
+        // live kbps readout for the currently-decoded program. The
+        // one-shot `AudioStarted` event above is separate — it only
+        // fires on the first occurrence to drive the "audio started
+        // in Xs" status message.
+        if let Some(rest) = msg.strip_prefix("Audio bit rate: ") {
+            if let Some(kbps) = parse_audio_bitrate(rest) {
+                if tx.send(NrscEvent::AudioBitRate { program, kbps }).is_err() {
+                    break;
+                }
+            }
+        }
     }
 
     // NOTE: Intentionally do NOT emit `LostDevice` here. This loop
@@ -925,13 +1002,55 @@ fn parse_line(msg: &str, program: u32, got_first_audio: &mut bool) -> Option<Nrs
         return Some(NrscEvent::StationName(rest.to_string()));
     }
 
+    // "Slogan: Today's Hits"
+    if let Some(rest) = msg.strip_prefix("Slogan: ") {
+        if rest.is_empty() {
+            return None;
+        }
+        return Some(NrscEvent::Slogan(rest.to_string()));
+    }
+
+    // "Message: Welcome to KEGL"
+    if let Some(rest) = msg.strip_prefix("Message: ") {
+        if rest.is_empty() {
+            return None;
+        }
+        return Some(NrscEvent::Message(rest.to_string()));
+    }
+
+    // "Location: 39.123456, -76.987654, 100 m"
+    if let Some(rest) = msg.strip_prefix("Location: ") {
+        return parse_location(rest);
+    }
+
+    // "Country code: US, FCC facility ID: 12345"
+    if let Some(rest) = msg.strip_prefix("Country code: ") {
+        return parse_country_fcc(rest);
+    }
+
+    // "Audio program 1: MPS, type: Music, sound experience: Mono"
+    if let Some(rest) = msg.strip_prefix("Audio program ") {
+        return parse_audio_program(rest);
+    }
+
     // "SIG Service: type=audio number=2 name=The EDGE"
     if let Some(rest) = msg.strip_prefix("SIG Service: type=audio number=") {
         return parse_sig_service_audio(rest);
     }
 
-    if msg.starts_with("Alert:") {
-        return Some(NrscEvent::EmergencyAlert);
+    // "SIG Service: type=data number=4 name=Album Art"
+    if let Some(rest) = msg.strip_prefix("SIG Service: type=data number=") {
+        return parse_sig_service_data(rest);
+    }
+
+    // "Alert: National emergency test"
+    if let Some(rest) = msg.strip_prefix("Alert: ") {
+        if rest.is_empty() {
+            return None;
+        }
+        return Some(NrscEvent::EmergencyAlert {
+            text: rest.to_string(),
+        });
     }
 
     if msg.starts_with("HERE Image:") {
@@ -963,6 +1082,14 @@ fn parse_gain(rest: &str) -> Option<NrscEvent> {
     Some(NrscEvent::Agc { gain_db })
 }
 
+/// Pull the leading float out of an `Audio bit rate:` value. Accepts
+/// both the bare form ("96.0 kbps") and the extended form nrsc5 emits
+/// on later cycles ("96.00 kbps (96.13 average, 12.43 min, 99.18
+/// max)"). Returns `None` if the first token isn't a parseable float.
+fn parse_audio_bitrate(rest: &str) -> Option<f32> {
+    rest.split_whitespace().next()?.parse::<f32>().ok()
+}
+
 fn parse_lot(rest: &str) -> Option<NrscEvent> {
     // "port=0802 lot=16502 name=KDGE HD2HD024076.jpg size=10115 mime=1E653E9C"
     // name= value may contain spaces, so we extract it between "name=" and " size=".
@@ -989,6 +1116,70 @@ fn parse_sig_service_audio(rest: &str) -> Option<NrscEvent> {
         return None;
     }
     Some(NrscEvent::SigServiceAudio { number, name })
+}
+
+fn parse_sig_service_data(rest: &str) -> Option<NrscEvent> {
+    // Same wire shape as the audio variant: "<N> name=<Name>".
+    let (num_part, name_part) = rest.split_once(" name=")?;
+    let number = num_part.parse::<u32>().ok()?;
+    let name = name_part.trim().to_string();
+    if name.is_empty() {
+        return None;
+    }
+    Some(NrscEvent::SigServiceData { number, name })
+}
+
+fn parse_location(rest: &str) -> Option<NrscEvent> {
+    // "39.123456, -76.987654, 100 m"
+    let mut parts = rest.split(", ");
+    let latitude = parts.next()?.trim().parse::<f64>().ok()?;
+    let longitude = parts.next()?.trim().parse::<f64>().ok()?;
+    // Altitude segment is "<N> m" — take the leading token.
+    let alt_part = parts.next()?.trim();
+    let altitude_m = alt_part.split_whitespace().next()?.parse::<i32>().ok()?;
+    Some(NrscEvent::Location {
+        latitude,
+        longitude,
+        altitude_m,
+    })
+}
+
+fn parse_country_fcc(rest: &str) -> Option<NrscEvent> {
+    // "US, FCC facility ID: 12345"
+    let (country_part, fcc_part) = rest.split_once(", FCC facility ID: ")?;
+    let country = country_part.trim().to_string();
+    if country.is_empty() {
+        return None;
+    }
+    let facility_id = fcc_part.trim().parse::<u32>().ok()?;
+    Some(NrscEvent::CountryFcc {
+        country,
+        facility_id,
+    })
+}
+
+fn parse_audio_program(rest: &str) -> Option<NrscEvent> {
+    // rest = "1: MPS, type: Music, sound experience: Mono"
+    // The MPS/SPSx token is redundant with `number` (MPS=1, SPS1=2, …),
+    // so we skip it. We do capture type + sound experience.
+    let (num_part, after_num) = rest.split_once(": ")?;
+    let number = num_part.parse::<u32>().ok()?;
+
+    // after_num = "MPS, type: Music, sound experience: Mono"
+    let (_program_id, after_id) = after_num.split_once(", type: ")?;
+    // after_id = "Music, sound experience: Mono"
+    let (program_type, sound_experience) =
+        after_id.split_once(", sound experience: ")?;
+    let program_type = program_type.trim().to_string();
+    let sound_experience = sound_experience.trim().to_string();
+    if program_type.is_empty() || sound_experience.is_empty() {
+        return None;
+    }
+    Some(NrscEvent::AudioProgram {
+        number,
+        program_type,
+        sound_experience,
+    })
 }
 
 fn parse_xhdr(rest: &str) -> Option<NrscEvent> {
@@ -1034,4 +1225,145 @@ fn find_nrsc5_exe() -> Option<PathBuf> {
     }
 
     None
+}
+
+// -- Tests ------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    //! Format-lock tests for the SIS-related stderr parsers added in
+    //! 0.3.5. Each test mirrors the literal line nrsc5 prints so a
+    //! future upstream wording change fails loudly instead of silently
+    //! dropping events.
+
+    use super::*;
+
+    fn parse(msg: &str) -> Option<NrscEvent> {
+        let mut audio_seen = false;
+        parse_line(msg, 0, &mut audio_seen)
+    }
+
+    #[test]
+    fn parses_slogan() {
+        match parse("Slogan: Today's Hits") {
+            Some(NrscEvent::Slogan(s)) => assert_eq!(s, "Today's Hits"),
+            other => panic!("expected Slogan, got {:?}", other),
+        }
+        assert!(parse("Slogan: ").is_none());
+    }
+
+    #[test]
+    fn parses_message() {
+        match parse("Message: Welcome to KEGL") {
+            Some(NrscEvent::Message(s)) => assert_eq!(s, "Welcome to KEGL"),
+            other => panic!("expected Message, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parses_location() {
+        match parse("Location: 39.123456, -76.987654, 100 m") {
+            Some(NrscEvent::Location {
+                latitude,
+                longitude,
+                altitude_m,
+            }) => {
+                assert!((latitude - 39.123456).abs() < 1e-6);
+                assert!((longitude - -76.987654).abs() < 1e-6);
+                assert_eq!(altitude_m, 100);
+            }
+            other => panic!("expected Location, got {:?}", other),
+        }
+        // Malformed altitude segment must not crash.
+        assert!(parse("Location: 39.0, -76.0, garbage").is_none());
+    }
+
+    #[test]
+    fn parses_country_fcc() {
+        match parse("Country code: US, FCC facility ID: 12345") {
+            Some(NrscEvent::CountryFcc {
+                country,
+                facility_id,
+            }) => {
+                assert_eq!(country, "US");
+                assert_eq!(facility_id, 12345);
+            }
+            other => panic!("expected CountryFcc, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parses_audio_program() {
+        match parse("Audio program 1: MPS, type: Music, sound experience: Mono") {
+            Some(NrscEvent::AudioProgram {
+                number,
+                program_type,
+                sound_experience,
+            }) => {
+                assert_eq!(number, 1);
+                assert_eq!(program_type, "Music");
+                assert_eq!(sound_experience, "Mono");
+            }
+            other => panic!("expected AudioProgram, got {:?}", other),
+        }
+        // HD2 with SPS1 identifier still resolves to number=2.
+        match parse("Audio program 2: SPS1, type: Talk, sound experience: Stereo") {
+            Some(NrscEvent::AudioProgram { number, .. }) => assert_eq!(number, 2),
+            other => panic!("expected AudioProgram, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parses_sig_service_data() {
+        match parse("SIG Service: type=data number=4 name=Album Art") {
+            Some(NrscEvent::SigServiceData { number, name }) => {
+                assert_eq!(number, 4);
+                assert_eq!(name, "Album Art");
+            }
+            other => panic!("expected SigServiceData, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parses_alert_with_text() {
+        match parse("Alert: Severe thunderstorm warning") {
+            Some(NrscEvent::EmergencyAlert { text }) => {
+                assert_eq!(text, "Severe thunderstorm warning");
+            }
+            other => panic!("expected EmergencyAlert, got {:?}", other),
+        }
+        // Empty alert text is dropped (we never want a blank popup).
+        assert!(parse("Alert: ").is_none());
+    }
+
+    #[test]
+    fn parses_audio_bitrate_helper() {
+        // Bare form (early cycles).
+        assert_eq!(parse_audio_bitrate("96.0 kbps"), Some(96.0));
+        // Extended form (later cycles, with stats trailer).
+        assert_eq!(
+            parse_audio_bitrate("96.00 kbps (96.13 average, 12.43 min, 99.18 max)"),
+            Some(96.00)
+        );
+        // Integer form.
+        assert_eq!(parse_audio_bitrate("24 kbps"), Some(24.0));
+        // Garbage rejected, not a crash.
+        assert!(parse_audio_bitrate("").is_none());
+        assert!(parse_audio_bitrate("garbage kbps").is_none());
+    }
+
+    #[test]
+    fn existing_parsers_still_work() {
+        // Smoke check that pre-existing variants weren't broken by the
+        // reshuffle. One representative per category.
+        assert!(matches!(parse("Synchronized"), Some(NrscEvent::Sync)));
+        assert!(matches!(
+            parse("Station name: KROQ-FM"),
+            Some(NrscEvent::StationName(_))
+        ));
+        assert!(matches!(
+            parse("SIG Service: type=audio number=1 name=KEGL HD1"),
+            Some(NrscEvent::SigServiceAudio { number: 1, .. })
+        ));
+    }
 }
