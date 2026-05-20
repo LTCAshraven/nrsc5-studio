@@ -4,6 +4,204 @@ All notable changes to NRSC5 Studio are documented here. The format roughly
 follows [Keep a Changelog](https://keepachangelog.com/), and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.3.1] - 2026-05-19
+
+Follow-up to 0.3.0 that actually makes SDRplay work end-to-end. The
+0.3.0 multi-SDR release enumerated and tuned SDRplay devices but the
+HD Radio demodulator never synced because SDRplay's hardware can't
+produce nrsc5's required 1.488375 Msps sample rate. This release adds
+the missing software resampler and cleans up the SDRplay gain UI.
+
+### Added
+
+- **Fractional IQ resampler** (`src/sdr/resampler.rs`). New polyphase
+  sinc resampler bridging SDR backends whose minimum hardware sample
+  rate sits above nrsc5's required 1.488375 Msps. SDRplay's MSi001
+  chain quantizes to {62.5, 96, 125, 192, 250, 384, 500, 768, 1000}
+  ksps discretely and then a continuous range from 2 Msps up; the
+  resampler asks the device for 2 Msps and converts down to
+  1.488375 Msps in software (ratio 0.7441875) with a 128-tap
+  Blackman-Harris-windowed kernel. CPU cost is negligible at HD
+  Radio's bandwidth and the stopband attenuation is well below the
+  receiver noise floor.
+- **`rubato` 0.16** dependency (default-features off) backing the
+  resampler. Time-domain sinc only — no FFT path, no new system
+  libraries.
+
+### Changed
+
+- **SDRplay gain UI is now a single "Gain" slider.** SoapySDRPlay3
+  exposes IFGR (IF Gain Reduction, 20..59 dB, *inverted*) and RFGR
+  (RF Gain Reduction / LNA state, 0..9, *inverted*) as raw gain
+  elements. v0.3.0 surfaced both directly which was confusing —
+  sliders looked maxed when actually at minimum gain. v0.3.1 pins
+  the LNA at its most sensitive state (`rfgain_sel=0`, already in
+  0.3.0) and collapses the two reduction knobs into a single "Gain
+  (dB)" slider mapped to libSoapySDRPlay's aggregate-gain API,
+  which has un-inverted semantics (higher dB = more gain). The
+  AGC adapter drives the same knob. RTL-SDR and other multi-element
+  devices keep their per-element sliders unchanged.
+- **SDRplay sample rate** is now requested at 2 Msps internally
+  (previously a futile 1.488375 Msps request that silently snapped
+  to 2 Msps anyway). Visible only in `SoapySDRUtil` probes; the
+  app's spectrum view continues to report the post-resampler rate.
+
+### Fixed
+
+- **HD Radio sync on SDRplay.** Combined effect of the resampler
+  fix and the LNA/notch defaults already shipped in 0.3.0 means
+  SDRplay RSP1A / RSP1B / RSPduo / RSPdx now decode FM HD Radio
+  end-to-end without any user-side workarounds.
+- **SDRplay closed-loop AGC stability.** Three follow-on fixes
+  surfaced during 0.3.1 bench testing:
+  - **Driver-key case normalization.** `Device::driver_key()`
+    returns mixed-case (`"SDRplay"`, `"RTLSDR"`) on Soapy
+    0.8 while every internal lookup keyed on the lowercase form;
+    SDRplay sessions silently fell back to the RTL-SDR profile so
+    none of the bandwidth, notch, or AGC-element overrides took
+    effect. `SoapySdr::open` now lowercases the driver key
+    immediately.
+  - **Force HW AGC off.** `SoapySDRPlay3`'s internal hardware
+    AGC was left enabled in Auto gain mode and overrode every
+    `setGain` from the closed-loop driver thread, leading to
+    USB-stream churn and `lost-device` events. Configure now
+    unconditionally calls `set_gain_mode(false)` for SDRplay
+    regardless of UI gain mode.
+  - **Per-profile AGC start gain.** The closed-loop AGC's global
+    default (19.7 dB) is fine on RTL-SDR's 0..49 dB table but
+    landed at the bottom of SDRplay's 20..48 dB table and forced
+    a long climb before MER came up. New `DeviceProfile::
+    default_agc_initial_tenths` lets each profile pick its own
+    sweet-spot start: 19.7 dB on RTL-SDR (unchanged), 38 dB on
+    SDRplay, 24 dB on HackRF.
+  - **AGC tick rate** on SDRplay is now 500 ms (was 250 ms). The
+    SoapySDRPlay3 `setGain` call is more disruptive to the USB
+    stream than RTL-SDR's tuner-gain write and 250 ms ticks
+    occasionally tripped a `lost-device` event during AGC probing.
+
+### Migration
+
+No config changes required. Existing v0.3.0 `[sdr]` blocks with
+`driver = "sdrplay"` will Just Work. If you had manual entries for
+`gains.IFGR` or `gains.RFGR` in your config they'll be silently
+ignored — the new collapsed model reads / writes `gains.Gain`
+instead. Restoring the default (delete the `gains` block under
+`[sdr]`) is the simplest path.
+
+## [0.3.0] - 2026-05-19
+
+A multi-SDR release. The native `librtlsdr` backend is retired in
+favor of a unified [SoapySDR](https://github.com/pothosware/SoapySDR)
+device layer so the same build now talks to RTL-SDR, HackRF One, and
+SDRplay (RSP1A / RSPduo / RSPdx) without recompilation.
+
+### Added
+
+- **SoapySDR backend.** New `src/sdr/soapy.rs` opens any device that
+  libSoapySDR can enumerate (`driver=rtlsdr`, `driver=hackrf`,
+  `driver=sdrplay`, …). Replaces the v0.2.x native librtlsdr binding.
+  Existing RTL-SDR users see no behavioral change; HD Radio
+  reception is unchanged on the reference R820T2 hardware.
+- **Device profiles** (`src/sdr/profile.rs`). Per-driver descriptors
+  encode which gain element the closed-loop AGC drives, whether that
+  element is straight-gain (RTL-SDR `TUNER`) or gain-reduction
+  (SDRplay `IFGR` — sign-flipped automatically), the AGC tick rate,
+  the manual-gain element list for the UI, and HD-Radio-specific
+  notes. v0.3.0 ships profiles for `rtlsdr`, `sdrplay`, and `hackrf`.
+- **Profile-driven AGC adapter.** `ffi::apply_agc_action` translates
+  the controller's tenths-of-dB decisions into the right
+  `set_gain_element` call for the active device, clamping to each
+  element's reported range. Same controller, three SDR families.
+- **SDR Settings modal** (hamburger menu → `📡 SDR Settings…`). Live
+  device picker driven by `SoapySdr::enumerate_devices()`, one
+  slider per gain element on the active device, PPM correction
+  field, per-driver HD Radio notes, "Reset to defaults" / "Refresh"
+  / "Close" footer. Changes apply immediately to a running stream
+  and persist to `config.toml`.
+- **Top-bar hamburger menu** + **About dialog** with version,
+  license, and clickable project URLs.
+- **`[sdr]` config section** (`driver`, `device_args`,
+  `freq_correction_ppm`, `gains` map). Legacy `rtl_device_index`,
+  `use_rtl_tcp`, `rtl_tcp_host`, `rtl_tcp_port`, `manual_gain_tenths`,
+  `gain_mode` fields are preserved unchanged for the v0.4.0
+  SoapyRemote restoration; first launch on an upgraded config
+  migrates the necessary values automatically.
+- **Self-locating native DLLs.** `main.rs` resolves
+  `<exe_dir>\bin\` at startup and prepends it to `PATH`, then
+  sets `SOAPY_SDR_PLUGIN_PATH` to
+  `<exe_dir>\bin\SoapySDR\modules0.8\`. Cargo runs and portable
+  installs both work out of the box — no shell env setup needed.
+- **Bundled SoapySDR modules.** Portable zip now ships
+  `librtlsdrSupport.dll`, `libHackRFSupport.dll`, and
+  `libsdrPlaySupport.dll`. The packaging script (`scripts/
+  package-portable.ps1`) reports presence of each module and
+  reminds packagers about the SDRplay API runtime dependency.
+- **`scripts/build-soapysdrplay3-msys2.ps1`** — idempotent builder
+  for `libsdrPlaySupport.dll` from upstream SoapySDRPlay3 sources.
+- **`examples/iq_compare.rs`** — FFT-based spectral parity gate
+  used during the v0.2.x → v0.3.0 cutover. Validates the new
+  Soapy backend against the legacy librtlsdr backend on the same
+  RTL-SDR hardware (RMS, DC offset, noise floor, and SNR within
+  tight tolerances).
+- **Version in window title.** Window title now reads
+  `NRSC5 Studio <version>` (sourced from `CARGO_PKG_VERSION`).
+
+### Changed
+
+- **`Sdr` trait widened.** New methods `gain_elements()`,
+  `set_gain_element(name, db)`, `set_frequency_correction_ppm(ppm)`,
+  and `driver()` round out the device-agnostic surface. The legacy
+  tenths-only `set_tuner_gain_tenths` is still present for the AGC
+  fast path but is no longer the only knob the rest of the app
+  uses.
+- **`Nrsc5Process::start_piped`** signature now takes a SoapySDR
+  args string and a PPM correction value instead of a u32 device
+  index. App-level callers route through
+  `config.sdr.to_args_string()`.
+- **All Start paths construct a SoapySdr.** The previous Start
+  branching (`use_rtl_tcp` / `use_piped_sdr` / legacy USB) is
+  retired; `app.rs` always calls `start_piped`. The legacy
+  `Nrsc5Process::start` (USB-direct) and `start_rtltcp` methods
+  remain as dead code for the v0.4.0 SoapyRemote / rtl_tcp restoration.
+
+### Removed
+
+- **Native librtlsdr backend** (`src/sdr/rtl.rs`). All RTL-SDR
+  access now goes through SoapyRTLSDR. The `librtlsdr.dll` file
+  is still bundled because SoapyRTLSDR depends on it; the Rust
+  binding has been deleted.
+- **`R820T_GAINS_TENTHS` from `src/sdr/mod.rs`**. Moved to
+  `src/sdr/profile.rs` and surfaced only through the `RTLSDR`
+  device profile's `agc_tenths_table`.
+
+### Deprecated / Deferred
+
+- **rtl_tcp networked input** is deferred to v0.4.0 with full
+  restoration via SoapyRemote. v0.3.0 logs a one-shot WARN on
+  load when a user's `config.toml` still has `use_rtl_tcp = true`
+  and falls back to local USB RTL-SDR for the session. Existing
+  `rtl_tcp_host` / `rtl_tcp_port` settings are preserved untouched
+  and will be re-honored when 0.4.0 ships.
+
+### Supported devices (v0.3.0)
+
+| Device family       | Status     | Notes                                                   |
+|---------------------|------------|---------------------------------------------------------|
+| RTL-SDR (R820T2)    | Validated  | Reference platform. Bench-validated.                    |
+| RTL-SDR (E4000)     | Works      | 7-element gain stack (IF1..IF6+TUNER). Bench-validated. |
+| SDRplay RSP1A       | Validated  | Requires SDRplay API v3.x from sdrplay.com.             |
+| SDRplay (other RSP) | Should work| Same profile as RSP1A. Bench-validation welcome.        |
+| HackRF One          | Profile only | Profile ships; bench-validation deferred.             |
+
+### Migration notes
+
+Existing v0.2.x users: drop in the new exe; your `config.toml`
+auto-migrates on first launch. The legacy `rtl_device_index` is
+translated into `[sdr] device_args = "device=N"` when N > 0; the
+default `device_index = 0` case becomes `[sdr] device_args = ""`
+(SoapyRTLSDR picks the first device). Your saved presets, play log,
+album art cache, and dock layout all carry over unchanged.
+
 ## [0.2.2] - 2026-05-18
 
 A polish + portability release on top of 0.2.1. No architectural

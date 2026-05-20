@@ -1,10 +1,10 @@
 [package]
 name = "nrsc5-studio"
-version = "0.2.2"
+version = "0.3.1"
 edition = "2021"
 authors = ["LTCAshraven"]
 license = "MIT"
-description = "A native Windows desktop app for listening to HD Radio broadcasts with an RTL-SDR dongle, built on top of nrsc5."
+description = "A native Windows desktop app for listening to HD Radio broadcasts with an RTL-SDR or SDRplay dongle, built on nrsc5 and SoapySDR."
 repository = "https://github.com/LTCAshraven/nrsc5-studio"
 readme = "README.md"
 
@@ -20,11 +20,34 @@ egui_dock = { version = "0.19", features = ["serde"] }
 egui_extras = { version = "0.34", features = ["image", "file"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 libloading = "0.8"
+# v0.3.0: num-complex pairs with the `soapysdr` crate, which streams
+# samples as `Complex<i8>` / `Complex<i16>` / `Complex<f32>` depending
+# on what the device negotiates. We keep CS8 as our preferred wire
+# format (byte-for-byte equivalent to librtlsdr's CU8 after a +128
+# offset adjustment) and fall back to CS16 for devices that don't
+# advertise CS8 natively (SDRplay).
+num-complex = { version = "0.4", default-features = false }
 ron = "0.8"
+# v0.3.1: rubato gives us a high-quality fractional resampler for the
+# SDRplay path. SDRplay's lowest supported sample rates are
+# {62.5, 96, 125, 192, 250, 384, 500, 768, 1000} ksps (discrete) and
+# then a continuous range starting at 2 Msps. nrsc5 requires exactly
+# 1.488375 Msps, which falls in a gap. We open SDRplay at 2 Msps and
+# resample down to 1.488375 Msps in software with `SincFixedIn`. The
+# `fft_resampler` feature is off; we only need the time-domain sinc
+# resampler which has no extra deps beyond `num-traits`.
+rubato = { version = "0.16", default-features = false }
 rustfft = { version = "6", default-features = false }
 rfd = { version = "0.17", default-features = false }
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
+# v0.3.0: single unified SDR backend over libSoapySDR. Replaces the
+# direct librtlsdr binding for RTL-SDR users and brings SDRplay /
+# Airspy / HackRF / Lime / Pluto / network SDRs under one trait. The
+# import library and headers are staged into the bundled llvm-mingw
+# toolchain by `scripts/install-soapysdr-msys2.ps1` — run that script
+# once before the first build.
+soapysdr = "0.4"
 thiserror = "2"
 toml = "0.8"
 

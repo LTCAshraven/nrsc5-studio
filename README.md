@@ -1,6 +1,6 @@
 # NRSC5 Studio
 
-A native Windows desktop app for listening to **HD Radio** broadcasts with an RTL-SDR dongle. Built in Rust with [egui](https://www.egui.rs/), wrapped around the excellent [`nrsc5`](https://github.com/theori-io/nrsc5) HD Radio decoder.
+A native Windows desktop app for listening to **HD Radio** broadcasts with an RTL-SDR or SDRplay receiver. Built in Rust with [egui](https://www.egui.rs/), wrapped around the excellent [`nrsc5`](https://github.com/theori-io/nrsc5) HD Radio decoder, with a unified [SoapySDR](https://github.com/pothosware/SoapySDR) device layer underneath.
 
 NRSC5 Studio gives you everything `nrsc5.exe` already does — tuning, demodulating, decoding HD1–HD4 subchannels, pulling album art and station logos — and adds a polished, persistent GUI on top, with a few extras the command line never had.
 
@@ -28,12 +28,13 @@ NRSC5 Studio gives you everything `nrsc5.exe` already does — tuning, demodulat
 - **24-Hour Song Log** — every play the station broadcasts metadata for is captured with a timestamp and persisted across restarts. Two views: a **Timeline** of the most recent plays and a **Top Played** grouping by `(title, artist)`. Export to RFC-4180 CSV for the scrobbler crowd. Aggressive filtering keeps station IDs, slogans, and call signs out of the log.
 - **Spectrum + Waterfall** — a dedicated SDR scope tab with a 1024-bin live FFT trace (SDR#-style translucent gradient fill, ±20 dB grid, faint shading at the HD digital sidebands at ±129–199 kHz) and a 256-row scrolling waterfall underneath with a turbo colormap. Driven from a tap on the same I/Q stream that feeds the decoder, so what you see is what nrsc5 sees.
 - **QPSK Constellation** — a phosphor-green scope showing the OFDM-subcarrier constellation cloud, with cloud spread driven by live MER per sideband. Watch the cloud tighten as signal quality improves — especially satisfying while the AGC walks into its sweet spot.
-- **Closed-Loop AGC** — a host-side automatic-gain-control loop (separate from the dongle's built-in AGC) that walks the R820T2 gain table to find the setting that maximizes per-sideband MER for whatever signal you're tuned to. Switch between **Auto** / **Manual** / **Hardware AGC** in the Signal panel; choice persists between runs.
+- **Closed-Loop AGC** — a host-side automatic-gain-control loop (separate from the dongle's built-in AGC) that drives the active SDR's primary gain element to maximize per-sideband MER for whatever signal you're tuned to. Profile-driven: on RTL-SDR it walks the R820T2 gain table; on SDRplay it controls IF gain reduction (with sign-flip handled automatically); on HackRF it drives the LNA. Switch between **Auto** / **Manual** / **Hardware AGC** in the Signal panel; choice persists between runs.
 - **Traffic Map** — TPEG traffic-tile decode, stitched into a single map image the moment all tiles for an area arrive. Only IHeartMedia stations transmit this. [IHeartMedia Stations](https://www.iheartmedia.com/stations)
 - **Weather Radar Animation** — every weather overlay frame from the broadcast is captured with its real wall-clock timestamp. Play / pause / scrub through up to 90 minutes of frames with a rocker slider; duplicate frames are deduplicated by content hash so the loop only advances when the station actually pushes new radar. Only IHeartMedia stations transmit this. [IHeartMedia Stations](https://www.iheartmedia.com/stations)
 - **Signal Quality** — live MER (lower / upper sidebands), BER counters, and the current AGC gain in dB with a status badge (probing / settled / bailed) and time-since-last-change.
 - **Per-app Volume** — Windows COM-based per-process volume / mute, so NRSC5 Studio's volume slider only changes NRSC5 Studio's audio (not the whole system).
-- **Friendly first-run experience** — if no RTL-SDR is plugged in, a centered "Plug in an RTL-SDR and press Refresh" overlay replaces the cryptic empty state. The overlay auto-dismisses the moment a dongle is detected.
+- **Multi-SDR support** — RTL-SDR (R820T2 / E4000), SDRplay (RSP1A / RSPduo / RSPdx via the proprietary SDRplay API), and HackRF One out of the box. Switch devices via the hamburger menu's **📡 SDR Settings…** modal; per-element gain sliders, PPM correction, and HD-Radio-specific notes are surfaced per driver.
+- **Friendly first-run experience** — if no SDR is plugged in, a centered "Plug in an SDR and press Refresh" overlay replaces the cryptic empty state. The overlay auto-dismisses the moment a device is detected.
 - **Persistent dock layout** — drag tabs into floating sub-panes, split horizontally or vertically. Your layout is restored on the next launch.
 - **Dark / light themes**, DPI-aware sizing, and a procedurally-rendered window icon.
 
@@ -41,11 +42,43 @@ NRSC5 Studio gives you everything `nrsc5.exe` already does — tuning, demodulat
 
 ## Hardware requirements
 
-- An installed and working on your system **RTL-SDR dongle** with an antenna suitable for FM (87.5–108 MHz). Generic RTL2832U + R820T2 dongles are perfect.
+- An installed and working **SDR** with an antenna suitable for FM (87.5–108 MHz). Generic RTL2832U + R820T2 dongles are still the cheapest, most-tested option.
 - A nearby HD Radio FM broadcaster. (Most U.S. metro areas have several.)
 - Windows 10 or 11, x86_64.
 
-If you don't already have working RTL-SDR drivers, install [Zadig](https://zadig.akeo.ie/) and follow the standard [WinUSB driver setup](https://www.rtl-sdr.com/rtl-sdr-quick-start-guide/) for your dongle once before running NRSC5 Studio.
+### Supported SDRs (v0.3.0)
+
+NRSC5 Studio v0.3.0 introduces a unified [SoapySDR](https://github.com/pothosware/SoapySDR) backend so the same build supports multiple SDR families. Switch between them via the **hamburger menu → 📡 SDR Settings…**.
+
+| Device family       | Status        | Notes                                                                                          |
+|---------------------|---------------|------------------------------------------------------------------------------------------------|
+| RTL-SDR (R820T2)    | ✅ Validated   | Reference platform. Cheapest entry point.                                                       |
+| RTL-SDR (E4000)     | ✅ Validated   | Nooelec SmartXTR and similar. AGC drives `TUNER`; six other IF stages settable manually.        |
+| SDRplay RSP1A       | ✅ Validated   | 14-bit ADC, much wider dynamic range than RTL-SDR. **Requires SDRplay API v3.x** (see below).   |
+| SDRplay (other RSP) | 🟡 Should work | RSPduo / RSPdx use the same profile as RSP1A; bench-validation contributions welcome.            |
+| HackRF One          | 🟡 Profile-only | Profile ships but is not yet bench-validated. AGC drives `LNA`; report any issues you find.     |
+
+#### RTL-SDR (Zadig)
+
+If you don't already have working RTL-SDR drivers, install [Zadig](https://zadig.akeo.ie/) and follow the standard [WinUSB driver setup](https://www.rtl-sdr.com/rtl-sdr-quick-start-guide/) once before running NRSC5 Studio. This is the only end-user prerequisite for RTL-SDR support.
+
+#### SDRplay (proprietary API)
+
+SDRplay receivers (RSP1A, RSPduo, RSPdx, …) require the SDRplay API service to be installed separately. It's free but **cannot be redistributed** under SDRplay's license — so the portable zip ships only the open-source `libsdrPlaySupport.dll` bridge module. To use an SDRplay device:
+
+1. Download and install the **SDRplay API v3.x** from [sdrplay.com/downloads](https://www.sdrplay.com/downloads/).
+2. Plug in your SDRplay device.
+3. Launch NRSC5 Studio. Open **📡 SDR Settings…**, click **Refresh**, and pick the SDRplay entry.
+
+Users without an SDRplay device can ignore this entirely — the bundled module loads lazily.
+
+#### HackRF One
+
+HackRF support ships in v0.3.0 but is **not yet bench-validated**. The device profile (`LNA`, `VGA`, `AMP` gain stages) is conservative but may need tuning for HD Radio. If you have a HackRF and try it, opening an issue with your findings would be hugely appreciated.
+
+### Deferred for v0.4.0: rtl_tcp / networked SDRs
+
+The v0.2.x **rtl_tcp networked input** path is **deferred to v0.4.0** with full restoration via [SoapyRemote](https://github.com/pothosware/SoapyRemote). If your existing `config.toml` has `use_rtl_tcp = true`, v0.3.0 logs a one-shot warning on launch and falls back to local USB RTL-SDR for the session. Your `rtl_tcp_host` / `rtl_tcp_port` settings are preserved untouched and will be re-honored automatically when 0.4.0 ships.
 
 ---
 

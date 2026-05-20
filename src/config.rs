@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -70,6 +71,75 @@ pub struct AppConfig {
     /// still applies (≤5000 entries) regardless of retention.
     #[serde(default = "default_play_log_retention_hours")]
     pub play_log_retention_hours: u32,
+    /// Backend-agnostic SDR configuration. Holds the SoapySDR driver
+    /// key + device-args string + per-element manual gain values + PPM
+    /// correction. Populated by [`migrate_legacy_sdr`] on load when an
+    /// older config (with only `rtl_device_index` / `use_rtl_tcp`) is
+    /// upgraded; the legacy fields are preserved alongside so 0.4.0's
+    /// rtl_tcp restoration can still find them.
+    #[serde(default)]
+    pub sdr: SdrConfigSection,
+}
+
+/// SoapySDR-keyed configuration for the v0.3.0 in-process backend.
+///
+/// `driver` is the Soapy driver key (`"rtlsdr"`, `"sdrplay"`,
+/// `"hackrf"`). `device_args` is the rest of the args string passed to
+/// [`SoapySdr::open`](crate::sdr::SoapySdr::open) — e.g. `"device=1"`
+/// to pick the second RTL-SDR, or `"serial=02000001"` to pick a
+/// specific SDRplay. Together they form the full args string
+/// `format!("driver={driver},{device_args}")` (or just `driver={driver}`
+/// if `device_args` is empty).
+///
+/// `gains` is a per-element override map (`{"TUNER": 19.7}` for
+/// RTL-SDR; `{"IFGR": 40.0, "RFGR": 4.0}` for SDRplay). The SDR
+/// Settings modal writes here; the AGC adapter ignores this map and
+/// drives the profile's target element directly. Stored as a
+/// `BTreeMap` to keep TOML key order deterministic across saves.
+///
+/// `freq_correction_ppm` is applied once per stream at start; mid-stream
+/// PPM nudges from the SDR Settings modal call
+/// [`Sdr::set_frequency_correction_ppm`](crate::sdr::Sdr::set_frequency_correction_ppm)
+/// directly without going through config.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SdrConfigSection {
+    #[serde(default = "default_sdr_driver")]
+    pub driver: String,
+    #[serde(default)]
+    pub device_args: String,
+    #[serde(default)]
+    pub freq_correction_ppm: f64,
+    #[serde(default)]
+    pub gains: BTreeMap<String, f64>,
+}
+
+fn default_sdr_driver() -> String {
+    "rtlsdr".to_string()
+}
+
+impl Default for SdrConfigSection {
+    fn default() -> Self {
+        Self {
+            driver: default_sdr_driver(),
+            device_args: String::new(),
+            freq_correction_ppm: 0.0,
+            gains: BTreeMap::new(),
+        }
+    }
+}
+
+impl SdrConfigSection {
+    /// Build the full SoapySDR args string for `Device::new`. Combines
+    /// `driver` and `device_args` so the caller doesn't need to repeat
+    /// the formatting. Returns `"driver=rtlsdr"` for the default
+    /// case, or `"driver=rtlsdr,device=2"` etc. when args are set.
+    pub fn to_args_string(&self) -> String {
+        if self.device_args.trim().is_empty() {
+            format!("driver={}", self.driver)
+        } else {
+            format!("driver={},{}", self.driver, self.device_args.trim())
+        }
+    }
 }
 
 fn default_volume() -> f32 {
@@ -113,6 +183,7 @@ impl Default for AppConfig {
             gain_mode: GainMode::Auto,
             manual_gain_tenths: 197,
             play_log_retention_hours: 24,
+            sdr: SdrConfigSection::default(),
         }
     }
 }
@@ -146,6 +217,69 @@ pub fn load_config() -> AppConfig {
 fn sanitize(cfg: &mut AppConfig) {
     cfg.play_log_retention_hours =
         crate::play_log::clamp_retention(cfg.play_log_retention_hours);
+    migrate_legacy_sdr(cfg);
+}
+
+/// Migrate the pre-0.3.0 SDR config layout into the new `[sdr]`
+/// section. Triggered on every load — idempotent in steady state
+/// because we only fill in fields the user hasn't already configured.
+///
+/// Migration rules:
+///
+/// * If `cfg.sdr.driver` is the default `"rtlsdr"` AND `cfg.sdr.device_args`
+///   is empty, populate `device_args` from the legacy
+///   `rtl_device_index` field (`"device=N"` for N > 0; left empty for 0
+///   to match Soapy's default-first-device behavior).
+/// * If `cfg.sdr.gains` is empty AND legacy `manual_gain_tenths` is
+///   non-default, seed a `TUNER` entry so saving the config produces
+///   a sensible round-trip.
+/// * If `use_rtl_tcp` is `true`, log a one-shot warning that rtl_tcp
+///   support is deferred to 0.4.0 (via SoapyRemote) — but DON'T touch
+///   the legacy fields. The user's preferences for host/port survive
+///   the upgrade; we just fall back to local USB RTL-SDR for the
+///   0.3.x cycle. See `/memories/session/plan-0.4.0-stub.md` for the
+///   restoration plan.
+///
+/// The legacy fields (`rtl_device_index`, `use_rtl_tcp`,
+/// `rtl_tcp_host`, `rtl_tcp_port`, `use_piped_sdr`, `manual_gain_tenths`,
+/// `gain_mode`) are NOT removed from `AppConfig` — they keep
+/// round-tripping unchanged so 0.4.0 can read them.
+fn migrate_legacy_sdr(cfg: &mut AppConfig) {
+    // Populate device_args from rtl_device_index if the user hasn't
+    // set anything explicit. We use the heuristic "default driver AND
+    // empty device_args" rather than just "empty device_args" so the
+    // first migration cleanly seeds, and subsequent loads (where the
+    // user has switched to e.g. driver=sdrplay) leave the args alone.
+    if cfg.sdr.driver == "rtlsdr" && cfg.sdr.device_args.is_empty()
+        && cfg.rtl_device_index > 0
+    {
+        cfg.sdr.device_args = format!("device={}", cfg.rtl_device_index);
+    }
+
+    // Seed a TUNER gain entry from the legacy manual_gain_tenths if
+    // gains is empty. Skipped when gain_mode == Auto since the AGC
+    // controller manages the value anyway. Stored as dB (not tenths)
+    // to match the new section's convention.
+    if cfg.sdr.gains.is_empty() && cfg.gain_mode == GainMode::Manual {
+        cfg.sdr.gains.insert(
+            "TUNER".to_string(),
+            cfg.manual_gain_tenths as f64 / 10.0,
+        );
+    }
+
+    // rtl_tcp deferral notice. Logged through eprintln rather than
+    // tracing/log because the rest of this module is unaware of those
+    // facades; the goal is just to surface the change once on launch
+    // without breaking anyone's existing config.
+    if cfg.use_rtl_tcp {
+        eprintln!(
+            "[config] WARN: use_rtl_tcp=true in config — rtl_tcp support is \
+             deferred to v0.4.0 via SoapyRemote (see CHANGELOG and \
+             README 'Supported SDRs'). Falling back to local USB RTL-SDR \
+             via SoapySDR for this session. Your rtl_tcp_host/port settings \
+             are preserved untouched and will be re-honored when 0.4.0 ships."
+        );
+    }
 }
 
 pub fn save_config(cfg: &AppConfig) {

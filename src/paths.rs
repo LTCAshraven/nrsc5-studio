@@ -48,6 +48,75 @@ pub fn is_portable() -> bool {
     portable_root().is_some()
 }
 
+/// Directory containing the running executable. Cached on first call.
+/// `None` when the OS refuses to tell us where we are (extremely rare —
+/// only happens on heavily-sandboxed configurations).
+pub fn exe_dir() -> Option<PathBuf> {
+    static CACHED: OnceLock<Option<PathBuf>> = OnceLock::new();
+    CACHED
+        .get_or_init(|| {
+            std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        })
+        .clone()
+}
+
+/// Directory containing bundled native DLLs (`libSoapySDR.dll`,
+/// `nrsc5.exe`, the librtlsdr / libhackrf / libsdrPlaySupport
+/// support libraries, etc.). Two layouts are supported:
+///
+/// 1. **Portable-zip / installed layout**: `<exe_dir>\bin\` holds
+///    all native deps, with a `SoapySDR\modules0.8\` subfolder for
+///    the loadable SoapySDR modules. This is what
+///    `scripts/package-portable.ps1` ships and matches the repo
+///    layout used by `cargo run` (next case).
+/// 2. **Dev `cargo run` layout**: cargo emits the binary into
+///    `<repo>\target\…\{debug,release}\`. We walk up to 6 directory
+///    levels from the exe looking for a sibling `bin\` folder. We
+///    deliberately don't hardcode depth — `..\..\..\bin` would
+///    break for the gnullvm target which adds an extra directory
+///    level versus the host triple.
+///
+/// Returns `None` only when neither match — caller then trusts that
+/// whoever launched us put the DLLs on PATH already.
+pub fn bundled_dll_dir() -> Option<PathBuf> {
+    let exe = exe_dir()?;
+    // Layout 1: <exe_dir>\bin\
+    let portable = exe.join("bin");
+    if portable.is_dir() {
+        return Some(portable);
+    }
+    // Layout 2: walk up looking for a sibling `bin\`.
+    let mut probe = exe.clone();
+    for _ in 0..6 {
+        if let Some(parent) = probe.parent() {
+            let candidate = parent.join("bin");
+            if candidate.is_dir() {
+                return Some(candidate);
+            }
+            probe = parent.to_path_buf();
+        } else {
+            break;
+        }
+    }
+    None
+}
+
+/// Directory containing SoapySDR module DLLs that libSoapySDR loads
+/// at runtime (`SoapyRTLSDR.dll`, `libsdrPlaySupport.dll`, etc.).
+/// Conventionally `<bundled_dll_dir>\SoapySDR\modules0.8\`. Returns
+/// `None` when the bundle isn't present.
+pub fn bundled_soapy_modules_dir() -> Option<PathBuf> {
+    let bin = bundled_dll_dir()?;
+    let modules = bin.join("SoapySDR").join("modules0.8");
+    if modules.is_dir() {
+        Some(modules)
+    } else {
+        None
+    }
+}
+
 fn config_root() -> Option<PathBuf> {
     if let Some(root) = portable_root() {
         return Some(root.clone());
@@ -86,6 +155,17 @@ pub fn art_cache_dir() -> Option<PathBuf> {
 /// Path to the 24-hour rolling play-log RON file.
 pub fn play_log_path() -> Option<PathBuf> {
     Some(data_root()?.join("play-log.ron"))
+}
+
+/// Path to the SDR diagnostics snapshot written every time
+/// `SoapySdr::enumerate_devices()` runs. Captures env vars + per-driver
+/// enumeration outcomes so a "no devices detected" report can be
+/// triaged without rebuilding the app.
+///
+/// Portable mode: `<exe_dir>\data\sdr-diagnostics.txt`.
+/// Installed mode: `%APPDATA%\nrsc5-studio\sdr-diagnostics.txt`.
+pub fn sdr_diagnostics_file() -> Option<PathBuf> {
+    Some(data_root()?.join("sdr-diagnostics.txt"))
 }
 
 /// Override file path for eframe's window/dock persistence RON. `None`

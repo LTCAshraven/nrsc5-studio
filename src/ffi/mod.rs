@@ -9,6 +9,7 @@ use thiserror::Error;
 
 use crate::config::GainMode;
 use crate::dsp::{AgcConfig, AgcController, AgcSnapshot};
+use crate::sdr::profile::DeviceProfile;
 use crate::sdr::{Sdr, SdrConfig, SdrError, StreamControl};
 
 // -- Events -----------------------------------------------------------
@@ -160,10 +161,82 @@ pub struct Nrsc5Process {
     /// in `GainMode::Manual`) for the current/last piped stream.
     /// Preserved across `stop()` for the same reason as `last_gain_mode`.
     last_manual_gain_tenths: Option<i32>,
+    /// SoapySDR args string used to open the current/last piped
+    /// stream's SDR (e.g. `"driver=rtlsdr"` or
+    /// `"driver=sdrplay,serial=00000001"`). Preserved across `stop()`
+    /// so [`retune`](Self::retune) can re-open the same device without
+    /// the caller having to plumb the config section through. `None`
+    /// until the first piped Start.
+    last_sdr_args: Option<String>,
+    /// PPM correction applied to the current/last piped stream's SDR.
+    /// Same lifecycle as `last_sdr_args`.
+    last_ppm: Option<f64>,
     tx: Sender<NrscEvent>,
     rx: Receiver<NrscEvent>,
     exe_path: PathBuf,
     aas_dir: PathBuf,
+}
+
+/// Translate one closed-loop AGC controller decision into the
+/// corresponding gain-element write on the live SDR, observing the
+/// device profile's sign convention and the element's reported range.
+///
+/// The AGC controller speaks in "tenths of dB of overall gain"
+/// (matches the legacy librtlsdr convention from v0.2.x). Each device
+/// has a different physical knob the controller should drive: RTL-SDR
+/// has a single straight-gain `TUNER`, SDRplay has a `IFGR` (gain
+/// reduction — *lower* is more gain), HackRF has a stepped `LNA`.
+/// [`DeviceProfile`] encodes the per-driver mapping; this function is
+/// the single place that mapping is applied.
+///
+/// Clamping happens here, not in the profile, because the element's
+/// actual `[min_db, max_db]` is queried per-device at run time and may
+/// be narrower than the synthesized AGC tenths table suggests (e.g.
+/// an SDRplay revision that limits IFGR to 24..59 instead of 20..59).
+///
+/// Returns the dB value actually written (post-clamp) so the caller
+/// can log it; returns `None` if the device doesn't expose the
+/// profile's target element at all (in which case we log a warning
+/// and treat the AGC as a no-op for this device).
+fn apply_agc_action(
+    sdr: &Arc<dyn Sdr>,
+    profile: &DeviceProfile,
+    action: &crate::dsp::AgcAction,
+) -> Option<f64> {
+    let target = profile.agc_element;
+    let desired_db = profile.agc_tenths_to_element_db(action.new_tenths);
+
+    // Look up the element's actual range. We deliberately re-query
+    // every action rather than caching: it's a cheap Soapy call (no
+    // hardware I/O) and it means the adapter survives mid-stream
+    // configuration changes (e.g. SDRplay switching IF mode).
+    let elements = sdr.gain_elements();
+    let element = match elements.iter().find(|e| e.name == target) {
+        Some(e) => e,
+        None => {
+            // The profile points at an element this device doesn't
+            // expose. Either a profile bug or a driver version that
+            // renamed it. Log once and let the caller no-op.
+            eprintln!(
+                "[agc] driver={} doesn't expose element {} — AGC disabled \
+                 for this device. Elements present: {:?}",
+                profile.driver,
+                target,
+                elements.iter().map(|e| &e.name).collect::<Vec<_>>()
+            );
+            return None;
+        }
+    };
+
+    let clamped = desired_db.clamp(element.min_db, element.max_db);
+    if let Err(e) = sdr.set_gain_element(target, clamped) {
+        eprintln!(
+            "[agc] set_gain_element({}={:.2}dB) failed: {}",
+            target, clamped, e
+        );
+        return None;
+    }
+    Some(clamped)
 }
 
 impl Nrsc5Process {
@@ -184,6 +257,8 @@ impl Nrsc5Process {
             agc_stop: None,
             last_gain_mode: None,
             last_manual_gain_tenths: None,
+            last_sdr_args: None,
+            last_ppm: None,
             tx,
             rx,
             exe_path,
@@ -225,6 +300,44 @@ impl Nrsc5Process {
 
     pub fn events(&self) -> &Receiver<NrscEvent> {
         &self.rx
+    }
+
+    /// Apply a manual per-element gain on the live SDR if a piped
+    /// stream is currently running. No-op when there's no active SDR
+    /// (the change still survives in config and is applied on the
+    /// next Start). Returns `Ok(())` for the no-op case too — callers
+    /// don't need to distinguish "no stream running" from "applied".
+    pub fn set_sdr_gain_element(
+        &self,
+        element: &str,
+        value_db: f64,
+    ) -> Result<(), SdrError> {
+        match self.sdr.as_ref() {
+            Some(sdr) => sdr.set_gain_element(element, value_db),
+            None => Ok(()),
+        }
+    }
+
+    /// Apply a frequency-correction PPM nudge to the live SDR. Same
+    /// no-op-when-idle semantics as `set_sdr_gain_element`. Some
+    /// backends (SDRplay) silently ignore this — see their `Sdr`
+    /// trait impl for details.
+    pub fn set_sdr_freq_correction_ppm(&self, ppm: f64) -> Result<(), SdrError> {
+        match self.sdr.as_ref() {
+            Some(sdr) => sdr.set_frequency_correction_ppm(ppm),
+            None => Ok(()),
+        }
+    }
+
+    /// Snapshot the live SDR's reported gain elements. Returns an
+    /// empty `Vec` when no stream is running — the SDR Settings modal
+    /// then falls back to an idle open-and-close to populate its
+    /// sliders.
+    pub fn sdr_gain_elements(&self) -> Vec<crate::sdr::GainElement> {
+        self.sdr
+            .as_ref()
+            .map(|s| s.gain_elements())
+            .unwrap_or_default()
     }
 
     pub fn version(&self) -> String {
@@ -338,7 +451,8 @@ impl Nrsc5Process {
         &mut self,
         frequency_mhz: f32,
         program: u32,
-        device_index: u32,
+        sdr_args: &str,
+        ppm_correction: f64,
         gain_mode: GainMode,
         manual_gain_tenths: i32,
     ) -> Result<(), Nrsc5Error> {
@@ -360,15 +474,23 @@ impl Nrsc5Process {
             GainMode::Manual => Some(manual_gain_tenths),
             GainMode::HardwareAgc => None,
         };
-        let rtl = crate::sdr::RtlSdr::open(device_index)?;
-        rtl.configure(&SdrConfig {
+        // Open the SDR via SoapySDR. The args string already encodes
+        // `driver=` plus any per-device disambiguators (serial /
+        // device index / soapy_remote URL etc.). One open path,
+        // every supported device — the legacy `RtlSdr::open(idx)`
+        // call that lived here in 0.2.x is gone.
+        let soapy = crate::sdr::SoapySdr::open(sdr_args)?;
+        // Apply config-driven PPM correction. Zero is the common case;
+        // backends that don't expose runtime PPM return Ok(()) silently.
+        let _ = soapy.set_frequency_correction_ppm(ppm_correction);
+        soapy.configure(&SdrConfig {
             center_freq_hz: (frequency_mhz * 1_000_000.0) as u32,
             sample_rate_sps: 1_488_375,
             ppm_correction: 0,
             direct_sampling: 0,
             initial_gain_tenths,
         })?;
-        let sdr: Arc<dyn Sdr> = Arc::new(rtl);
+        let sdr: Arc<dyn Sdr> = Arc::new(soapy);
 
         let mut cmd = Command::new(&self.exe_path);
         // -r -  : read raw I/Q from stdin.
@@ -405,17 +527,34 @@ impl Nrsc5Process {
         // `Manual` / `HardwareAgc` we leave these `None` and skip the
         // driver thread entirely — the dongle's gain is set once by
         // `configure` above and never touched again for this stream.
+        //
+        // The controller walks a per-device tenths-of-dB table sourced
+        // from the device profile (NOT from `sdr.gain_table_tenths()`,
+        // which is the legacy librtlsdr-specific accessor). The
+        // adapter (`apply_agc_action`) translates each tenths value
+        // into a `set_gain_element` call on the profile's target
+        // element, observing the device's actual range.
+        let profile = crate::sdr::profile::lookup(sdr.driver())
+            .copied()
+            .unwrap_or(crate::sdr::profile::RTLSDR);
         let (agc, agc_stderr_handle) = if gain_mode == GainMode::Auto {
+            // Build the controller with the profile's per-driver start
+            // gain. The global `AgcConfig::default()` aims at the RTL-SDR
+            // sweet spot (19.7 dB); SDRplay and HackRF override it via
+            // `default_agc_initial_tenths` so they land closer to their
+            // own HD lock range on first tick.
+            let mut agc_cfg = AgcConfig::default();
+            agc_cfg.initial_tenths = profile.default_agc_initial_tenths;
             let agc_ctrl = AgcController::new(
-                sdr.gain_table_tenths(),
-                AgcConfig::default(),
+                profile.agc_tenths_table,
+                agc_cfg,
             );
             let agc = Arc::new(Mutex::new(agc_ctrl));
             let initial = agc
                 .lock()
                 .expect("AGC mutex poisoned at startup")
                 .initial_action();
-            let _ = sdr.set_tuner_gain_tenths(initial.new_tenths);
+            let _ = apply_agc_action(&sdr, &profile, &initial);
             let _ = self
                 .tx
                 .send(NrscEvent::AgcDecision {
@@ -500,6 +639,8 @@ impl Nrsc5Process {
         self.last_mode = Some(LastStartMode::Piped);
         self.last_gain_mode = Some(gain_mode);
         self.last_manual_gain_tenths = Some(manual_gain_tenths);
+        self.last_sdr_args = Some(sdr_args.to_string());
+        self.last_ppm = Some(ppm_correction);
 
         // ----- AGC driver thread (only when AGC is active) ----------
         // Ticks the controller every ~500 ms and applies any gain
@@ -515,9 +656,15 @@ impl Nrsc5Process {
             let agc_stop = Arc::new(AtomicBool::new(false));
             let agc_stop_for_driver = Arc::clone(&agc_stop);
             let agc_tx = self.tx.clone();
+            // Capture the profile by value (it's Copy) so the driver
+            // thread doesn't need to borrow anything from the outer
+            // scope. Tick rate and gain-element mapping are both
+            // baked into this copy.
+            let agc_profile = profile;
+            let tick_ms = profile.agc_tick_ms;
             let agc_thread = std::thread::spawn(move || {
                 while !agc_stop_for_driver.load(Ordering::Relaxed) {
-                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    std::thread::sleep(std::time::Duration::from_millis(tick_ms));
                     if agc_stop_for_driver.load(Ordering::Relaxed) {
                         break;
                     }
@@ -530,7 +677,7 @@ impl Nrsc5Process {
                         Err(_) => break, // mutex poisoned — give up gracefully
                     };
                     if let Some(action) = action {
-                        let _ = sdr_for_agc.set_tuner_gain_tenths(action.new_tenths);
+                        let _ = apply_agc_action(&sdr_for_agc, &agc_profile, &action);
                         let _ = agc_tx.send(NrscEvent::AgcDecision {
                             tenths: action.new_tenths,
                             reason: action.reason,
@@ -616,12 +763,19 @@ impl Nrsc5Process {
         std::thread::sleep(std::time::Duration::from_millis(250));
         match mode {
             Some(LastStartMode::Piped) => {
-                // Reuse the gain settings from the previous start. New
-                // piped streams always come from the GUI which sources
-                // these from `AppConfig`; retune doesn't need to know.
+                // Reuse the gain settings and SDR args from the
+                // previous start. The args string was stashed by
+                // start_piped; if it's missing for some reason (e.g.
+                // synthetic call ordering in tests), fall back to a
+                // bare RTL-SDR open.
                 let gain_mode = self.last_gain_mode.unwrap_or_default();
                 let manual = self.last_manual_gain_tenths.unwrap_or(197);
-                self.start_piped(frequency_mhz, program, device_index, gain_mode, manual)
+                let args = self
+                    .last_sdr_args
+                    .clone()
+                    .unwrap_or_else(|| "driver=rtlsdr".to_string());
+                let ppm = self.last_ppm.unwrap_or(0.0);
+                self.start_piped(frequency_mhz, program, &args, ppm, gain_mode, manual)
             }
             Some(LastStartMode::RtlTcp { host, port }) => {
                 self.start_rtltcp(frequency_mhz, program, &host, port)

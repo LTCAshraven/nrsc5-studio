@@ -3,6 +3,7 @@ use std::time::Instant;
 pub use crate::maps::WeatherFrame;
 use crate::config::GainMode;
 use crate::dsp::{AgcSnapshot, SpectrumSnapshot, SpectrumTap};
+use crate::sdr::{DeviceInfo, GainElement};
 
 /// One tile in the album-art heat-map collage: the file path to the image,
 /// the number of times it has appeared, and the unique (title, artist) pairs
@@ -155,6 +156,26 @@ pub struct AppState {
     /// stream. Compared against `manual_gain_tenths` for the same
     /// "restart to apply" purpose.
     pub active_manual_gain_tenths: Option<i32>,
+    /// Set when the hamburger-menu's "SDR Settings" item is clicked.
+    /// The modal is rendered as long as this is true; closed by the
+    /// modal's own dismiss button or Esc key.
+    pub show_sdr_settings: bool,
+    /// Set when "About" is clicked from the hamburger menu.
+    pub show_about: bool,
+    /// Snapshot of enumerated SoapySDR devices, refreshed on
+    /// `UiCommand::RefreshSdrDevices` and once when the SDR Settings
+    /// modal is opened. Empty when no devices were found OR when the
+    /// modal hasn't been opened yet this session.
+    pub sdr_devices: Vec<DeviceInfo>,
+    /// Snapshot of gain elements exposed by the device matching the
+    /// active config args. Refreshed alongside `sdr_devices`. Empty
+    /// when no device is currently configured or enumeration failed.
+    /// The SDR Settings modal renders one slider per entry.
+    pub sdr_gain_elements: Vec<GainElement>,
+    /// Wall-clock time of the last `RefreshSdrDevices` apply. Used to
+    /// throttle automatic refreshes and to show "Last refreshed Xs ago"
+    /// in the modal.
+    pub sdr_devices_last_refreshed: Option<Instant>,
 }
 
 /// Render mode for the Log tab — chronological list of every play, or a

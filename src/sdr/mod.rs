@@ -11,9 +11,12 @@
 //! (`RtlTcp`, `SoapySdr`, …) will implement the same trait so the rest of
 //! the app doesn't care which one is wired in.
 
-pub mod rtl;
+pub mod soapy;
+pub mod profile;
+pub mod resampler;
 
-pub use rtl::{RtlSdr, R820T_GAINS_TENTHS};
+pub use soapy::{DeviceInfo, SoapySdr};
+pub use profile::{DeviceProfile, R820T_GAINS_TENTHS};
 
 use thiserror::Error;
 
@@ -36,6 +39,14 @@ pub enum SdrError {
     NotOpen,
     #[error("stream is already running on this device")]
     AlreadyStreaming,
+    // === SoapySDR backend (v0.3.0) ===
+    #[error("SoapySDR could not open device `{args}`: {reason}")]
+    OpenFailedArgs { args: String, reason: String },
+    #[error("SoapySDR call `{func}` failed: {detail}")]
+    SoapyCall {
+        func: &'static str,
+        detail: String,
+    },
 }
 
 /// Return value of the per-frame callback in [`Sdr::run_stream`]. Returning
@@ -45,6 +56,37 @@ pub enum SdrError {
 pub enum StreamControl {
     Continue,
     Stop,
+}
+
+/// One named gain stage exposed by a device. SoapySDR's mental model is
+/// that every device has a stack of gain elements with semantic names
+/// (`TUNER` for RTL-SDR, `IFGR`/`RFGR` for SDRplay, `LNA`/`VGA`/`AMP`
+/// for HackRF), each with its own range and step. The SDR Settings
+/// modal renders one widget per element; the AGC adapter (Phase 2.3)
+/// drives exactly one of them, picked per-device via [`DeviceProfile`].
+///
+/// All units are dB. `step_db == 0.0` means continuous; non-zero means
+/// the device snaps to that step internally (e.g. SDRplay's IFGR is
+/// 1 dB steps; SDRplay's RFGR is an integer index that we still
+/// surface as dB for UI consistency).
+///
+/// [`DeviceProfile`]: profile::DeviceProfile
+#[derive(Debug, Clone)]
+pub struct GainElement {
+    /// Element name as Soapy reports it. Used as the key to
+    /// [`Sdr::set_gain_element`] and for looking up the AGC target in
+    /// the device profile.
+    pub name: String,
+    /// Inclusive minimum in dB.
+    pub min_db: f64,
+    /// Inclusive maximum in dB.
+    pub max_db: f64,
+    /// Granularity in dB. `0.0` = continuous (treat as 0.1 dB in UI).
+    pub step_db: f64,
+    /// Current value in dB at the moment `gain_elements` was called.
+    /// The SDR Settings modal uses this to populate its initial widget
+    /// state; the AGC adapter ignores it (it tracks its own state).
+    pub current_db: f64,
 }
 
 /// One-shot configuration applied at the start of a stream. Values are
@@ -137,4 +179,42 @@ pub trait Sdr: Send + Sync {
     /// without error if the stream isn't running. Used by the GUI's
     /// retune flow once the SDR backend is wired into [`ffi`](crate::ffi).
     fn set_center_freq_hz(&self, hz: u32) -> Result<(), SdrError>;
+
+    /// Snapshot of every named gain element this device exposes, with
+    /// each element's range and current value in dB. The SDR Settings
+    /// modal (Phase 3.3) renders one slider/combobox per entry; the
+    /// AGC adapter (Phase 2.3) picks one element by name from the
+    /// active [`DeviceProfile`].
+    ///
+    /// Returns an empty `Vec` for devices that don't expose named
+    /// elements (none in the 0.3.0 supported set, but futureproof).
+    /// Backends should treat this as a "best-effort, never errors"
+    /// query — if a device refuses to enumerate, fall back to an empty
+    /// Vec rather than panicking.
+    fn gain_elements(&self) -> Vec<GainElement>;
+
+    /// Set a specific named gain element in dB. The AGC adapter calls
+    /// this via the profile's `agc_element` field; manual gain UI
+    /// calls it for whatever the user is dragging. Devices that don't
+    /// expose the named element should return `Ok(())` and silently
+    /// ignore the call rather than erroring — keeps the AGC adapter
+    /// from needing per-device branching.
+    fn set_gain_element(&self, name: &str, value_db: f64) -> Result<(), SdrError>;
+
+    /// Apply parts-per-million frequency correction. Zero is a no-op
+    /// on every device. Some devices (SDRplay) don't expose a runtime
+    /// PPM knob — implementors should return `Ok(())` in that case
+    /// rather than erroring, so the config-driven apply path can stay
+    /// uniform across backends.
+    fn set_frequency_correction_ppm(&self, ppm: f64) -> Result<(), SdrError>;
+
+    /// SoapySDR driver key for this device (`"rtlsdr"`, `"sdrplay"`,
+    /// `"hackrf"`, ...). Used by the device-profile lookup so the
+    /// AGC adapter can pick the right gain element, sign convention,
+    /// and tick rate. Backends without a Soapy concept of driver
+    /// should return a string that matches one of the known profiles
+    /// — the legacy native [`RtlSdr`] returns `"rtlsdr"`, matching the
+    /// `RTLSDR` profile so its AGC behavior is identical to Soapy's
+    /// SoapyRTLSDR.
+    fn driver(&self) -> &str;
 }

@@ -24,6 +24,9 @@ pub enum UiCommand {
     /// Set the maximum number of album-art tiles shown in the Collage tab.
     /// Snapped server-side to a power of two in [1, 512].
     SetCollageTileCap(u32),
+    /// Drop every entry from the rolling album-art collage. Wipes the
+    /// in-memory history, persisted manifest, and on-disk image cache.
+    ClearCollage,
     /// Write the current play log to a CSV file. App resolves the path and
     /// surfaces it through `AppState::log_export_status`.
     ExportLogCsv,
@@ -41,6 +44,43 @@ pub enum UiCommand {
     /// R820T2 step at apply time. Persisted to config; takes effect on
     /// the next piped Start.
     SetManualGainTenths(i32),
+    /// Re-enumerate attached SoapySDR devices and refresh the device
+    /// picker list shown in the SDR Settings modal. Triggered by the
+    /// "Refresh" button there and once when the modal is first opened.
+    RefreshSdrDevices,
+    /// Apply a user-chosen device from the SDR Settings modal. The
+    /// payload is the full SoapySDR args string (e.g.
+    /// `"driver=rtlsdr,device=1"`). Persisted to config and applied on
+    /// the next piped Start.
+    SelectSdrDevice {
+        driver: String,
+        device_args: String,
+    },
+    /// Set a per-element manual gain (dB) for the currently configured
+    /// device. The element name is whatever the device exposes
+    /// (`TUNER` for RTL-SDR, `IFGR`/`RFGR` for SDRplay, `LNA`/`VGA`/`AMP`
+    /// for HackRF). Persisted into `AppConfig.sdr.gains` and applied to
+    /// the live SDR if a piped stream is running.
+    SetSdrGainElement {
+        element: String,
+        value_db: f64,
+    },
+    /// Set the SoapySDR frequency-correction PPM for the active device.
+    /// Persisted; applied mid-stream when possible (RTL-SDR supports
+    /// runtime PPM; SDRplay does not — the call no-ops there).
+    SetSdrFreqCorrectionPpm(f64),
+    /// Reset everything in the `[sdr]` config section back to default
+    /// (`driver=rtlsdr`, empty args, 0 PPM, no gain overrides). The SDR
+    /// Settings modal's "Reset to defaults" button.
+    ResetSdrConfig,
+    /// Show the SDR Settings modal.
+    ShowSdrSettings,
+    /// Hide the SDR Settings modal.
+    HideSdrSettings,
+    /// Show the About dialog.
+    ShowAbout,
+    /// Hide the About dialog.
+    HideAbout,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -1394,6 +1434,17 @@ impl DockViewer<'_> {
             if dbl.clicked() {
                 self.commands
                     .push(UiCommand::SetCollageTileCap((cap * 2).min(512)));
+            }
+            ui.add_space(12.0);
+            let clear_resp = ui
+                .add(egui::Button::new("\u{1F5D1} Clear").small())
+                .on_hover_text(
+                    "Drop every cover from the rolling collage. \
+                     Wipes the in-memory history and the on-disk \
+                     art cache. Cannot be undone.",
+                );
+            if clear_resp.clicked() {
+                self.commands.push(UiCommand::ClearCollage);
             }
         });
         ui.add_space(4.0);

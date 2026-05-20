@@ -27,9 +27,59 @@ New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
 # Application binary
 Copy-Item -Path (Join-Path $TargetDir "nrsc5-studio.exe") -Destination $OutDir -Force
 
-# Native dependencies (nrsc5.exe + DLLs)
-if (Test-Path (Join-Path $Root "bin")) {
-    Copy-Item -Path (Join-Path $Root "bin\*") -Destination $OutDir -Recurse -Force
+# Native dependencies. Layout:
+#
+#   <exe_dir>\nrsc5-studio.exe
+#   <exe_dir>\libSoapySDR.dll        -- load-time import of the exe
+#   <exe_dir>\libunwind.dll          -- load-time import of the exe
+#   <exe_dir>\libgcc_s_seh-1.dll     -- transitive load-time dep of libSoapySDR
+#   <exe_dir>\libwinpthread-1.dll    -- transitive load-time dep of libSoapySDR
+#   <exe_dir>\libstdc++-6.dll        -- transitive load-time dep of libSoapySDR
+#   <exe_dir>\bin\nrsc5.exe
+#   <exe_dir>\bin\libnrsc5.dll       -- loaded by nrsc5.exe (its own exe dir)
+#   <exe_dir>\bin\librtlsdr.dll      -- loaded by SoapyRTLSDR (PATH at runtime)
+#   <exe_dir>\bin\libusb-1.0.dll     -- transitive dep of librtlsdr
+#   <exe_dir>\bin\libao-4.dll        -- loaded by nrsc5.exe (its own exe dir)
+#   <exe_dir>\bin\libgcc_s_dw2-1.dll -- loaded by nrsc5.exe (its own exe dir)
+#   <exe_dir>\bin\SoapySDR\modules0.8\*.dll
+#
+# Why the split: Windows resolves the exe's load-time imports BEFORE
+# any of our Rust code runs, so any DLL the exe links statically
+# (libSoapySDR.dll + the MSYS2 C/C++ runtime libs it pulls in) must
+# sit in a directory Windows' default DLL search covers -- i.e. next
+# to the exe, since we don't want to require System32 installs. The
+# remaining DLLs (`bin\...`) are either loaded by the `nrsc5.exe`
+# subprocess (whose own exe dir is `bin\`, so Windows finds them
+# natively) or loaded by libSoapySDR's modules AFTER
+# `main.rs::install_bundled_dll_paths()` has prepended `<exe>\bin`
+# to PATH and pointed `SOAPY_SDR_PLUGIN_PATH` at
+# `<exe>\bin\SoapySDR\modules0.8`.
+$LoadTimeDlls = @(
+    "libSoapySDR.dll",
+    "libunwind.dll",
+    "libgcc_s_seh-1.dll",
+    "libwinpthread-1.dll",
+    "libstdc++-6.dll"
+)
+$BinSrc = Join-Path $Root "bin"
+$BinDst = Join-Path $OutDir "bin"
+if (Test-Path $BinSrc) {
+    # 1) Mirror the whole bin\ tree into <exe_dir>\bin\ (preserves
+    #    the `SoapySDR\modules0.8\` subfolder structure that
+    #    `paths::bundled_soapy_modules_dir()` looks for).
+    Copy-Item -Path $BinSrc -Destination $OutDir -Recurse -Force
+    # 2) Promote the load-time DLLs up to the exe root. Each is
+    #    *also* left in `bin\` as a copy so that an end user who
+    #    runs `bin\nrsc5.exe` directly (e.g. for debugging) still
+    #    gets a self-consistent bin\ folder.
+    foreach ($dll in $LoadTimeDlls) {
+        $src = Join-Path $BinSrc $dll
+        if (Test-Path $src) {
+            Copy-Item -Path $src -Destination $OutDir -Force
+        } else {
+            Write-Warning "Expected load-time DLL '$dll' not found in bin\ -- exe may fail to start on a clean machine."
+        }
+    }
 }
 
 # Default configuration
@@ -71,6 +121,30 @@ foreach ($doc in @("README.md", "LICENSE", "THIRD_PARTY_NOTICES.md")) {
 }
 
 Write-Host "Portable package created at: $OutDir"
+
+# SDR support summary. Confirms every module DLL we expect for the
+# v0.3.0 release is present in the staged bundle and reminds the
+# packager about the runtime dependency the SDRplay module has on
+# Xperi/SDRplay's proprietary sdrplay_api.dll (which cannot be
+# redistributed — end users must install the SDRplay API themselves
+# from sdrplay.com).
+$ModulesDir = Join-Path $OutDir "bin\SoapySDR\modules0.8"
+$ExpectedModules = @(
+    @{ File = "librtlsdrSupport.dll";  Display = "RTL-SDR"  },
+    @{ File = "libHackRFSupport.dll";  Display = "HackRF"   },
+    @{ File = "libsdrPlaySupport.dll"; Display = "SDRplay"  }
+)
+Write-Host "Bundled SoapySDR modules:"
+foreach ($m in $ExpectedModules) {
+    $present = Test-Path (Join-Path $ModulesDir $m.File)
+    $marker = if ($present) { "[OK]   " } else { "[MISS] " }
+    Write-Host "  $marker$($m.Display) ($($m.File))"
+}
+Write-Host ""
+Write-Host "NOTE: libsdrPlaySupport.dll requires SDRplay API v3.x at runtime."
+Write-Host "      Users without an SDRplay receiver can ignore. Users WITH"
+Write-Host "      one must install the SDRplay API service from sdrplay.com"
+Write-Host "      (free; can't be bundled per Xperi/SDRplay licensing)."
 
 if ($Zip) {
     $ZipPath = Join-Path $Root "dist\$OutName.zip"

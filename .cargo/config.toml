@@ -4,3 +4,28 @@ target = "x86_64-pc-windows-gnullvm"
 [target.x86_64-pc-windows-gnullvm]
 linker = ".toolchains/llvm-mingw-20260505-ucrt-x86_64/bin/x86_64-w64-mingw32-clang.exe"
 ar = ".toolchains/llvm-mingw-20260505-ucrt-x86_64/bin/llvm-ar.exe"
+
+# Env vars propagated to cargo and ALL build scripts (including
+# soapysdr-sys, which calls pkg-config to locate SoapySDR). These point
+# at MSYS2's default install. Override via shell env vars before
+# running cargo if MSYS2 is installed elsewhere.
+[env]
+# Absolute path to the pkg-config binary. The pkg-config crate uses
+# this in preference to searching PATH, so we don't need to pollute
+# the developer's PATH globally.
+PKG_CONFIG = "C:\\msys64\\mingw64\\bin\\pkg-config.exe"
+# Directory containing SoapySDR.pc (and any future Soapy module .pc
+# files installed via MSYS2).
+PKG_CONFIG_PATH = "C:\\msys64\\mingw64\\lib\\pkgconfig"
+# pkg-config considers MSYS2's mingw64 prefix a "system" path and
+# strips its -L/-I flags from the output by default. These overrides
+# tell it to emit them anyway, which is what we need for the linker
+# to actually find libSoapySDR.dll.a.
+PKG_CONFIG_ALLOW_SYSTEM_LIBS = "1"
+PKG_CONFIG_ALLOW_SYSTEM_CFLAGS = "1"
+# Path to the directory containing libclang.dll. The bindgen crate
+# (used transitively by soapysdr-sys to parse SoapySDR's headers at
+# build time) loads this dynamically. The bundled llvm-mingw toolchain
+# only ships libclang-cpp.dll, which has a different ABI and can't be
+# substituted; mingw-w64-x86_64-clang from MSYS2 provides the right one.
+LIBCLANG_PATH = "C:\\msys64\\mingw64\\bin"
