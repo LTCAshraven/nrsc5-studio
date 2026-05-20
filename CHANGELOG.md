@@ -4,6 +4,79 @@ All notable changes to NRSC5 Studio are documented here. The format roughly
 follows [Keep a Changelog](https://keepachangelog.com/), and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.3.6] - 2026-05-20
+
+PSD release. The Station Information panel is now split into two
+stacked tables — a new **PSD (Program Service Data)** section on
+top surfacing the per-song ID3-style metadata (Song Title, Artist,
+Album, Genre) the broadcast actually carries, and the existing
+**SIS (Station Information Service)** section below it. Every row
+appears and disappears on its own as the station sends or drops
+each underlying field, with a 15-second per-field freshness window
+so stale data between songs can't claim to be the current track.
+No SDR or DSP behavior changes from 0.3.5.
+
+### Added
+
+- **PSD section in Station Information.** Four-row table for the
+  song-level ID3v2.4 frames nrsc5 emits:
+  - **Song Title** (`TIT2`)
+  - **Artist** (`TPE1`)
+  - **Album** (`TALB`) — previously parsed but never rendered.
+  - **Genre** (`TCON`) — previously parsed but never rendered.
+
+  Each row only appears when the corresponding field is non-empty,
+  and disappears 15 seconds after the last refresh of *that*
+  specific field, so a stale Genre from the previous song doesn't
+  linger when the next song omits it.
+- **Per-field freshness timestamps.** `AppState` now tracks
+  `title_updated` / `artist_updated` / `album_updated` /
+  `genre_updated` independently. `AppState::is_psd_field_fresh()`
+  and `psd_latest_updated()` derive the visibility and footer
+  state from those.
+- **Per-section footers** in the Station Information panel.
+  "PSD updated Xs ago" and "SIS updated Xs ago" lines bucket the
+  elapsed time in 10-second steps (`just now` → `10s ago` →
+  `20s ago` → `1m ago`) so they refresh visibly only when the
+  number actually changes, instead of flickering every second.
+
+### Changed
+
+- **Station Information layout.** The panel is now a scrollable
+  two-section table: PSD on top, SIS below. Either section is
+  hidden when it has nothing to show; the combined empty-state
+  placeholder ("Waiting for station data…") appears when both
+  are empty.
+- **SIS section rendering** now skips each block (call sign +
+  service-mode header, slogan, message, country/FCC row,
+  location, subchannels grid, data services) individually when
+  the underlying field is absent, instead of drawing separator
+  rules for empty sections.
+
+### Fixed
+
+- **Album and Genre are now actually displayed.** Both PSD frames
+  were parsed from nrsc5 stderr into `AppState` since the very
+  first release but had no rendering path. They now appear in the
+  new PSD table as the station sends them.
+- **Stale PSD on retune / Stop.** `UiCommand::TuneMhz` and
+  `UiCommand::Stop` now explicitly clear `title` / `artist` /
+  `album` / `genre` (and all four per-field timestamps) alongside
+  the existing `station_info.reset()`, so the Station Information
+  panel can no longer briefly show the previous station's song
+  metadata while the new station's SIS / PSD rolls in.
+
+### Internal
+
+- `AppState::PSD_STALE_AFTER` constant (15 s) and
+  `AppState::is_psd_field_fresh()` helper mirror the existing
+  `LOST_SYNC_GRACE` / `sync_data_stale()` pattern, keeping the
+  freshness policy in one place.
+- `TabViewer::station_info_ui()` refactored into
+  `render_psd_section()` + `render_sis_section()` helpers and a
+  shared `fmt_elapsed_bucketed()` formatter so both footers
+  render through the same code path.
+
 ## [0.3.5] - 2026-05-20
 
 Identity release. Everything nrsc5 prints from a station's SIS table —

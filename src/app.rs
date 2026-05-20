@@ -1281,17 +1281,22 @@ impl Nrsc5App {
                 self.last_signal_at = Some(Instant::now());
                 self.app_state.active_program = self.app_state.selected_program;
 
+                let now = Instant::now();
                 if !title.is_empty() {
                     self.app_state.title = title;
+                    self.app_state.title_updated = Some(now);
                 }
                 if !artist.is_empty() {
                     self.app_state.artist = artist;
+                    self.app_state.artist_updated = Some(now);
                 }
                 if !album.is_empty() {
                     self.app_state.album = album;
+                    self.app_state.album_updated = Some(now);
                 }
                 if !genre.is_empty() {
                     self.app_state.genre = genre;
+                    self.app_state.genre_updated = Some(now);
                 }
 
                 // Try to record this metadata update to the play log only
@@ -1561,6 +1566,17 @@ impl Nrsc5App {
                 // from scratch rather than rendering stale fields from the
                 // last session.
                 self.app_state.station_info.reset();
+                // Wipe PSD so the Station Info panel doesn't claim the
+                // last-heard track is the "current" one once the stream
+                // is no longer running.
+                self.app_state.title.clear();
+                self.app_state.artist.clear();
+                self.app_state.album.clear();
+                self.app_state.genre.clear();
+                self.app_state.title_updated = None;
+                self.app_state.artist_updated = None;
+                self.app_state.album_updated = None;
+                self.app_state.genre_updated = None;
                 self.traffic_map.clear();
                 self.weather_map.clear();
                 self.app_state.nrsc5_status = "stream stopped".to_string();
@@ -1577,6 +1593,17 @@ impl Nrsc5App {
                 self.app_state.currently_synced = false;
                 self.app_state.lost_sync_at = None;
                 self.app_state.call_sign.clear();
+                // PSD belongs to the previous station's broadcast; clear
+                // it so the panel doesn't show the wrong song while the
+                // new station's SIS / PSD roll in.
+                self.app_state.title.clear();
+                self.app_state.artist.clear();
+                self.app_state.album.clear();
+                self.app_state.genre.clear();
+                self.app_state.title_updated = None;
+                self.app_state.artist_updated = None;
+                self.app_state.album_updated = None;
+                self.app_state.genre_updated = None;
                 self.lot_files.clear();
                 self.config.frequency_mhz = mhz;
                 save_config(&self.config);

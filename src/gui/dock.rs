@@ -4,6 +4,7 @@ use crate::play_log::PlayLog;
 use egui::{Color32, DragValue, RichText, Ui, Vec2, WidgetText};
 use egui_dock::TabViewer;
 use serde::{Deserialize, Serialize};
+use std::time::Instant;
 
 #[derive(Debug, Clone)]
 pub enum UiCommand {
@@ -548,32 +549,54 @@ impl DockViewer<'_> {
         }
     }
 
-    /// Aggregated SIS readout for the currently tuned station. Renders
-    /// fields harvested from nrsc5 stderr (call sign, slogan, message,
-    /// alert, country/FCC ID, transmitter location, per-program info,
-    /// data services) plus an inferred service-mode badge. Stays
-    /// empty with a "Waiting for SIS\u2026" placeholder until any field
-    /// is populated. Survives brief LostSync flickers because the
-    /// underlying [`StationInfo`] is only cleared on retune / Stop.
+    /// Station Information panel. Two stacked tables:
+    ///
+    /// 1. **PSD (Program Service Data)** \u2014 the per-song ID3-style
+    ///    metadata for whatever is currently playing on the tuned
+    ///    subchannel: Song Title / Artist / Album / Genre. Rows appear
+    ///    only when the field is non-empty, and the whole section is
+    ///    hidden once `psd_last_updated` is older than
+    ///    `AppState::PSD_STALE_AFTER` (so a stale title between songs
+    ///    doesn't claim to be the current track).
+    /// 2. **SIS (Station Information Service)** \u2014 the station-level
+    ///    fields nrsc5 surfaces from the broadcast (call sign, slogan,
+    ///    message, alert, country / FCC ID, transmitter location,
+    ///    per-program advertised subchannels, data services). Each row
+    ///    only renders when the underlying field is populated. The
+    ///    aggregate state is cleared on retune / Stop, so we don't need
+    ///    a per-field timeout here.
+    ///
+    /// The panel shows a single "Waiting for station data\u2026" placeholder
+    /// when neither section currently has anything to show.
     fn station_info_ui(&mut self, ui: &mut Ui) {
-        let info = &self.app_state.station_info;
         let accent = Color32::from_rgb(100, 160, 255);
         let dim = Color32::from_gray(160);
         let muted = Color32::from_gray(120);
         let alert_red = Color32::from_rgb(220, 80, 80);
 
-        if !info.has_any_data() {
+        let title_fresh = !self.app_state.title.is_empty()
+            && AppState::is_psd_field_fresh(self.app_state.title_updated);
+        let artist_fresh = !self.app_state.artist.is_empty()
+            && AppState::is_psd_field_fresh(self.app_state.artist_updated);
+        let album_fresh = !self.app_state.album.is_empty()
+            && AppState::is_psd_field_fresh(self.app_state.album_updated);
+        let genre_fresh = !self.app_state.genre.is_empty()
+            && AppState::is_psd_field_fresh(self.app_state.genre_updated);
+        let psd_has_any = title_fresh || artist_fresh || album_fresh || genre_fresh;
+        let sis_has_any = self.app_state.station_info.has_any_data();
+
+        if !psd_has_any && !sis_has_any {
             ui.add_space(8.0);
             ui.vertical_centered(|ui| {
                 ui.label(
-                    RichText::new("Waiting for SIS\u{2026}")
+                    RichText::new("Waiting for station data\u{2026}")
                         .italics()
                         .color(dim),
                 );
                 ui.add_space(4.0);
                 ui.label(
                     RichText::new(
-                        "Station identity, slogan, programs, and location\nappear here once HD sync stabilizes.",
+                        "Song metadata and station identity appear here\nonce HD sync stabilizes.",
                     )
                     .small()
                     .color(muted),
@@ -582,7 +605,133 @@ impl DockViewer<'_> {
             return;
         }
 
-        // Alert banner pinned to the top when active.
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                if psd_has_any {
+                    self.render_psd_section(ui, accent, dim, muted);
+                }
+
+                if psd_has_any && sis_has_any {
+                    ui.add_space(10.0);
+                }
+
+                if sis_has_any {
+                    self.render_sis_section(ui, accent, dim, muted, alert_red);
+                }
+            });
+
+        // Keep the relative-time footers ticking and PSD staleness
+        // re-evaluated even when no events are arriving.
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_secs(1));
+    }
+
+    /// PSD section \u2014 per-song metadata. Rendered as a label + two-column
+    /// grid. Caller has already verified at least one field is present
+    /// and within the freshness window.
+    fn render_psd_section(
+        &self,
+        ui: &mut Ui,
+        accent: Color32,
+        dim: Color32,
+        muted: Color32,
+    ) {
+        ui.label(
+            RichText::new("PSD \u{2014} Program Service Data")
+                .color(accent)
+                .strong(),
+        );
+        ui.add_space(2.0);
+
+        egui::Grid::new("station_info_psd_grid")
+            .num_columns(2)
+            .spacing([12.0, 3.0])
+            .show(ui, |ui| {
+                Self::psd_row(
+                    ui,
+                    "Song Title",
+                    &self.app_state.title,
+                    self.app_state.title_updated,
+                    muted,
+                    dim,
+                );
+                Self::psd_row(
+                    ui,
+                    "Artist",
+                    &self.app_state.artist,
+                    self.app_state.artist_updated,
+                    muted,
+                    dim,
+                );
+                Self::psd_row(
+                    ui,
+                    "Album",
+                    &self.app_state.album,
+                    self.app_state.album_updated,
+                    muted,
+                    dim,
+                );
+                Self::psd_row(
+                    ui,
+                    "Genre",
+                    &self.app_state.genre,
+                    self.app_state.genre_updated,
+                    muted,
+                    dim,
+                );
+            });
+
+        if let Some(ts) = self.app_state.psd_latest_updated() {
+            let txt = format!("PSD updated {}", Self::fmt_elapsed_bucketed(ts.elapsed().as_secs()));
+            ui.add_space(2.0);
+            ui.label(RichText::new(txt).small().color(muted));
+        }
+    }
+
+    /// One PSD row. Skipped entirely when the value is empty OR its
+    /// per-field timestamp has aged past [`AppState::PSD_STALE_AFTER`],
+    /// so each row appears and disappears independently as the station
+    /// keeps (or drops) the underlying ID3 frame between songs.
+    fn psd_row(
+        ui: &mut Ui,
+        label: &str,
+        value: &str,
+        updated_at: Option<Instant>,
+        muted: Color32,
+        dim: Color32,
+    ) {
+        if value.is_empty() || !AppState::is_psd_field_fresh(updated_at) {
+            return;
+        }
+        ui.label(RichText::new(label).color(muted));
+        ui.label(RichText::new(value).color(dim));
+        ui.end_row();
+    }
+
+    /// SIS section \u2014 station-level fields. Mirrors the structure the
+    /// 0.3.5 panel originally had (alert banner / call sign + service
+    /// mode / slogan / message / identity / location / subchannels /
+    /// data services / updated-at footer) but each block only renders
+    /// when its underlying field is populated.
+    fn render_sis_section(
+        &self,
+        ui: &mut Ui,
+        accent: Color32,
+        dim: Color32,
+        muted: Color32,
+        alert_red: Color32,
+    ) {
+        let info = &self.app_state.station_info;
+
+        ui.label(
+            RichText::new("SIS \u{2014} Station Information Service")
+                .color(accent)
+                .strong(),
+        );
+        ui.add_space(2.0);
+
+        // Alert banner pinned to the top of the SIS section when active.
         if let Some(text) = info.alert.clone() {
             egui::Frame::new()
                 .fill(Color32::from_rgba_unmultiplied(220, 80, 80, 40))
@@ -599,24 +748,24 @@ impl DockViewer<'_> {
         }
 
         // Header row: call sign + inferred service-mode badge.
-        ui.horizontal(|ui| {
-            let call_sign = info
-                .call_sign
-                .clone()
-                .unwrap_or_else(|| "(unknown call sign)".to_string());
-            ui.label(RichText::new(call_sign).heading().color(accent));
-            if let Some(mode) = info.infer_service_mode() {
-                ui.add_space(10.0);
-                let resp = ui.label(
-                    RichText::new(format!("[{} \u{2022} inferred]", mode.label()))
-                        .small()
-                        .color(muted),
-                );
-                resp.on_hover_text(
-                    "HD Radio service mode inferred from the highest subchannel\nadvertised in SIS. nrsc5 does not report the mode directly.",
-                );
-            }
-        });
+        if info.call_sign.is_some() || info.infer_service_mode().is_some() {
+            ui.horizontal(|ui| {
+                if let Some(call_sign) = info.call_sign.clone() {
+                    ui.label(RichText::new(call_sign).heading().color(accent));
+                }
+                if let Some(mode) = info.infer_service_mode() {
+                    ui.add_space(10.0);
+                    let resp = ui.label(
+                        RichText::new(format!("[{} \u{2022} inferred]", mode.label()))
+                            .small()
+                            .color(muted),
+                    );
+                    resp.on_hover_text(
+                        "HD Radio service mode inferred from the highest subchannel\nadvertised in SIS. nrsc5 does not report the mode directly.",
+                    );
+                }
+            });
+        }
 
         if let Some(slogan) = &info.slogan {
             ui.label(RichText::new(slogan).italics().color(dim));
@@ -625,52 +774,48 @@ impl DockViewer<'_> {
             ui.label(RichText::new(message).color(dim));
         }
 
-        ui.add_space(6.0);
-        ui.separator();
-        ui.add_space(4.0);
+        let has_identity_row = info.country.is_some()
+            || info.fcc_facility_id.is_some()
+            || info.location.is_some();
+        if has_identity_row {
+            ui.add_space(6.0);
+            ui.separator();
+            ui.add_space(4.0);
 
-        // Identity: country + FCC facility ID on one row.
-        if info.country.is_some() || info.fcc_facility_id.is_some() {
-            ui.horizontal(|ui| {
-                if let Some(country) = &info.country {
-                    ui.label(RichText::new("Country:").color(muted));
-                    ui.label(RichText::new(country).monospace());
-                }
-                if let Some(fcc) = info.fcc_facility_id {
-                    ui.add_space(14.0);
-                    ui.label(RichText::new("FCC ID:").color(muted));
-                    ui.label(RichText::new(fcc.to_string()).monospace());
-                }
-            });
+            if info.country.is_some() || info.fcc_facility_id.is_some() {
+                ui.horizontal(|ui| {
+                    if let Some(country) = &info.country {
+                        ui.label(RichText::new("Country:").color(muted));
+                        ui.label(RichText::new(country).monospace());
+                    }
+                    if let Some(fcc) = info.fcc_facility_id {
+                        ui.add_space(14.0);
+                        ui.label(RichText::new("FCC ID:").color(muted));
+                        ui.label(RichText::new(fcc.to_string()).monospace());
+                    }
+                });
+            }
+
+            if let Some(loc) = info.location {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Location:").color(muted));
+                    ui.label(
+                        RichText::new(format!(
+                            "{:.4}\u{00B0}, {:.4}\u{00B0}  (alt {} m)",
+                            loc.latitude, loc.longitude, loc.altitude_m
+                        ))
+                        .monospace(),
+                    );
+                });
+            }
         }
 
-        // Transmitter location.
-        if let Some(loc) = info.location {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("Location:").color(muted));
-                ui.label(
-                    RichText::new(format!(
-                        "{:.4}\u{00B0}, {:.4}\u{00B0}  (alt {} m)",
-                        loc.latitude, loc.longitude, loc.altitude_m
-                    ))
-                    .monospace(),
-                );
-            });
-        }
-
-        ui.add_space(6.0);
-        ui.separator();
-        ui.add_space(4.0);
-
-        // Subchannels — only show rows for slots SIS has actually advertised.
-        ui.label(RichText::new("Subchannels").color(muted).small());
-        if info.program_count() == 0 {
-            ui.label(
-                RichText::new("none advertised yet")
-                    .italics()
-                    .color(dim),
-            );
-        } else {
+        // Subchannels block \u2014 only when SIS has actually advertised any.
+        if info.program_count() > 0 {
+            ui.add_space(6.0);
+            ui.separator();
+            ui.add_space(4.0);
+            ui.label(RichText::new("Subchannels").color(muted).small());
             egui::Grid::new("station_info_programs_grid")
                 .num_columns(5)
                 .spacing([10.0, 2.0])
@@ -698,10 +843,6 @@ impl DockViewer<'_> {
                             )
                             .color(dim),
                         );
-                        // Bit rate column \u2014 only the currently-decoded
-                        // program will have a value, since nrsc5 emits
-                        // `Audio bit rate:` for whatever subchannel it's
-                        // tuned to. Other rows render an em-dash.
                         let bitrate_txt = prog
                             .bit_rate_kbps
                             .map(|k| format!("{:.0} kbps", k))
@@ -712,7 +853,6 @@ impl DockViewer<'_> {
                 });
         }
 
-        // Data services (only if any).
         if !info.data_services.is_empty() {
             ui.add_space(6.0);
             ui.separator();
@@ -723,21 +863,27 @@ impl DockViewer<'_> {
             }
         }
 
-        // Footer: relative "last updated" timestamp. Request a follow-up
-        // repaint so the counter ticks while the panel is visible.
         if let Some(ts) = info.last_updated {
             ui.add_space(8.0);
-            let secs = ts.elapsed().as_secs();
-            let txt = if secs < 1 {
-                "updated just now".to_string()
-            } else if secs < 60 {
-                format!("updated {}s ago", secs)
-            } else {
-                format!("updated {}m ago", secs / 60)
-            };
+            let txt = format!("SIS updated {}", Self::fmt_elapsed_bucketed(ts.elapsed().as_secs()));
             ui.label(RichText::new(txt).small().color(muted));
-            ui.ctx()
-                .request_repaint_after(std::time::Duration::from_secs(1));
+        }
+    }
+
+    /// Bucket an elapsed time so the Station Info footers don't flicker
+    /// once per second between "just now" and "1s ago". Buckets:
+    /// `< 10s` -> "just now"; `10..60s` -> nearest 10s step; minutes /
+    /// hours otherwise. Combined with the 1 Hz repaint, the label
+    /// changes at most every 10 seconds while still tracking real time.
+    fn fmt_elapsed_bucketed(secs: u64) -> String {
+        if secs < 10 {
+            "just now".to_string()
+        } else if secs < 60 {
+            format!("{}s ago", (secs / 10) * 10)
+        } else if secs < 3600 {
+            format!("{}m ago", secs / 60)
+        } else {
+            format!("{}h ago", secs / 3600)
         }
     }
 

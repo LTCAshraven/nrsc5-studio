@@ -54,6 +54,22 @@ pub struct AppState {
     pub artist: String,
     pub album: String,
     pub genre: String,
+    /// Wall-clock time the `title` field was last refreshed by a
+    /// `NrscEvent::Metadata` event. Used by the Station Information
+    /// panel to fade the Song Title row out independently of the
+    /// other PSD fields once `PSD_STALE_AFTER` elapses with no
+    /// further updates — stations sometimes drop Genre / Album
+    /// between songs while still pushing Title / Artist, and we
+    /// don't want the stale field to keep claiming to be current.
+    /// `None` whenever no value has been observed since the last
+    /// retune / Stop.
+    pub title_updated: Option<Instant>,
+    /// Per-field freshness for `artist`. See [`Self::title_updated`].
+    pub artist_updated: Option<Instant>,
+    /// Per-field freshness for `album`. See [`Self::title_updated`].
+    pub album_updated: Option<Instant>,
+    /// Per-field freshness for `genre`. See [`Self::title_updated`].
+    pub genre_updated: Option<Instant>,
     pub mer: f32,
     /// MER on the lower OFDM sideband, in dB. Drives the left half of the
     /// constellation cloud.
@@ -208,6 +224,17 @@ impl AppState {
     /// lost signal blanks the selector promptly.
     pub const LOST_SYNC_GRACE: Duration = Duration::from_secs(5);
 
+    /// How long a PSD field is considered "fresh" after the last
+    /// `NrscEvent::Metadata` update before the Station Information
+    /// panel hides its rows. Most stations refresh PSD on every song
+    /// change (every 2-4 minutes) but emit the four fields one line
+    /// at a time spaced over a few seconds, so the timeout has to be
+    /// generous enough to ride out the per-field staggering without
+    /// flickering rows in and out. Fifteen seconds covers the typical
+    /// title -> artist -> album -> genre roll-in while still hiding
+    /// "stale" PSD between songs on stations that pause metadata.
+    pub const PSD_STALE_AFTER: Duration = Duration::from_secs(15);
+
     /// True if we've been out of sync for longer than [`Self::LOST_SYNC_GRACE`].
     /// The dock uses this to decide whether the cached SIS program list
     /// should be considered stale for display purposes — the underlying
@@ -217,6 +244,37 @@ impl AppState {
         self.lost_sync_at
             .map(|t| t.elapsed() >= Self::LOST_SYNC_GRACE)
             .unwrap_or(false)
+    }
+
+    /// True if any PSD field has been updated within the
+    /// [`Self::PSD_STALE_AFTER`] window. Used by the Station Information
+    /// panel to decide whether to show the PSD section at all.
+    pub fn psd_is_fresh(&self) -> bool {
+        Self::is_psd_field_fresh(self.title_updated)
+            || Self::is_psd_field_fresh(self.artist_updated)
+            || Self::is_psd_field_fresh(self.album_updated)
+            || Self::is_psd_field_fresh(self.genre_updated)
+    }
+
+    /// True iff a per-field PSD timestamp is within
+    /// [`Self::PSD_STALE_AFTER`]. `None` -> always stale.
+    pub fn is_psd_field_fresh(ts: Option<Instant>) -> bool {
+        ts.map(|t| t.elapsed() < Self::PSD_STALE_AFTER).unwrap_or(false)
+    }
+
+    /// Most recent PSD update across all four fields, used for the
+    /// "PSD updated Xs ago" footer. `None` whenever no PSD has been
+    /// observed since the last retune / Stop.
+    pub fn psd_latest_updated(&self) -> Option<Instant> {
+        [
+            self.title_updated,
+            self.artist_updated,
+            self.album_updated,
+            self.genre_updated,
+        ]
+        .into_iter()
+        .flatten()
+        .max()
     }
 
     /// Derived `[bool; 8]` indicating which HD subchannels should be
