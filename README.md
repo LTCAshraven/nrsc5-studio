@@ -12,7 +12,7 @@ NRSC5 Studio gives you everything `nrsc5.exe` already does — tuning, demodulat
 
 ![NRSC5 Studio default layout](docs/screenshot01.png)
 
-*The default dock layout — Tuner, Now-Playing, Spectrum, Constellation, Traffic, Weather, and the rolling Album-Art Collage all visible at once.*
+*The default dock layout — Tuner, Now-Playing, Station Information, Spectrum, Constellation, Traffic, Weather, and the rolling Album-Art Collage all visible at once.*
 
 ![NRSC5 Studio collage-focused layout](docs/screenshot02.png)
 
@@ -22,8 +22,9 @@ NRSC5 Studio gives you everything `nrsc5.exe` already does — tuning, demodulat
 
 ## Features
 
-- **Full HD Radio playback** — HD1/HD2/HD3/HD4 subchannel selection, automatic retune on frequency change, persistent presets you can save, recall, rename, and re-target via a double-click edit dialog.
+- **Full HD Radio playback** — **HD1–HD8** subchannel selection (the full HD Radio program range), with a **SIS-aware selector grid**: subchannels the station actually advertises light up at full intensity; the rest stay dimmed-but-clickable with a tooltip explaining the station doesn't list that program (you can still probe). Automatic retune on frequency change, persistent presets you can save, recall, rename, and re-target via a double-click edit dialog.
 - **Now-Playing pane** — title / artist / album / genre from broadcast metadata, plus cover art and the station logo if the station you are listening to transmits it.
+- **Station Information pane** — a first-class home for everything the station broadcasts about *itself* via the HD Radio SIS (Station Information Service) table: call sign, slogan, rolling message banner, country and FCC facility ID (linked to the FCC public lookup), transmitter latitude / longitude / altitude, per-subchannel short name + program type + sound experience + live audio bit rate in kbps, the station's data services (Traffic, Weather, Album Art, etc.), and any active emergency alert in a red callout banner. An **MP1 / MP3 / MP11 service-mode badge** is inferred from the highest populated program slot. Fields populate progressively after sync (call sign and slogan in seconds; location and FCC ID can take a minute or two).
 - **Album-Art Collage** — a rolling 8-hour squarified-treemap heat-map of every unique cover seen on the station. Frequent plays grow into bigger tiles; the layout re-flows as new art comes in. **Survives restarts** — covers are cached to disk (`data\art-cache\` in portable mode, `%LOCALAPPDATA%\nrsc5-studio\art-cache\` otherwise) so the heat-map repopulates instantly on relaunch (within the 8-hour window).
 - **24-Hour Song Log** — every play the station broadcasts metadata for is captured with a timestamp and persisted across restarts. Two views: a **Timeline** of the most recent plays and a **Top Played** grouping by `(title, artist)`. Export to RFC-4180 CSV for the scrobbler crowd. Aggressive filtering keeps station IDs, slogans, and call signs out of the log.
 - **Spectrum + Waterfall** — a dedicated SDR scope tab with a 1024-bin live FFT trace (SDR#-style translucent gradient fill, ±20 dB grid, faint shading at the HD digital sidebands at ±129–199 kHz) and a 256-row scrolling waterfall underneath with a turbo colormap. Driven from a tap on the same I/Q stream that feeds the decoder, so what you see is what nrsc5 sees.
@@ -100,7 +101,7 @@ If you'd rather use the standard Windows convention (state under `%APPDATA%\nrsc
 ## Quick start
 
 1. Launch the app. The **Tuner** pane is on the left.
-2. Type a frequency (e.g. `101.1`) and pick a subchannel (`HD1`–`HD4`).
+2. Type a frequency (e.g. `101.1`) and pick a subchannel (`HD1`–`HD8`). Subchannels the station advertises light up; the rest stay clickable in case you want to probe.
 3. Click the green **Start** button.
 4. After 5–15 seconds you should see signal lock and audio.
 5. Right-click any preset slot to save the current station to it; double-click to edit the label, frequency, and subchannel.
@@ -108,6 +109,7 @@ If you'd rather use the standard Windows convention (state under `%APPDATA%\nrsc
 Tips:
 
 - **Live signal lock** is reported in the top bar and on the Signal pane. MER lower/upper should be **≥ 8 dB** for clean HD audio; below that you'll hear audio dropouts.
+- **Station Information** populates as the SIS table rolls in — call sign and slogan are usually first (a few seconds), with country / FCC ID / location arriving over the next minute or two. Many U.S. stations never broadcast `Message` or `Alert`; that's the station, not the app.
 - **Tabs are draggable.** Pull a tab title bar off into its own floating sub-window, split panes, or close panes you don't need.
 - **Album-art collage** starts empty and grows as the station plays songs. After a couple of hours on a busy station you'll see real heat-map structure form.
 - **Weather radar** can take several minutes to receive a full frame even on a strong signal — that's a property of the broadcast, not the app. Will take several more minutes until enough of the frames change to show the animation.
