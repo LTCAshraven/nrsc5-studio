@@ -6,6 +6,15 @@ use crate::dsp::{AgcSnapshot, SpectrumSnapshot, SpectrumTap};
 use crate::sdr::{DeviceInfo, GainElement};
 use crate::station_info::StationInfo;
 
+/// How volume is being controlled for the active audio session.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AudioSessionMode {
+    /// Per-process sink-input found and targeted (best case).
+    PerApp,
+    /// Default system sink used as fallback when per-process match failed.
+    SystemSink,
+}
+
 /// One tile in the album-art heat-map collage: the file path to the image,
 /// the number of times it has appeared, and the unique (title, artist) pairs
 /// observed while it was on screen. Used to render hover tooltips.
