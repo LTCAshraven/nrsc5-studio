@@ -32,6 +32,10 @@ cargo run
 Note: Linux needs `nrsc5` (no `.exe`) available either on PATH or at
 `./bin/nrsc5` inside the repo/runtime folder.
 
+If you compile `nrsc5` yourself, copy/symlink it to `./bin/nrsc5`.
+This is the preferred dev setup because it keeps the helper version
+explicit and independent from distro package revisions.
+
 ## 4. If SoapySDR device discovery fails
 
 ```bash
