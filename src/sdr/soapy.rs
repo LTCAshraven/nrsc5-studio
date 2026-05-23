@@ -912,6 +912,7 @@ fn run_cs8_loop(
     let mut u8_buf: Vec<u8> = vec![0u8; mtu * 2];
 
     let mut error: Option<SdrError> = None;
+    let mut overflow_warned = false;
     while !stop_flag.load(Ordering::Acquire) {
         // 1 second timeout — long enough that we won't spin under
         // normal load, short enough that cancel becomes visible
@@ -919,9 +920,19 @@ fn run_cs8_loop(
         let n = match rx.read(&mut [&mut i8_buf], 1_000_000) {
             Ok(n) => n,
             Err(e) => {
+                let detail = e.to_string();
+                if is_overflow_error(&detail) {
+                    if !overflow_warned {
+                        eprintln!(
+                            "[sdr] transient overflow in CS8 read path; continuing"
+                        );
+                        overflow_warned = true;
+                    }
+                    continue;
+                }
                 error = Some(SdrError::SoapyCall {
                     func: "rx_stream.read",
-                    detail: e.to_string(),
+                    detail,
                 });
                 break;
             }
@@ -979,13 +990,24 @@ fn run_cs16_loop(
     let mut u8_buf: Vec<u8> = vec![0u8; mtu * 2];
 
     let mut error: Option<SdrError> = None;
+    let mut overflow_warned = false;
     while !stop_flag.load(Ordering::Acquire) {
         let n = match rx.read(&mut [&mut i16_buf], 1_000_000) {
             Ok(n) => n,
             Err(e) => {
+                let detail = e.to_string();
+                if is_overflow_error(&detail) {
+                    if !overflow_warned {
+                        eprintln!(
+                            "[sdr] transient overflow in CS16 read path; continuing"
+                        );
+                        overflow_warned = true;
+                    }
+                    continue;
+                }
                 error = Some(SdrError::SoapyCall {
                     func: "rx_stream.read",
-                    detail: e.to_string(),
+                    detail,
                 });
                 break;
             }
@@ -1064,13 +1086,24 @@ fn run_resample_loop(
     const I16_NORM: f32 = 1.0 / 32767.0;
 
     let mut error: Option<SdrError> = None;
+    let mut overflow_warned = false;
     while !stop_flag.load(Ordering::Acquire) {
         let n = match rx.read(&mut [&mut i16_buf], 1_000_000) {
             Ok(n) => n,
             Err(e) => {
+                let detail = e.to_string();
+                if is_overflow_error(&detail) {
+                    if !overflow_warned {
+                        eprintln!(
+                            "[sdr] transient overflow in resample read path; continuing"
+                        );
+                        overflow_warned = true;
+                    }
+                    continue;
+                }
                 error = Some(SdrError::SoapyCall {
                     func: "rx_stream.read",
-                    detail: e.to_string(),
+                    detail,
                 });
                 break;
             }
@@ -1117,6 +1150,10 @@ fn run_resample_loop(
     } else {
         Ok(())
     }
+}
+
+fn is_overflow_error(detail: &str) -> bool {
+    detail.to_ascii_lowercase().contains("overflow")
 }
 
 /// Translate a Soapy `Args` enumeration record into our `DeviceInfo`.
