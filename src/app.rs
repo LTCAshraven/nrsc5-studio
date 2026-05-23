@@ -139,9 +139,9 @@ pub struct Nrsc5App {
     aas_dir: PathBuf,
     traffic_map: TrafficMap,
     weather_map: WeatherMap,
-    /// COM-based per-process volume controller (Windows only).
-    #[cfg(target_os = "windows")]
-    volume_ctl: crate::winaudio::ProcessVolumeControl,
+    /// Per-process volume controller (Windows COM, Linux pactl).
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    volume_ctl: crate::audioctl::ProcessVolumeControl,
     /// Last time we tried to (re)discover the nrsc5 audio session.
     last_session_probe_at: Option<Instant>,
     /// Histogram of unique album art images seen this session, keyed by a
@@ -247,8 +247,8 @@ impl Nrsc5App {
             aas_dir: aas_dir.clone(),
             traffic_map: TrafficMap::new(&aas_dir),
             weather_map: WeatherMap::new(&aas_dir),
-            #[cfg(target_os = "windows")]
-            volume_ctl: crate::winaudio::ProcessVolumeControl::new(),
+            #[cfg(any(target_os = "windows", target_os = "linux"))]
+            volume_ctl: crate::audioctl::ProcessVolumeControl::new(),
             last_session_probe_at: None,
             art_history,
             art_cache,
@@ -720,7 +720,7 @@ impl Nrsc5App {
     /// so we retry every ~500ms while streaming until it appears, then
     /// push the current volume/mute state into it.
     fn poll_audio_session(&mut self) {
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
         {
             let pid = self.nrsc5.as_ref().and_then(|p| p.pid());
             let Some(pid) = pid else {
@@ -761,7 +761,7 @@ impl Nrsc5App {
     }
 
     fn apply_volume(&mut self) {
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
         {
             let Some(pid) = self.nrsc5.as_ref().and_then(|p| p.pid()) else {
                 return;
@@ -771,7 +771,7 @@ impl Nrsc5App {
     }
 
     fn apply_mute(&mut self) {
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
         {
             let Some(pid) = self.nrsc5.as_ref().and_then(|p| p.pid()) else {
                 return;

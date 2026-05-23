@@ -34,6 +34,7 @@ sudo apt-get install -y \
   libxinerama-dev \
   libgl1-mesa-dev \
   libgtk-3-dev \
+  pulseaudio-utils \
   xdg-desktop-portal
 
 if ! command -v rustup >/dev/null 2>&1; then

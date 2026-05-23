@@ -7,6 +7,8 @@
 )]
 
 mod app;
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+mod audioctl;
 mod art_cache;
 mod collage;
 mod config;
@@ -20,6 +22,8 @@ mod play_log;
 mod sdr;
 mod sdr_detect;
 mod station_info;
+#[cfg(target_os = "linux")]
+mod linaudio;
 #[cfg(target_os = "windows")]
 mod winaudio;
 
