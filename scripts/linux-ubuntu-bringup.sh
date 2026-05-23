@@ -38,10 +38,12 @@ sudo apt-get install -y \
 
 if ! command -v rustup >/dev/null 2>&1; then
   echo "==> Installing rustup"
-  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-  # shellcheck disable=SC1090
-  source "$HOME/.cargo/env"
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
 fi
+
+# Ensure cargo is on PATH whether rustup was just installed or was already present.
+# shellcheck disable=SC1090,SC1091
+source "$HOME/.cargo/env"
 
 echo "==> Ensuring rustup toolchain + target"
 rustup toolchain install stable
