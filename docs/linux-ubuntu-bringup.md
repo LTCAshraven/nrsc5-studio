@@ -1,0 +1,54 @@
+# Ubuntu Bring-Up (Linux Port)
+
+This project is currently Windows-first, but Linux bring-up is in progress.
+Use this runbook on Ubuntu 22.04.5 LTS to validate native Linux builds.
+
+## 1. Clone and enter the repo
+
+```bash
+git clone <your-fork-or-origin-url> nrsc5-rust
+cd nrsc5-rust
+```
+
+## 2. Run the setup/check script
+
+```bash
+bash scripts/linux-ubuntu-bringup.sh
+```
+
+What this does:
+- Installs required apt packages (clang/libclang, SoapySDR, RTL-SDR, X11/Wayland dev libs, GTK).
+- Installs rustup if missing.
+- Ensures stable toolchain and Linux target.
+- Runs `cargo check --target x86_64-unknown-linux-gnu`.
+
+## 3. Run the app (dev build)
+
+```bash
+cargo run
+```
+
+## 4. If SoapySDR device discovery fails
+
+```bash
+SoapySDRUtil --find
+SoapySDRUtil --probe="driver=rtlsdr"
+```
+
+If those fail, verify that `librtlsdr` and Soapy modules are installed and visible.
+
+## 5. Useful SSH workflow from Windows
+
+From PowerShell on your Windows machine:
+
+```powershell
+ssh <user>@<ubuntu-host>
+cd ~/nrsc5-rust
+bash scripts/linux-ubuntu-bringup.sh
+cargo run
+```
+
+## Notes
+
+- First Linux milestone is compile + launch + SDR detection + tune/start/stop.
+- Linux per-process volume parity with Windows COM is not required for the first bring-up milestone.

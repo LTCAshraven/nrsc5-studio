@@ -11,7 +11,6 @@ readme = "README.md"
 [dependencies]
 anyhow = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
-cpal = "0.16"
 crossbeam-channel = "0.5"
 dirs = "6"
 eframe = { version = "0.34", features = ["persistence"] }
@@ -38,7 +37,6 @@ ron = "0.8"
 # resampler which has no extra deps beyond `num-traits`.
 rubato = { version = "0.16", default-features = false }
 rustfft = { version = "6", default-features = false }
-rfd = { version = "0.17", default-features = false }
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
 # v0.3.0: single unified SDR backend over libSoapySDR. Replaces the
@@ -52,6 +50,7 @@ thiserror = "2"
 toml = "0.8"
 
 [target.'cfg(windows)'.dependencies]
+rfd = { version = "0.17", default-features = false }
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Media_Audio",
@@ -60,6 +59,9 @@ windows = { version = "0.62", features = [
     "Win32_System_Variant",
     "Win32_UI_Shell_PropertiesSystem",
 ] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
 
 [build-dependencies]
 bindgen = "0.72"

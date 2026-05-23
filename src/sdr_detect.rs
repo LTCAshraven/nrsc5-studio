@@ -52,7 +52,45 @@ fn find_librtlsdr() -> Option<PathBuf> {
 
 #[cfg(not(target_os = "windows"))]
 fn find_librtlsdr() -> Option<PathBuf> {
-    None
+    // Try portable/dev-local copies first, then fall back to the
+    // system dynamic loader search path by soname.
+    const CANDIDATES: [&str; 4] = [
+        "librtlsdr.so",
+        "librtlsdr.so.0",
+        "librtlsdr.so.2",
+        "librtlsdr.dylib",
+    ];
+
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            for name in CANDIDATES {
+                let p = dir.join("bin").join(name);
+                if p.exists() {
+                    return Some(p);
+                }
+                let p = dir.join(name);
+                if p.exists() {
+                    return Some(p);
+                }
+            }
+        }
+    }
+
+    if let Ok(cwd) = std::env::current_dir() {
+        for name in CANDIDATES {
+            let p = cwd.join("bin").join(name);
+            if p.exists() {
+                return Some(p);
+            }
+            let p = cwd.join(name);
+            if p.exists() {
+                return Some(p);
+            }
+        }
+    }
+
+    // Let dlopen resolve via ld.so/dyld search paths.
+    Some(PathBuf::from("librtlsdr.so.0"))
 }
 
 type RtlsdrGetDeviceCount = unsafe extern "C" fn() -> u32;

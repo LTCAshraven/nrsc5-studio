@@ -1,7 +1,10 @@
 // In release builds, mark the binary as a Windows GUI app so no console
 // window appears when the user double-clicks the .exe. Debug builds keep the
 // console so `println!` / `eprintln!` remain visible during development.
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![cfg_attr(
+    all(target_os = "windows", not(debug_assertions)),
+    windows_subsystem = "windows"
+)]
 
 mod app;
 mod art_cache;
@@ -74,13 +77,13 @@ fn install_bundled_dll_paths() {
     // matters: earlier entries take precedence when Windows resolves
     // a DLL name. We push them in *reverse* prepend order (so the
     // last one pushed ends up first on PATH).
-    let mut prepend: Vec<std::ffi::OsString> = Vec::new();
+    let mut prepend: Vec<std::path::PathBuf> = Vec::new();
 
     // 1) <exe_dir>\bin\ -- our bundled libSoapySDR.dll, librtlsdr,
     //    libusb, libao, nrsc5.exe, etc. Mandatory for the portable
     //    install to work at all.
     if let Some(bin) = paths::bundled_dll_dir() {
-        prepend.push(bin.into_os_string());
+        prepend.push(bin);
     }
 
     // 2) SDRplay API runtime directory. The SDRplay API installer
@@ -103,30 +106,39 @@ fn install_bundled_dll_paths() {
     ] {
         let p = std::path::Path::new(candidate);
         if p.is_dir() && p.join("sdrplay_api.dll").is_file() {
-            prepend.push(p.as_os_str().to_os_string());
+            prepend.push(p.to_path_buf());
         }
     }
 
     if !prepend.is_empty() {
         // Prepend (don't replace) so a user's existing PATH entries
-        // still resolve. `set_var` here is sound because we run
-        // before any other thread is spawned.
+        // still resolve. `join_paths` picks the right separator on each OS.
         let prev_path = std::env::var_os("PATH").unwrap_or_default();
-        let mut new_path = std::ffi::OsString::new();
-        for (i, dir) in prepend.iter().enumerate() {
-            if i > 0 {
-                new_path.push(";");
-            }
-            new_path.push(dir);
-        }
-        new_path.push(";");
-        new_path.push(&prev_path);
+        let mut merged = prepend;
+        merged.extend(std::env::split_paths(&prev_path));
         // SAFETY: single-threaded startup. No other code is reading
         // PATH yet. Pre-Rust-1.78 set_var is safe here unconditionally;
         // newer toolchains mark it unsafe in multi-threaded contexts
         // only -- main thread before eframe::run_native is fine.
-        unsafe {
-            std::env::set_var("PATH", new_path);
+        if let Ok(new_path) = std::env::join_paths(merged) {
+            unsafe {
+                std::env::set_var("PATH", new_path);
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    if let Some(bin) = paths::bundled_dll_dir() {
+        // Linux/macOS use the dynamic loader's library search path.
+        // Keep parity with the Windows PATH prepend behavior so a
+        // portable layout with native `.so` files can self-resolve.
+        let prev = std::env::var_os("LD_LIBRARY_PATH").unwrap_or_default();
+        let mut merged = vec![bin];
+        merged.extend(std::env::split_paths(&prev));
+        if let Ok(new_ld) = std::env::join_paths(merged) {
+            unsafe {
+                std::env::set_var("LD_LIBRARY_PATH", new_ld);
+            }
         }
     }
 

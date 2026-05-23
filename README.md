@@ -151,6 +151,11 @@ cargo +stable-x86_64-pc-windows-gnullvm build --release --target x86_64-pc-windo
 
 Bundles the release exe with `bin\` runtime into `dist\nrsc5-studio-portable\`.
 
+### Linux bring-up (developer preview)
+
+Linux support is in-progress. For Ubuntu 22.04.5 LTS bring-up instructions,
+see [docs/linux-ubuntu-bringup.md](docs/linux-ubuntu-bringup.md).
+
 ---
 
 ## Project structure
