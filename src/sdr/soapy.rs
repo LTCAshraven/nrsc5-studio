@@ -119,6 +119,19 @@ impl DeviceInfo {
 }
 
 impl SoapySdr {
+    /// Drivers that NRSC5 Studio currently supports for SDR ingest.
+    /// Enumeration may discover other Soapy modules (e.g. audio-only
+    /// endpoints), but they are intentionally hidden from the SDR picker.
+    const SUPPORTED_DRIVERS: &'static [&'static str] = &[
+        "rtlsdr",
+        "sdrplay",
+        "airspy",
+        "hackrf",
+        "lime",
+        "plutosdr",
+        "remote",
+    ];
+
     /// Enumerate every device visible to libSoapySDR.
     ///
     /// **Why we probe per-driver instead of just calling
@@ -194,16 +207,7 @@ impl SoapySdr {
         // module's failure (e.g. SDRplay API not running, libhackrf
         // not on PATH) doesn't suppress the others. The driver list
         // matches the device profiles we ship in `sdr/profile.rs`.
-        const KNOWN_DRIVERS: &[&str] = &[
-            "rtlsdr",
-            "sdrplay",
-            "airspy",
-            "hackrf",
-            "lime",
-            "plutosdr",
-            "remote",
-        ];
-        for driver in KNOWN_DRIVERS {
+        for driver in Self::SUPPORTED_DRIVERS {
             let filter = format!("driver={driver}");
             match soapysdr::enumerate(&filter[..]) {
                 Ok(v) => {
@@ -224,7 +228,21 @@ impl SoapySdr {
             }
         }
 
-        diag.push_str(&format!("\nTotal unique devices: {}\n", merged.len()));
+        let before_filter = merged.len();
+        merged.retain(|_, info| {
+            Self::SUPPORTED_DRIVERS
+                .iter()
+                .any(|d| info.driver.eq_ignore_ascii_case(d))
+        });
+
+        diag.push_str(&format!("\nTotal unique devices: {}\n", before_filter));
+        if before_filter != merged.len() {
+            diag.push_str(&format!(
+                "Filtered out non-SDR Soapy endpoints: {}\n",
+                before_filter - merged.len()
+            ));
+        }
+        diag.push_str(&format!("SDR-visible devices: {}\n", merged.len()));
         for info in merged.values() {
             diag.push_str(&format!("  {} | {}\n", info.driver, info.device_args));
         }
