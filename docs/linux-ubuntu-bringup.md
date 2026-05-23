@@ -20,6 +20,7 @@ What this does:
 - Installs required apt packages (clang/libclang, SoapySDR, RTL-SDR, X11/Wayland dev libs, GTK).
 - Installs rustup if missing.
 - Ensures stable toolchain and Linux target.
+- Ensures an `nrsc5` helper binary is available (tries `apt install nrsc5`).
 - Runs `cargo check --target x86_64-unknown-linux-gnu`.
 
 ## 3. Run the app (dev build)
@@ -27,6 +28,9 @@ What this does:
 ```bash
 cargo run
 ```
+
+Note: Linux needs `nrsc5` (no `.exe`) available either on PATH or at
+`./bin/nrsc5` inside the repo/runtime folder.
 
 ## 4. If SoapySDR device discovery fails
 

@@ -1193,6 +1193,17 @@ fn parse_xhdr(rest: &str) -> Option<NrscEvent> {
 
 // -- Exe discovery ----------------------------------------------------
 
+fn find_on_path(exe_name: &str) -> Option<PathBuf> {
+    let path_var = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path_var) {
+        let candidate = dir.join(exe_name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
 fn find_nrsc5_exe() -> Option<PathBuf> {
     let exe_name = if cfg!(target_os = "windows") {
         "nrsc5.exe"
@@ -1224,7 +1235,9 @@ fn find_nrsc5_exe() -> Option<PathBuf> {
         }
     }
 
-    None
+    // Linux packaging often installs `nrsc5` into /usr/bin rather than
+    // shipping it beside this app, so fall back to PATH lookup.
+    find_on_path(exe_name)
 }
 
 // -- Tests ------------------------------------------------------------

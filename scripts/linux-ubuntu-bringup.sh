@@ -53,6 +53,24 @@ rustup target add x86_64-unknown-linux-gnu
 echo "==> Printing SoapySDR probe"
 SoapySDRUtil --info || true
 
+if ! command -v nrsc5 >/dev/null 2>&1; then
+  echo "==> nrsc5 helper not found on PATH; attempting apt install"
+  if ! sudo apt-get install -y nrsc5; then
+    cat <<'EOF'
+WARNING: couldn't install `nrsc5` from apt.
+The GUI can compile and launch, but streaming needs a runnable `nrsc5`
+binary (Linux name: `nrsc5`, not `nrsc5.exe`) available either:
+- on PATH (e.g. /usr/bin/nrsc5), or
+- beside the app under ./bin/nrsc5.
+EOF
+  fi
+fi
+
+if command -v nrsc5 >/dev/null 2>&1; then
+  echo "==> nrsc5 helper found: $(command -v nrsc5)"
+  nrsc5 --version || true
+fi
+
 echo "==> Running format-safe compile check"
 cargo check --target x86_64-unknown-linux-gnu
 
