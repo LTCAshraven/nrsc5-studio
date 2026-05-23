@@ -270,9 +270,31 @@ fn apply_agc_action(
     // hardware I/O) and it means the adapter survives mid-stream
     // configuration changes (e.g. SDRplay switching IF mode).
     let elements = sdr.gain_elements();
-    let element = match elements.iter().find(|e| e.name == target) {
+    let element = match elements
+        .iter()
+        .find(|e| e.name.eq_ignore_ascii_case(target))
+    {
         Some(e) => e,
         None => {
+            // Compatibility fallback for SDRplay module variants that
+            // expose IFGR/RFGR but not aggregate Gain.
+            if profile.driver == "sdrplay" {
+                if let Some(ifgr) = elements
+                    .iter()
+                    .find(|e| e.name.eq_ignore_ascii_case("IFGR"))
+                {
+                    let mapped = map_sdrplay_gain_to_ifgr(profile, desired_db, ifgr);
+                    if let Err(e) = sdr.set_gain_element(&ifgr.name, mapped) {
+                        eprintln!(
+                            "[agc] sdrplay fallback set_gain_element({}={:.2}dB) failed: {}",
+                            ifgr.name, mapped, e
+                        );
+                        return None;
+                    }
+                    return Some(mapped);
+                }
+            }
+
             // The profile points at an element this device doesn't
             // expose. Either a profile bug or a driver version that
             // renamed it. Log once and let the caller no-op.
@@ -288,14 +310,31 @@ fn apply_agc_action(
     };
 
     let clamped = desired_db.clamp(element.min_db, element.max_db);
-    if let Err(e) = sdr.set_gain_element(target, clamped) {
+    if let Err(e) = sdr.set_gain_element(&element.name, clamped) {
         eprintln!(
             "[agc] set_gain_element({}={:.2}dB) failed: {}",
-            target, clamped, e
+            element.name, clamped, e
         );
         return None;
     }
     Some(clamped)
+}
+
+fn map_sdrplay_gain_to_ifgr(
+    profile: &DeviceProfile,
+    desired_gain_db: f64,
+    ifgr: &crate::sdr::GainElement,
+) -> f64 {
+    let table = profile.agc_tenths_table;
+    let min_gain_db = table.first().copied().unwrap_or(200) as f64 / 10.0;
+    let max_gain_db = table.last().copied().unwrap_or(480) as f64 / 10.0;
+    let denom = (max_gain_db - min_gain_db).max(1e-9);
+    let norm = ((desired_gain_db - min_gain_db) / denom).clamp(0.0, 1.0);
+
+    // SDRplay IFGR is a reduction control: lower IFGR = more gain.
+    // Invert the normalized gain request into the IFGR range.
+    let ifgr_span = ifgr.max_db - ifgr.min_db;
+    ifgr.max_db - (norm * ifgr_span)
 }
 
 impl Nrsc5Process {
