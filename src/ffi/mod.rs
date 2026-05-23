@@ -17,6 +17,9 @@ use crate::sdr::{Sdr, SdrConfig, SdrError, StreamControl};
 #[derive(Debug, Clone)]
 pub enum NrscEvent {
     LostDevice,
+    /// Backend stream failed; carries the underlying Soapy error text
+    /// for diagnostics/UI status.
+    LostDeviceDetail(String),
     Sync,
     LostSync,
     Mer { lower: f32, upper: f32 },
@@ -119,6 +122,7 @@ impl NrscEvent {
     pub fn label(&self) -> &'static str {
         match self {
             Self::LostDevice => "lost-device",
+            Self::LostDeviceDetail(_) => "lost-device-detail",
             Self::Sync => "sync",
             Self::LostSync => "lost-sync",
             Self::Mer { .. } => "mer",
@@ -689,6 +693,7 @@ impl Nrsc5Process {
                 // etc. Cheap diagnostic; only fires on actual
                 // backend failure, not on user Stop.
                 eprintln!("[sdr] run_stream failed: {e}");
+                let _ = evt_tx.send(NrscEvent::LostDeviceDetail(e.to_string()));
             }
             if run_res.is_err() {
                 let _ = evt_tx.send(NrscEvent::LostDevice);
@@ -726,6 +731,16 @@ impl Nrsc5Process {
             let agc_profile = profile;
             let tick_ms = profile.agc_tick_ms;
             let agc_thread = std::thread::spawn(move || {
+                // SDRplay is sensitive right after stream activation;
+                // avoid immediate AGC writes in the first moment.
+                let startup_grace_ms = if agc_profile.driver == "sdrplay" {
+                    1500
+                } else {
+                    0
+                };
+                if startup_grace_ms > 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(startup_grace_ms));
+                }
                 while !agc_stop_for_driver.load(Ordering::Relaxed) {
                     std::thread::sleep(std::time::Duration::from_millis(tick_ms));
                     if agc_stop_for_driver.load(Ordering::Relaxed) {

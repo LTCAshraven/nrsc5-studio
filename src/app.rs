@@ -1218,6 +1218,9 @@ impl Nrsc5App {
                 }
                 self.app_state.nrsc5_status = "device lost".to_string();
             }
+            NrscEvent::LostDeviceDetail(detail) => {
+                self.app_state.nrsc5_status = format!("device lost: {detail}");
+            }
             NrscEvent::Sync => {
                 self.last_signal_at = Some(Instant::now());
                 self.app_state.currently_synced = true;

@@ -54,6 +54,20 @@ rustup target add x86_64-unknown-linux-gnu
 echo "==> Printing SoapySDR probe"
 SoapySDRUtil --info || true
 
+# Handle SoapySDRPlay3 module if bundled in ./bin/
+if [[ -f "./bin/libsdrPlaySupport.so" ]]; then
+  echo "==> Installing bundled SoapySDRPlay3 module"
+  sudo mkdir -p /usr/local/lib/SoapySDR/modules0.8
+  sudo cp ./bin/libsdrPlaySupport.so /usr/local/lib/SoapySDR/modules0.8/
+  sudo ldconfig
+  if [[ -f /usr/local/lib/SoapySDR/modules0.8/libsdrPlaySupport.so ]]; then
+    echo "✓ SoapySDRPlay3 module installed successfully"
+  else
+    echo "✗ SoapySDRPlay3 module install failed"
+    exit 1
+  fi
+fi
+
 NRSC5_HELPER=""
 if [[ -f "./bin/nrsc5" && ! -x "./bin/nrsc5" ]]; then
   echo "==> fixing execute bit on ./bin/nrsc5"
