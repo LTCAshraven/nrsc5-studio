@@ -726,6 +726,7 @@ impl Nrsc5App {
             let Some(pid) = pid else {
                 if self.app_state.audio_session_ready {
                     self.app_state.audio_session_ready = false;
+                    self.app_state.audio_session_mode = None;
                     self.volume_ctl.detach();
                 }
                 return;
@@ -751,6 +752,18 @@ impl Nrsc5App {
                         // our persisted volume/mute state into it.
                         self.apply_volume();
                         self.apply_mute();
+                    }
+                    // Sync the mode label so the UI can show per-app vs system-sink.
+                    #[cfg(target_os = "linux")]
+                    {
+                        use crate::linaudio::ActiveMode;
+                        self.app_state.audio_session_mode =
+                            self.volume_ctl.active_mode.as_ref().map(|m| match m {
+                                ActiveMode::PerApp =>
+                                    crate::gui::state::AudioSessionMode::PerApp,
+                                ActiveMode::SystemSink =>
+                                    crate::gui::state::AudioSessionMode::SystemSink,
+                            });
                     }
                 }
                 Err(_) => {

@@ -280,6 +280,19 @@ impl DockViewer<'_> {
                     .small()
                     .color(Color32::from_gray(120)),
             );
+        } else if let Some(mode) = &self.app_state.audio_session_mode {
+            use crate::gui::state::AudioSessionMode;
+            let (label, color) = match mode {
+                AudioSessionMode::PerApp => (
+                    "🎚 per-app volume",
+                    Color32::from_gray(120),
+                ),
+                AudioSessionMode::SystemSink => (
+                    "🔊 system sink (no per-app session found)",
+                    Color32::from_rgb(180, 140, 60),
+                ),
+            };
+            ui.label(RichText::new(label).small().color(color));
         }
         ui.add_space(2.0);
         ui.separator();

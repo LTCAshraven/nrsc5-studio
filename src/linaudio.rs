@@ -3,6 +3,13 @@
 use std::process::Command;
 use thiserror::Error;
 
+/// Which target the volume controller is currently driving.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ActiveMode {
+    PerApp,
+    SystemSink,
+}
+
 #[derive(Debug, Error)]
 pub enum AudioControlError {
     #[error("audio session for PID {0} not found (process may not be playing yet)")]
@@ -23,11 +30,12 @@ enum SessionTarget {
 
 pub struct ProcessVolumeControl {
     session: Option<(u32, SessionTarget)>,
+    pub active_mode: Option<ActiveMode>,
 }
 
 impl ProcessVolumeControl {
     pub fn new() -> Self {
-        Self { session: None }
+        Self { session: None, active_mode: None }
     }
 
     fn run_pactl(args: &[String]) -> Result<String, AudioControlError> {
@@ -137,11 +145,13 @@ impl ProcessVolumeControl {
         if !cached_ok {
             if let Ok(idx) = Self::find_session(pid) {
                 self.session = Some((pid, SessionTarget::SinkInput(idx)));
+                self.active_mode = Some(ActiveMode::PerApp);
             } else {
                 // Fallback mode: control the default sink when per-process
                 // sink-input matching is unavailable in this audio stack.
                 let sink = Self::default_sink()?;
                 self.session = Some((pid, SessionTarget::DefaultSink(sink)));
+                self.active_mode = Some(ActiveMode::SystemSink);
             }
         }
 
@@ -223,6 +233,7 @@ impl ProcessVolumeControl {
 
     pub fn detach(&mut self) {
         self.session = None;
+        self.active_mode = None;
     }
 }
 

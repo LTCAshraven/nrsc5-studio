@@ -122,6 +122,9 @@ pub struct AppState {
     /// True once the per-process audio session has been located. Slider is
     /// disabled until this becomes true.
     pub audio_session_ready: bool,
+    /// Describes how volume control is being applied on the current platform.
+    /// `None` means not yet established or not supported.
+    pub audio_session_mode: Option<AudioSessionMode>,
     /// Rolling ring buffer of synthesized QPSK constellation samples, in
     /// normalized symbol coordinates (ideal points at (±1, ±1)). Allocated
     /// lazily by the Constellation panel on first paint.
