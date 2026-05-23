@@ -15,8 +15,14 @@ pub enum AudioControlError {
     Parse(String),
 }
 
+#[derive(Debug, Clone)]
+enum SessionTarget {
+    SinkInput(u32),
+    DefaultSink(String),
+}
+
 pub struct ProcessVolumeControl {
-    session: Option<(u32, u32)>,
+    session: Option<(u32, SessionTarget)>,
 }
 
 impl ProcessVolumeControl {
@@ -40,86 +46,167 @@ impl ProcessVolumeControl {
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     }
 
+    fn target_healthy(target: &SessionTarget) -> bool {
+        match target {
+            SessionTarget::SinkInput(idx) => Self::run_pactl(&[
+                "get-sink-input-volume".to_string(),
+                idx.to_string(),
+            ])
+            .is_ok(),
+            SessionTarget::DefaultSink(name) => {
+                Self::run_pactl(&["get-sink-volume".to_string(), name.clone()]).is_ok()
+            }
+        }
+    }
+
     fn find_session(pid: u32) -> Result<u32, AudioControlError> {
         let out = Self::run_pactl(&["list".to_string(), "sink-inputs".to_string()])?;
         let mut current_idx: Option<u32> = None;
+        let mut current_pid: Option<u32> = None;
+        let mut current_binary: Option<String> = None;
+        let mut binary_match_idx: Option<u32> = None;
 
         for line in out.lines() {
             let trimmed = line.trim();
             if let Some(rest) = trimmed.strip_prefix("Sink Input #") {
+                if let (Some(idx), Some(bin)) = (current_idx, current_binary.as_ref()) {
+                    if bin == "nrsc5" {
+                        binary_match_idx = Some(idx);
+                    }
+                }
                 current_idx = rest.trim().parse::<u32>().ok();
+                current_pid = None;
+                current_binary = None;
                 continue;
             }
 
-            if !trimmed.starts_with("application.process.id") {
-                continue;
+            if let Some((_, rhs)) = trimmed.split_once('=') {
+                let val = rhs.trim().trim_matches('"').to_string();
+                if trimmed.starts_with("application.process.id") {
+                    current_pid = val.parse::<u32>().ok();
+                } else if trimmed.starts_with("application.process.binary") {
+                    current_binary = Some(val);
+                }
             }
 
             let Some(idx) = current_idx else {
                 continue;
             };
-            let Some((_, rhs)) = trimmed.split_once('=') else {
-                continue;
-            };
-            let pid_str = rhs.trim().trim_matches('"');
-            if let Ok(found_pid) = pid_str.parse::<u32>() {
-                if found_pid == pid {
-                    return Ok(idx);
-                }
+
+            if current_pid == Some(pid) {
+                return Ok(idx);
             }
+        }
+
+        // Finalize last block.
+        if let (Some(idx), Some(bin)) = (current_idx, current_binary.as_ref()) {
+            if bin == "nrsc5" {
+                binary_match_idx = Some(idx);
+            }
+        }
+
+        // PipeWire/Pulse metadata varies across setups; if process ID isn't
+        // published, fall back to the first sink input whose process binary is
+        // `nrsc5`.
+        if let Some(idx) = binary_match_idx {
+            return Ok(idx);
         }
 
         Err(AudioControlError::SessionNotFound(pid))
     }
 
-    fn ensure(&mut self, pid: u32) -> Result<u32, AudioControlError> {
+    fn default_sink() -> Result<String, AudioControlError> {
+        let out = Self::run_pactl(&["get-default-sink".to_string()])?;
+        let sink = out.trim();
+        if sink.is_empty() {
+            return Err(AudioControlError::Parse(
+                "empty default sink from pactl get-default-sink".to_string(),
+            ));
+        }
+        Ok(sink.to_string())
+    }
+
+    fn ensure(&mut self, pid: u32) -> Result<SessionTarget, AudioControlError> {
         let cached_ok = match self.session {
-            Some((cached_pid, idx)) if cached_pid == pid => {
-                Self::run_pactl(&[
-                    "get-sink-input-volume".to_string(),
-                    idx.to_string(),
-                ])
-                .is_ok()
+            Some((cached_pid, ref target)) if cached_pid == pid => {
+                Self::target_healthy(target)
             }
             _ => false,
         };
 
         if !cached_ok {
-            let idx = Self::find_session(pid)?;
-            self.session = Some((pid, idx));
+            if let Ok(idx) = Self::find_session(pid) {
+                self.session = Some((pid, SessionTarget::SinkInput(idx)));
+            } else {
+                // Fallback mode: control the default sink when per-process
+                // sink-input matching is unavailable in this audio stack.
+                let sink = Self::default_sink()?;
+                self.session = Some((pid, SessionTarget::DefaultSink(sink)));
+            }
         }
 
-        Ok(self.session.expect("session populated above").1)
+        Ok(self.session
+            .as_ref()
+            .expect("session populated above")
+            .1
+            .clone())
     }
 
     pub fn set_volume(&mut self, pid: u32, value: f32) -> Result<(), AudioControlError> {
-        let idx = self.ensure(pid)?;
+        let target = self.ensure(pid)?;
         let pct = (value.clamp(0.0, 1.0) * 100.0).round() as i32;
-        Self::run_pactl(&[
-            "set-sink-input-volume".to_string(),
-            idx.to_string(),
-            format!("{pct}%"),
-        ])?;
+        match target {
+            SessionTarget::SinkInput(idx) => {
+                Self::run_pactl(&[
+                    "set-sink-input-volume".to_string(),
+                    idx.to_string(),
+                    format!("{pct}%"),
+                ])?;
+            }
+            SessionTarget::DefaultSink(name) => {
+                Self::run_pactl(&[
+                    "set-sink-volume".to_string(),
+                    name,
+                    format!("{pct}%"),
+                ])?;
+            }
+        }
         Ok(())
     }
 
     pub fn set_mute(&mut self, pid: u32, mute: bool) -> Result<(), AudioControlError> {
-        let idx = self.ensure(pid)?;
+        let target = self.ensure(pid)?;
         let flag = if mute { "1" } else { "0" };
-        Self::run_pactl(&[
-            "set-sink-input-mute".to_string(),
-            idx.to_string(),
-            flag.to_string(),
-        ])?;
+        match target {
+            SessionTarget::SinkInput(idx) => {
+                Self::run_pactl(&[
+                    "set-sink-input-mute".to_string(),
+                    idx.to_string(),
+                    flag.to_string(),
+                ])?;
+            }
+            SessionTarget::DefaultSink(name) => {
+                Self::run_pactl(&[
+                    "set-sink-mute".to_string(),
+                    name,
+                    flag.to_string(),
+                ])?;
+            }
+        }
         Ok(())
     }
 
     pub fn get_volume(&mut self, pid: u32) -> Result<f32, AudioControlError> {
-        let idx = self.ensure(pid)?;
-        let out = Self::run_pactl(&[
-            "get-sink-input-volume".to_string(),
-            idx.to_string(),
-        ])?;
+        let target = self.ensure(pid)?;
+        let out = match target {
+            SessionTarget::SinkInput(idx) => Self::run_pactl(&[
+                "get-sink-input-volume".to_string(),
+                idx.to_string(),
+            ])?,
+            SessionTarget::DefaultSink(name) => {
+                Self::run_pactl(&["get-sink-volume".to_string(), name])?
+            }
+        };
 
         for token in out.split_whitespace() {
             if let Some(raw) = token.strip_suffix('%') {
