@@ -754,7 +754,19 @@ impl Nrsc5App {
                     }
                 }
                 Err(_) => {
-                    self.app_state.audio_session_ready = false;
+                    #[cfg(target_os = "windows")]
+                    {
+                        self.app_state.audio_session_ready = false;
+                    }
+                    #[cfg(target_os = "linux")]
+                    {
+                        // Some PipeWire/Pulse setups do not expose per-stream
+                        // metadata consistently enough for session probing,
+                        // but volume commands can still work. Keep controls
+                        // enabled while streaming.
+                        self.app_state.audio_session_ready =
+                            self.app_state.is_streaming;
+                    }
                 }
             }
         }
