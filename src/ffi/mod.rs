@@ -693,10 +693,8 @@ impl Nrsc5Process {
                 // etc. Cheap diagnostic; only fires on actual
                 // backend failure, not on user Stop.
                 eprintln!("[sdr] run_stream failed: {e}");
-                let _ = evt_tx.send(NrscEvent::LostDeviceDetail(e.to_string()));
-            }
-            if run_res.is_err() {
                 let _ = evt_tx.send(NrscEvent::LostDevice);
+                let _ = evt_tx.send(NrscEvent::LostDeviceDetail(e.to_string()));
             }
         });
 

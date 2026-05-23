@@ -1216,7 +1216,11 @@ impl Nrsc5App {
                 if let Some(nrsc5) = self.nrsc5.as_mut() {
                     nrsc5.stop();
                 }
-                self.app_state.nrsc5_status = "device lost".to_string();
+                // Preserve an already-present detailed reason if one was
+                // emitted by the backend thread in the same failure cycle.
+                if !self.app_state.nrsc5_status.starts_with("device lost:") {
+                    self.app_state.nrsc5_status = "device lost".to_string();
+                }
             }
             NrscEvent::LostDeviceDetail(detail) => {
                 self.app_state.nrsc5_status = format!("device lost: {detail}");
