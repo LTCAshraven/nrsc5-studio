@@ -1193,11 +1193,25 @@ fn parse_xhdr(rest: &str) -> Option<NrscEvent> {
 
 // -- Exe discovery ----------------------------------------------------
 
+#[cfg(unix)]
+fn is_executable(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    path.is_file()
+        && std::fs::metadata(path)
+            .map(|m| (m.permissions().mode() & 0o111) != 0)
+            .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn is_executable(path: &std::path::Path) -> bool {
+    path.is_file()
+}
+
 fn find_on_path(exe_name: &str) -> Option<PathBuf> {
     let path_var = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path_var) {
         let candidate = dir.join(exe_name);
-        if candidate.is_file() {
+        if is_executable(&candidate) {
             return Some(candidate);
         }
     }
@@ -1214,11 +1228,11 @@ fn find_nrsc5_exe() -> Option<PathBuf> {
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             let candidate = dir.join("bin").join(exe_name);
-            if candidate.exists() {
+            if is_executable(&candidate) {
                 return Some(candidate);
             }
             let candidate = dir.join(exe_name);
-            if candidate.exists() {
+            if is_executable(&candidate) {
                 return Some(candidate);
             }
         }
@@ -1226,11 +1240,11 @@ fn find_nrsc5_exe() -> Option<PathBuf> {
 
     if let Ok(cwd) = std::env::current_dir() {
         let candidate = cwd.join("bin").join(exe_name);
-        if candidate.exists() {
+        if is_executable(&candidate) {
             return Some(candidate);
         }
         let candidate = cwd.join(exe_name);
-        if candidate.exists() {
+        if is_executable(&candidate) {
             return Some(candidate);
         }
     }

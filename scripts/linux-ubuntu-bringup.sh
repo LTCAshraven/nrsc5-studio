@@ -55,6 +55,11 @@ echo "==> Printing SoapySDR probe"
 SoapySDRUtil --info || true
 
 NRSC5_HELPER=""
+if [[ -f "./bin/nrsc5" && ! -x "./bin/nrsc5" ]]; then
+  echo "==> fixing execute bit on ./bin/nrsc5"
+  chmod +x ./bin/nrsc5 || true
+fi
+
 if [[ -x "./bin/nrsc5" ]]; then
   NRSC5_HELPER="$(pwd)/bin/nrsc5"
 elif command -v nrsc5 >/dev/null 2>&1; then

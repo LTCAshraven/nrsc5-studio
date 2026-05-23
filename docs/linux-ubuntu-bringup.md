@@ -36,6 +36,13 @@ If you compile `nrsc5` yourself, copy/symlink it to `./bin/nrsc5`.
 This is the preferred dev setup because it keeps the helper version
 explicit and independent from distro package revisions.
 
+If app start reports `failed to spawn nrsc5 process: permission denied`,
+ensure the helper is executable:
+
+```bash
+chmod +x ./bin/nrsc5
+```
+
 ## 4. If SoapySDR device discovery fails
 
 ```bash
