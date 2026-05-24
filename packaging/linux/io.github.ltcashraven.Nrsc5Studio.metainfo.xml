@@ -1,0 +1,103 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Copyright 2026 LTCAshraven -->
+<component type="desktop-application">
+  <id>io.github.ltcashraven.Nrsc5Studio</id>
+
+  <name>NRSC5 Studio</name>
+  <summary>HD Radio FM receiver and station explorer</summary>
+
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+
+  <developer id="io.github.ltcashraven">
+    <name>LTCAshraven</name>
+  </developer>
+
+  <description>
+    <p>
+      NRSC5 Studio is a native desktop application for listening to
+      HD Radio broadcasts on FM (87.5–108 MHz) using an RTL-SDR,
+      SDRplay, or HackRF One software-defined radio. It is built around
+      the open-source nrsc5 demodulator and the SoapySDR device layer,
+      and adds a polished, persistent graphical front end on top.
+    </p>
+    <p>Features include:</p>
+    <ul>
+      <li>Full HD1–HD8 subchannel selection with a SIS-aware selector grid.</li>
+      <li>Now Playing pane with album art, station logo, and broadcast metadata.</li>
+      <li>Station Information pane surfacing the full SIS table — call sign, slogan, location, FCC facility ID, transmitter coordinates, per-subchannel program type and bit rate.</li>
+      <li>Rolling 8-hour album-art collage as a squarified-treemap heat map.</li>
+      <li>24-hour song log with CSV export.</li>
+      <li>Live spectrum and waterfall scope, QPSK constellation, MER / BER signal-quality readout.</li>
+      <li>Closed-loop automatic gain control driving the active SDR for the best per-sideband MER.</li>
+      <li>TPEG traffic-tile decode and animated weather-radar overlay (iHeartMedia stations).</li>
+      <li>Persistent dock layout with dark and light themes.</li>
+    </ul>
+    <p>
+      NRSC5 Studio requires the separate nrsc5 helper binary
+      (https://github.com/theori-io/nrsc5) to be installed on the
+      system. See /usr/share/doc/nrsc5-studio/linux-install.md for
+      instructions, or run the bundled helper installer at
+      /usr/share/nrsc5-studio/install-nrsc5-helper.sh.
+    </p>
+  </description>
+
+  <launchable type="desktop-id">nrsc5-studio.desktop</launchable>
+
+  <url type="homepage">https://github.com/LTCAshraven/nrsc5-studio</url>
+  <url type="bugtracker">https://github.com/LTCAshraven/nrsc5-studio/issues</url>
+  <url type="vcs-browser">https://github.com/LTCAshraven/nrsc5-studio</url>
+
+  <provides>
+    <binary>nrsc5-studio</binary>
+  </provides>
+
+  <categories>
+    <category>AudioVideo</category>
+    <category>Audio</category>
+    <category>Player</category>
+    <category>HamRadio</category>
+  </categories>
+
+  <keywords>
+    <keyword>HD Radio</keyword>
+    <keyword>SDR</keyword>
+    <keyword>RTL-SDR</keyword>
+    <keyword>SDRplay</keyword>
+    <keyword>HackRF</keyword>
+    <keyword>FM</keyword>
+    <keyword>NRSC5</keyword>
+  </keywords>
+
+  <supports>
+    <control>pointing</control>
+    <control>keyboard</control>
+  </supports>
+
+  <requires>
+    <display_length compare="ge">medium</display_length>
+  </requires>
+
+  <content_rating type="oars-1.1" />
+
+  <releases>
+    <release version="0.3.7" date="2026-05-24">
+      <description>
+        <p>Linux packaging debut. NRSC5 Studio is now distributed as
+        .deb (Debian/Ubuntu) and .rpm (Fedora) packages alongside the
+        existing Windows portable zip. No DSP or SDR behavior change
+        versus 0.3.6 — this release adds packaging metadata, install
+        scripts, AppStream metainfo, a .desktop launcher, hicolor
+        icons, a manpage, and a first-launch dialog that walks the
+        user through installing the upstream nrsc5 helper.</p>
+      </description>
+    </release>
+    <release version="0.3.6" date="2026-05-20">
+      <description>
+        <p>PSD release. Per-song ID3 metadata (Title, Artist, Album,
+        Genre) now appears in its own table above the SIS table in the
+        Station Information panel.</p>
+      </description>
+    </release>
+  </releases>
+</component>

@@ -82,6 +82,12 @@ pub enum UiCommand {
     ShowAbout,
     /// Hide the About dialog.
     HideAbout,
+    /// Dismiss the Linux first-launch "nrsc5 helper not found" dialog.
+    /// Triggered by the dialog's own Close button. The dialog is only
+    /// ever raised once per launch (by `AppState::show_nrsc5_missing`
+    /// being set in `Nrsc5App::new` when the helper probe fails) so
+    /// there's no matching `Show*` variant.
+    HideNrsc5Missing,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]

@@ -1,0 +1,56 @@
+Source: nrsc5-studio
+Section: sound
+Priority: optional
+Maintainer: LTCAshraven <LTCAshraven@users.noreply.github.com>
+Build-Depends:
+ debhelper-compat (= 13),
+ cargo,
+ rustc (>= 1.74),
+ pkg-config,
+ clang,
+ libclang-dev,
+ libsoapysdr-dev,
+ libasound2-dev,
+ libwayland-dev,
+ libxkbcommon-dev,
+ libgl-dev,
+ libgtk-3-dev,
+Standards-Version: 4.6.2
+Homepage: https://github.com/LTCAshraven/nrsc5-studio
+Vcs-Browser: https://github.com/LTCAshraven/nrsc5-studio
+Vcs-Git: https://github.com/LTCAshraven/nrsc5-studio.git
+Rules-Requires-Root: no
+
+Package: nrsc5-studio
+Architecture: any
+Depends:
+ ${shlibs:Depends},
+ ${misc:Depends},
+Recommends:
+ soapysdr-module-rtlsdr,
+ soapysdr-tools,
+ rtl-sdr,
+Suggests:
+ pulseaudio-utils,
+ pipewire-pulse,
+Description: HD Radio FM receiver and station explorer
+ NRSC5 Studio is a native desktop application for listening to HD Radio
+ FM broadcasts (87.5-108 MHz) with an RTL-SDR, SDRplay, or HackRF One
+ software-defined radio. It is built around the open-source nrsc5
+ demodulator and the SoapySDR device layer, and adds a polished,
+ persistent graphical front end on top.
+ .
+ Features include full HD1-HD8 subchannel selection with a SIS-aware
+ selector grid, a Now-Playing pane with album art and station logo, a
+ Station Information pane surfacing the full SIS table, a rolling
+ 8-hour album-art collage as a squarified-treemap heat map, a 24-hour
+ song log with CSV export, live spectrum and waterfall scope, QPSK
+ constellation, MER and BER signal-quality readout, closed-loop
+ automatic gain control, TPEG traffic-tile decoding, and animated
+ weather radar overlay.
+ .
+ NRSC5 Studio requires the separate nrsc5 helper binary
+ (https://github.com/theori-io/nrsc5) at runtime. The nrsc5 helper is
+ not packaged in Debian or Ubuntu and must be built from source. A
+ convenience installer is shipped at
+ /usr/share/nrsc5-studio/install-nrsc5-helper.sh.

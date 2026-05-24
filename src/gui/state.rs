@@ -210,6 +210,14 @@ pub struct AppState {
     pub show_sdr_settings: bool,
     /// Set when "About" is clicked from the hamburger menu.
     pub show_about: bool,
+    /// Linux-only: set on first launch when the `nrsc5` helper binary
+    /// was not found at any of the usual locations (next to the
+    /// executable, in the working directory, or on PATH). The
+    /// corresponding modal points the user at the bundled
+    /// install-nrsc5-helper.sh script and upstream theori-io/nrsc5,
+    /// then clears itself when the user dismisses it. On Windows the
+    /// helper ships in `./bin/nrsc5.exe` so this is always false there.
+    pub show_nrsc5_missing: bool,
     /// Snapshot of enumerated SoapySDR devices, refreshed on
     /// `UiCommand::RefreshSdrDevices` and once when the SDR Settings
     /// modal is opened. Empty when no devices were found OR when the

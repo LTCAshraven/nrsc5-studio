@@ -1,10 +1,10 @@
 # NRSC5 Studio
 
-A native Windows desktop app for listening to **HD Radio** broadcasts with an RTL-SDR or SDRplay receiver. Built in Rust with [egui](https://www.egui.rs/), wrapped around the excellent [`nrsc5`](https://github.com/theori-io/nrsc5) HD Radio decoder, with a unified [SoapySDR](https://github.com/pothosware/SoapySDR) device layer underneath.
+A native desktop app for listening to **HD Radio** broadcasts with an RTL-SDR or SDRplay receiver. Built in Rust with [egui](https://www.egui.rs/), wrapped around the excellent [`nrsc5`](https://github.com/theori-io/nrsc5) HD Radio decoder, with a unified [SoapySDR](https://github.com/pothosware/SoapySDR) device layer underneath.
 
-NRSC5 Studio gives you everything `nrsc5.exe` already does — tuning, demodulating, decoding HD1–HD4 subchannels, pulling album art and station logos — and adds a polished, persistent GUI on top, with a few extras the command line never had.
+NRSC5 Studio gives you everything `nrsc5` already does — tuning, demodulating, decoding HD1–HD4 subchannels, pulling album art and station logos — and adds a polished, persistent GUI on top, with a few extras the command line never had.
 
-> **Status:** pre-release polish. Functional and stable on Windows 10/11 x64. Linux/macOS aren't supported yet (the Windows-specific per-app volume control would need replacing).
+> **Status:** pre-release polish. Functional and stable on **Windows 10/11 x64** and **Linux x86_64** (Ubuntu 22.04+, Debian 12+, Fedora 41+). macOS isn't supported yet.
 
 ---
 
@@ -45,7 +45,7 @@ NRSC5 Studio gives you everything `nrsc5.exe` already does — tuning, demodulat
 
 - An installed and working **SDR** with an antenna suitable for FM (87.5–108 MHz). Generic RTL2832U + R820T2 dongles are still the cheapest, most-tested option.
 - A nearby HD Radio FM broadcaster. (Most U.S. metro areas have several.)
-- Windows 10 or 11, x86_64.
+- **Windows 10/11 x86_64**, or **Linux x86_64** on Ubuntu 22.04+ / Debian 12+ / Fedora 41+.
 
 ### Supported SDRs (v0.3.0)
 
@@ -85,6 +85,8 @@ The v0.2.x **rtl_tcp networked input** path is **deferred to v0.4.0** with full 
 
 ## Install (portable)
 
+**Windows users** — the portable zip is the easiest path. **Linux users** — see [Install (Linux)](#install-linux) below; you want the `.deb` or `.rpm`.
+
 1. Download the latest `nrsc5-studio-portable.zip` from the Releases page.
 2. Unzip it anywhere — `Documents`, `Program Files`, a USB stick, wherever.
 3. Plug in your RTL-SDR dongle.
@@ -95,6 +97,40 @@ No installer, no registry edits, no admin rights required.
 By default the zip ships in **portable mode** (a `portable.txt` marker file lives next to the executable). In this mode the app keeps everything it writes — presets, theme, window layout, album-art cache, 24-hour song log, traffic/weather scratch — inside a `data\` folder beside the exe. Move the folder, the whole state moves with it. Plug the USB stick into a different Windows machine and it just works.
 
 If you'd rather use the standard Windows convention (state under `%APPDATA%\nrsc5-studio\` and `%LOCALAPPDATA%\nrsc5-studio\`), delete `portable.txt` and relaunch.
+
+---
+
+## Install (Linux)
+
+Linux releases ship as `.deb` (Debian / Ubuntu) and `.rpm` (Fedora) packages on every GitHub Release. There is one prerequisite the package cannot install for you: the upstream [`nrsc5`](https://github.com/theori-io/nrsc5) HD Radio demodulator, which is not packaged in Debian or Ubuntu and must be built from source. NRSC5 Studio ships a one-shot installer that does this for you.
+
+### Debian / Ubuntu
+
+```bash
+sudo apt install ./nrsc5-studio_0.3.7-1_amd64.deb
+sudo apt install soapysdr-tools soapysdr-module-rtlsdr
+
+# Build and install the `nrsc5` helper (one-time):
+/usr/share/nrsc5-studio/install-nrsc5-helper.sh
+```
+
+### Fedora
+
+```bash
+sudo dnf install ./nrsc5-studio-0.3.7-1.x86_64.rpm
+sudo dnf install SoapySDR SoapyRTLSDR
+
+# Build and install the `nrsc5` helper (one-time):
+/usr/share/nrsc5-studio/install-nrsc5-helper.sh
+```
+
+Launch from your desktop environment's launcher (under **Sound & Video**) or from a terminal:
+
+```bash
+nrsc5-studio
+```
+
+On first launch, if the `nrsc5` helper isn't found, the app raises a modal pointing you back at the install script and the upstream project. See [docs/linux-install.md](docs/linux-install.md) for the full guide including troubleshooting (`No SDR devices detected`, USB permission errors, SDRplay API setup).
 
 ---
 
@@ -151,10 +187,27 @@ cargo +stable-x86_64-pc-windows-gnullvm build --release --target x86_64-pc-windo
 
 Bundles the release exe with `bin\` runtime into `dist\nrsc5-studio-portable\`.
 
-### Linux bring-up (developer preview)
+### Linux build
 
-Linux support is in-progress. For Ubuntu 22.04.5 LTS bring-up instructions,
-see [docs/linux-ubuntu-bringup.md](docs/linux-ubuntu-bringup.md).
+Linux builds are produced from the same source tree. Setup:
+
+```bash
+bash scripts/linux-ubuntu-bringup.sh   # installs system deps + Rust toolchain
+cargo build --release                  # produces target/release/nrsc5-studio
+```
+
+To build distributable `.deb` and `.rpm` packages on a Linux host:
+
+```bash
+scripts/build-linux-packages.sh
+```
+
+This installs `cargo-deb` / `cargo-generate-rpm` if they aren't already present, rebuilds the Linux icon set from `src/icon_render.rs`, runs a release build, and produces artifacts at:
+
+- `target/debian/nrsc5-studio_<version>-1_<arch>.deb`
+- `target/generate-rpm/nrsc5-studio-<version>-1.<arch>.rpm`
+
+For traditional `debuild` / `rpmbuild` workflows (intended for eventual Debian / Fedora archive upload), see the policy-aware scaffolds at [packaging/debian/](packaging/debian/) and [packaging/fedora/](packaging/fedora/).
 
 ---
 

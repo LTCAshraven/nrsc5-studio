@@ -1,0 +1,14 @@
+# Lintian overrides for nrsc5-studio.
+#
+# Each entry is documented with the reason the warning is intentional.
+
+# We bundle the application icon as PNG (rendered procedurally from
+# src/icon_render.rs) rather than an SVG. The PNGs are deterministic
+# and small (under 50 KB total across the hicolor size set), and we
+# don't currently have an SVG source of the icon.
+nrsc5-studio: package-contains-no-image-but-has-icons-folder
+
+# The install-nrsc5-helper.sh shipped at /usr/share/nrsc5-studio/ is
+# an end-user convenience script that builds the upstream nrsc5 helper
+# from source. Documented in /usr/share/doc/nrsc5-studio/linux-install.md.
+nrsc5-studio: script-not-executable [usr/share/nrsc5-studio/install-nrsc5-helper.sh]

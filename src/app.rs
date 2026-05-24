@@ -1,6 +1,6 @@
 use crate::collage::CollageEngine;
 use crate::config::{load_config, save_config, AppConfig};
-use crate::ffi::{Nrsc5Process, NrscEvent};
+use crate::ffi::{locate_nrsc5_helper, Nrsc5Process, NrscEvent};
 use crate::gui::dock::{DockTab, DockViewer, UiCommand};
 use crate::gui::state::{AppState, ArtTile};
 use crate::maps::{TrafficMap, WeatherMap};
@@ -190,6 +190,16 @@ impl Nrsc5App {
             Err(err) => (None, format!("NRSC5 unavailable: {err}")),
         };
 
+        // Linux first-launch UX: if the standalone `nrsc5` helper isn't
+        // anywhere on PATH (or in the usual bundled-bin locations),
+        // raise a one-shot modal pointing the user at the install
+        // script and upstream theori-io/nrsc5. Windows users get the
+        // helper inside the portable zip so this is gated to non-
+        // Windows targets only. The flag is cleared by the user
+        // clicking Close (`UiCommand::HideNrsc5Missing`).
+        let helper_missing = cfg!(not(target_os = "windows"))
+            && locate_nrsc5_helper().is_none();
+
         // Install the shared FFT tap so the Spectrum panel has a feed
         // every time the piped path starts. Done once at app startup
         // (and again when the backend is recreated on a config switch).
@@ -234,6 +244,7 @@ impl Nrsc5App {
                 art_session_started,
                 collage_tile_cap: collage_tile_cap(&config) as u32,
                 spectrum_tap: Some(spectrum_tap),
+                show_nrsc5_missing: helper_missing,
                 ..AppState::default()
             },
             dock_state,
@@ -468,6 +479,9 @@ impl eframe::App for Nrsc5App {
         }
         if self.app_state.show_about {
             self.render_about_dialog(ui.ctx(), &mut modal_commands);
+        }
+        if self.app_state.show_nrsc5_missing {
+            self.render_nrsc5_missing_dialog(ui.ctx(), &mut modal_commands);
         }
         for cmd in modal_commands {
             self.handle_command(cmd);
@@ -1922,6 +1936,9 @@ impl Nrsc5App {
             UiCommand::HideAbout => {
                 self.app_state.show_about = false;
             }
+            UiCommand::HideNrsc5Missing => {
+                self.app_state.show_nrsc5_missing = false;
+            }
             UiCommand::RefreshSdrDevices => {
                 self.refresh_sdr_devices();
             }
@@ -2322,7 +2339,7 @@ impl Nrsc5App {
                 ui.add_space(8.0);
 
                 ui.label(
-                    "A native Windows HD Radio receiver and station explorer, \
+                    "A native HD Radio receiver and station explorer, \
                      built on the open-source nrsc5 demodulator and the \
                      SoapySDR backend.",
                 );
@@ -2333,7 +2350,11 @@ impl Nrsc5App {
                     .spacing([12.0, 6.0])
                     .show(ui, |ui| {
                         ui.label(egui::RichText::new("License").strong());
-                        ui.label("GPL-3.0-or-later (matches nrsc5)");
+                        ui.label("MIT (this app)");
+                        ui.end_row();
+
+                        ui.label(egui::RichText::new("nrsc5 license").strong());
+                        ui.label("AGPL-3.0-or-later (separate helper process)");
                         ui.end_row();
 
                         ui.label(egui::RichText::new("Project").strong());
@@ -2391,6 +2412,90 @@ impl Nrsc5App {
 
         if !open {
             commands.push(UiCommand::HideAbout);
+        }
+    }
+
+    /// Render the Linux first-launch "nrsc5 helper not found" dialog.
+    /// Surfaced on app startup when the bundled helper-locate probe
+    /// (`crate::ffi::locate_nrsc5_helper`) returns `None`, so the user
+    /// learns the missing prerequisite *before* hitting Start and
+    /// staring at a "helper not found" error in the status bar.
+    ///
+    /// The dialog is fire-once: it sets `show_nrsc5_missing = false`
+    /// when dismissed and is never re-raised in the same session, so a
+    /// user who installs nrsc5 mid-session doesn't have to restart the
+    /// app to clear it (the underlying helper probe also runs whenever
+    /// the backend is recreated).
+    fn render_nrsc5_missing_dialog(
+        &mut self,
+        ctx: &egui::Context,
+        commands: &mut Vec<UiCommand>,
+    ) {
+        let mut open = true;
+        egui::Window::new(
+            egui::RichText::new("\u{26A0}  nrsc5 helper not installed").size(18.0),
+        )
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(false)
+        .default_width(520.0)
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .show(ctx, |ui| {
+            ui.label(
+                "NRSC5 Studio depends on the standalone `nrsc5` HD Radio \
+                 demodulator (a separate command-line program) to do the \
+                 actual RF decoding. That helper binary was not found on \
+                 your PATH or in any of the usual bundled locations.",
+            );
+
+            ui.add_space(10.0);
+            ui.separator();
+            ui.add_space(10.0);
+
+            ui.label(egui::RichText::new("Easy install").strong());
+            ui.add_space(4.0);
+            ui.label(
+                "Run the bundled installer once. It clones the upstream \
+                 source, builds it, and installs to /usr/local/bin:",
+            );
+            ui.add_space(4.0);
+            ui.code("/usr/share/nrsc5-studio/install-nrsc5-helper.sh");
+
+            ui.add_space(10.0);
+            ui.label(egui::RichText::new("Manual install").strong());
+            ui.add_space(4.0);
+            ui.label("Or build from source yourself:");
+            ui.add_space(4.0);
+            ui.hyperlink_to(
+                "github.com/theori-io/nrsc5",
+                "https://github.com/theori-io/nrsc5",
+            );
+
+            ui.add_space(10.0);
+            ui.label(
+                egui::RichText::new(
+                    "After installing, restart NRSC5 Studio so the new \
+                     helper is picked up.",
+                )
+                .small()
+                .italics()
+                .color(egui::Color32::from_gray(160)),
+            );
+
+            ui.add_space(12.0);
+            ui.separator();
+            ui.with_layout(
+                egui::Layout::right_to_left(egui::Align::Center),
+                |ui| {
+                    if ui.button("Close").clicked() {
+                        commands.push(UiCommand::HideNrsc5Missing);
+                    }
+                },
+            );
+        });
+
+        if !open {
+            commands.push(UiCommand::HideNrsc5Missing);
         }
     }
 }

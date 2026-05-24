@@ -136,9 +136,17 @@ impl ProcessVolumeControl {
 
     fn ensure(&mut self, pid: u32) -> Result<SessionTarget, AudioControlError> {
         let cached_ok = match self.session {
-            Some((cached_pid, ref target)) if cached_pid == pid => {
-                Self::target_healthy(target)
-            }
+            Some((cached_pid, ref target)) if cached_pid == pid => match target {
+                // The system-sink target is a fallback that fires when
+                // `find_session` can't yet locate a matching sink-input —
+                // typically because libao hasn't connected to PulseAudio
+                // yet at the moment the GUI first calls `set_volume`.
+                // Never treat this state as cached: retry `find_session`
+                // on every call so we transparently upgrade to PerApp
+                // mode once libao publishes its sink-input.
+                SessionTarget::DefaultSink(_) => false,
+                SessionTarget::SinkInput(_) => Self::target_healthy(target),
+            },
             _ => false,
         };
 

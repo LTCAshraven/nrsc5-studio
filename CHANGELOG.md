@@ -4,6 +4,112 @@ All notable changes to NRSC5 Studio are documented here. The format roughly
 follows [Keep a Changelog](https://keepachangelog.com/), and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.3.7] - 2026-05-24
+
+Linux packaging release. NRSC5 Studio is now a first-class Linux
+desktop app, distributed as `.deb` (Debian / Ubuntu 22.04+ / Debian
+12+) and `.rpm` (Fedora 41+) packages built from the same Rust source
+tree as the Windows portable zip. No Linux-side runtime behavior
+change since 0.3.6 — the existing Linux build target was already
+functional; this release adds packaging, install scripting, an
+AppStream metainfo entry, a `.desktop` launcher, hicolor icons, and a
+first-launch missing-helper dialog so users get a friendly
+diagnostic instead of a cryptic stderr line.
+
+### Added
+
+- **`packaging/linux/`** — desktop entry (`nrsc5-studio.desktop`),
+  AppStream metainfo (`io.github.ltcashraven.Nrsc5Studio.metainfo.xml`),
+  manpage (`nrsc5-studio.1`), and rendered hicolor PNG icon set
+  (16/32/48/64/128/256 px, all generated from the same procedural
+  `src/icon_render.rs` that produces the Windows .ico resource).
+- **`[package.metadata.deb]` + `[package.metadata.generate-rpm]`** in
+  `Cargo.toml` — drives `cargo deb` and `cargo generate-rpm` to
+  produce installable packages from `target/release/`. Runtime
+  shared-library dependencies are auto-detected at package time by
+  `dpkg-shlibdeps`; weak deps (`Recommends:` / `Suggests:`) point at
+  the SoapySDR driver modules and audio servers the app
+  optionally talks to.
+- **`packaging/debian/`** — policy-aware Debian source-package
+  skeleton (`control`, `rules`, `copyright`, `changelog`,
+  `source/format`, `*.install`, `*.manpages`, `*.lintian-overrides`,
+  `upstream/metadata`). Not yet uploaded to the Debian archive; lives
+  alongside the cargo-native path as a starting point for an
+  eventual sponsored upload.
+- **`packaging/fedora/nrsc5-studio.spec`** — RPM spec file as the
+  Fedora counterpart, suitable for COPR or eventual Fedora-archive
+  upload.
+- **`scripts/install-nrsc5-helper.sh`** — end-user one-shot
+  installer for the upstream `nrsc5` HD Radio demodulator. Detects
+  `apt`/`dnf`/`pacman`, installs build deps, clones
+  `theori-io/nrsc5` at the pinned tag (currently `v3.1.0`, matching
+  the Windows build), builds with `cmake`+`make`, and installs to
+  `/usr/local/bin`. Shipped at
+  `/usr/share/nrsc5-studio/install-nrsc5-helper.sh` in the installed
+  packages.
+- **`scripts/build-linux-packages.sh`** — convenience wrapper that
+  installs `cargo-deb` / `cargo-generate-rpm` if missing, refreshes
+  the Linux icon PNGs, runs a release build, and produces both a
+  `.deb` and `.rpm` artifact pair. Runs Lintian / rpmlint
+  automatically when those tools are installed.
+- **`examples/render_linux_icons.rs`** — pure-Rust icon renderer
+  that emits the hicolor PNG set under `packaging/linux/icons/`.
+  Sourced from the same `icon_render` module as `build.rs`, so Linux
+  and Windows icons stay byte-identical.
+- **`docs/linux-install.md`** — end-user Linux install guide
+  covering the prerequisite story, `.deb`/`.rpm` install, and common
+  troubleshooting (SoapySDR module install, RTL-SDR udev blacklist,
+  SDRplay API setup).
+- **First-launch "nrsc5 helper not installed" dialog.** On Linux, if
+  `crate::ffi::locate_nrsc5_helper()` returns `None` at startup, a
+  modal pointing the user at
+  `/usr/share/nrsc5-studio/install-nrsc5-helper.sh` and
+  `github.com/theori-io/nrsc5` is raised once per launch. Dismissed
+  by the user's Close click via the new
+  `UiCommand::HideNrsc5Missing`.
+- **`crate::ffi::locate_nrsc5_helper()`** — public probe function
+  wrapping the existing private `find_nrsc5_exe()` so the app shell
+  can render the missing-helper dialog without spinning up a full
+  `Nrsc5Process`.
+- **`AppState::show_nrsc5_missing`** — flag driving the new modal,
+  set in `Nrsc5App::new` on Linux when the helper probe returns
+  `None`.
+
+### Changed
+
+- **`README.md`** — status banner now lists Linux as a supported
+  target, and a dedicated **Install (Linux)** section walks through
+  the `.deb` / `.rpm` install plus the prerequisite `nrsc5` helper
+  install. Build-from-source section gained a Linux subsection
+  pointing at `scripts/build-linux-packages.sh`.
+- **`Nrsc5Error::ExeNotFound` text** generalized from "nrsc5.exe
+  not found" to "nrsc5 helper not found", since the same enum
+  variant now fires on both Windows and Linux. Platform-specific
+  remediation lives in the new dialog instead of the error string.
+
+### Fixed
+
+- **Per-app volume control on Linux no longer gets stuck on the
+  system sink.** When `set_volume()` was first called moments after
+  pressing Start, libao had not yet connected to PulseAudio, so the
+  per-process sink-input lookup failed and the controller fell back
+  to the default sink. The fallback state was then cached — even
+  after libao published its sink-input seconds later, the controller
+  never retried the per-app lookup and the slider stayed pointed at
+  the master sink for the rest of the session. The cache is now
+  treated as never-valid in `SystemSink` mode, so the next slider
+  motion after libao connects transparently upgrades the controller
+  into `PerApp` mode. (`src/linaudio.rs`)
+
+### Internal
+
+- The pre-existing `find_nrsc5_exe()` already handled the Linux case
+  (PATH lookup as the last resort after `<exe_dir>` / `<cwd>` /
+  `bin/` candidates), so a system-installed `nrsc5-studio` at
+  `/usr/bin/` correctly picks up an `nrsc5` at `/usr/local/bin/`
+  or `/usr/bin/` with no code change. The new dialog wiring is
+  the only Linux-only code path added in this release.
+
 ## [0.3.6] - 2026-05-20
 
 PSD release. The Station Information panel is now split into two

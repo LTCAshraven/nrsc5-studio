@@ -1,0 +1,67 @@
+.\" Manpage for nrsc5-studio.
+.\" Contact ltcashraven via https://github.com/LTCAshraven/nrsc5-studio for corrections.
+.TH NRSC5\-STUDIO 1 "May 2026" "nrsc5-studio 0.3.7" "User Commands"
+.SH NAME
+nrsc5\-studio \- graphical HD Radio receiver built on nrsc5 and SoapySDR
+.SH SYNOPSIS
+.B nrsc5\-studio
+.SH DESCRIPTION
+.B NRSC5 Studio
+is a native desktop application for listening to HD Radio FM broadcasts
+(87.5\(en108 MHz) with an RTL\-SDR, SDRplay, or HackRF One software\-defined
+radio. It is built around the open\-source
+.BR nrsc5 (1)
+HD Radio demodulator and the SoapySDR device layer, and provides a
+graphical interface with tuner controls, a SIS\-aware subchannel selector,
+album\-art collage, 24\-hour song log, live spectrum / waterfall / QPSK
+constellation scopes, closed\-loop AGC, TPEG traffic decoding, and
+weather\-radar animation.
+.PP
+The application takes no command\-line arguments. Settings are persisted
+between runs in standard XDG locations (see
+.BR FILES ).
+.SH PREREQUISITES
+NRSC5 Studio requires the
+.BR nrsc5 (1)
+helper binary to be installed and available on
+.BR PATH .
+The
+.B nrsc5
+helper is not packaged in Debian or Ubuntu and must be built from source.
+A convenience installer is shipped at
+.IR /usr/share/nrsc5\-studio/install\-nrsc5\-helper.sh ;
+run it once as a regular user to clone, build, and install
+.B nrsc5
+into
+.IR /usr/local/bin .
+Source code and full build instructions are available at
+.UR https://github.com/theori\-io/nrsc5
+.UE .
+.PP
+SoapySDR and at least one SoapySDR module package (for example
+.IR soapysdr\-module\-rtlsdr )
+must also be installed so the application can talk to your SDR
+hardware.
+.SH FILES
+.TP
+.I ~/.config/nrsc5\-studio/config.toml
+User\-level configuration: last frequency, presets, gain mode, AGC
+state, theme, SDR driver settings.
+.TP
+.I ~/.local/share/nrsc5\-studio/
+Persistent data: album\-art cache, play log, dock layout, SDR
+diagnostics snapshot.
+.SH SEE ALSO
+.BR nrsc5 (1),
+.BR SoapySDRUtil (1)
+.PP
+Project home page:
+.UR https://github.com/LTCAshraven/nrsc5\-studio
+.UE
+.PP
+Upstream nrsc5 demodulator:
+.UR https://github.com/theori\-io/nrsc5
+.UE
+.SH AUTHOR
+Written by LTCAshraven. HD Radio is a registered trademark of Xperi
+Corporation; this project is not affiliated with Xperi.

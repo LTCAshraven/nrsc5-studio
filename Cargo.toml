@@ -1,10 +1,10 @@
 [package]
 name = "nrsc5-studio"
-version = "0.3.6"
+version = "0.3.7"
 edition = "2021"
 authors = ["LTCAshraven"]
 license = "MIT"
-description = "A native Windows desktop app for listening to HD Radio broadcasts with an RTL-SDR or SDRplay dongle, built on nrsc5 and SoapySDR."
+description = "Native desktop application for HD Radio FM reception with RTL-SDR or SDRplay receivers, built on nrsc5 and SoapySDR."
 repository = "https://github.com/LTCAshraven/nrsc5-studio"
 readme = "README.md"
 
@@ -78,3 +78,189 @@ lto = true           # Link-time optimization
 codegen-units = 1    # Better optimization (slower compile, smaller binary)
 strip = true         # Strip debug symbols
 panic = "abort"      # No unwinding (smaller binary; fine for a GUI app)
+
+# -----------------------------------------------------------------------------
+# Linux packaging metadata
+# -----------------------------------------------------------------------------
+# Drives `cargo deb` (Debian/Ubuntu) and `cargo generate-rpm` (Fedora /
+# RHEL-family). Both tools read the corresponding `[package.metadata.*]`
+# section below and assemble an installable package from `target/release/`.
+#
+# Build prerequisites on the host running the package build:
+#   cargo install cargo-deb cargo-generate-rpm
+#   apt-get install -y dpkg-dev fakeroot lintian      # Debian/Ubuntu side
+#   dnf install -y rpm-build rpmlint                  # Fedora side
+#
+# Build the packages with:
+#   cargo build --release
+#   cargo deb --no-build               # produces target/debian/*.deb
+#   cargo generate-rpm                 # produces target/generate-rpm/*.rpm
+#
+# The convenience wrapper at scripts/build-linux-packages.sh runs all
+# three steps in order and prints the artifact paths.
+#
+# Runtime dependencies are intentionally not enumerated as `depends = …`
+# here — `cargo deb` runs `dpkg-shlibdeps` against the linked binary and
+# generates an accurate, per-host dependency list. The same approach is
+# used by every well-behaved Debian package. The `recommends` list below
+# is for non-shlibdep optional helpers (SDR driver modules).
+#
+# The end-user nrsc5 helper is *not* a package dependency — it isn't
+# packaged in Debian or Ubuntu, and bundling it would create AGPL/MIT
+# license-mixing concerns. Instead the post-install README and a first-
+# launch in-app dialog point the user at the install-nrsc5-helper.sh
+# script shipped at /usr/share/nrsc5-studio/install-nrsc5-helper.sh.
+
+[package.metadata.deb]
+maintainer = "LTCAshraven <LTCAshraven@users.noreply.github.com>"
+copyright = "2026, LTCAshraven <LTCAshraven@users.noreply.github.com>"
+license-file = ["LICENSE", "0"]
+# Point cargo-deb at our hand-maintained Debian changelog so the binary
+# package ships /usr/share/doc/nrsc5-studio/changelog.Debian.gz (Debian
+# Policy 12.7) instead of erroring out as a non-native package with no
+# changelog.
+changelog = "packaging/debian/changelog"
+extended-description = """\
+A native desktop application for listening to HD Radio FM broadcasts
+(87.5-108 MHz) with an RTL-SDR, SDRplay, or HackRF One software-defined
+radio. Built around the open-source nrsc5 demodulator and the SoapySDR
+device layer, with a dockable GUI that adds presets, an album-art
+collage, a 24-hour song log, live spectrum/waterfall/QPSK scopes,
+closed-loop AGC, TPEG traffic decoding, and weather-radar animation.
+
+The separate nrsc5 helper binary (https://github.com/theori-io/nrsc5)
+is required at runtime and is not packaged in Debian or Ubuntu. A
+convenience installer is shipped at
+/usr/share/nrsc5-studio/install-nrsc5-helper.sh."""
+section = "sound"
+priority = "optional"
+recommends = "soapysdr-module-rtlsdr, soapysdr-tools, rtl-sdr"
+suggests = "pulseaudio-utils, pipewire-pulse"
+assets = [
+    ["target/release/nrsc5-studio", "usr/bin/", "755"],
+    ["packaging/linux/nrsc5-studio.desktop", "usr/share/applications/", "644"],
+    ["packaging/linux/io.github.ltcashraven.Nrsc5Studio.metainfo.xml", "usr/share/metainfo/", "644"],
+    ["packaging/linux/icons/hicolor/16x16/apps/nrsc5-studio.png", "usr/share/icons/hicolor/16x16/apps/nrsc5-studio.png", "644"],
+    ["packaging/linux/icons/hicolor/32x32/apps/nrsc5-studio.png", "usr/share/icons/hicolor/32x32/apps/nrsc5-studio.png", "644"],
+    ["packaging/linux/icons/hicolor/48x48/apps/nrsc5-studio.png", "usr/share/icons/hicolor/48x48/apps/nrsc5-studio.png", "644"],
+    ["packaging/linux/icons/hicolor/64x64/apps/nrsc5-studio.png", "usr/share/icons/hicolor/64x64/apps/nrsc5-studio.png", "644"],
+    ["packaging/linux/icons/hicolor/128x128/apps/nrsc5-studio.png", "usr/share/icons/hicolor/128x128/apps/nrsc5-studio.png", "644"],
+    ["packaging/linux/icons/hicolor/256x256/apps/nrsc5-studio.png", "usr/share/icons/hicolor/256x256/apps/nrsc5-studio.png", "644"],
+    ["packaging/linux/nrsc5-studio.1", "usr/share/man/man1/nrsc5-studio.1", "644"],
+    ["scripts/install-nrsc5-helper.sh", "usr/share/nrsc5-studio/install-nrsc5-helper.sh", "755"],
+    ["README.md", "usr/share/doc/nrsc5-studio/README.md", "644"],
+    ["docs/linux-install.md", "usr/share/doc/nrsc5-studio/linux-install.md", "644"],
+    ["CHANGELOG.md", "usr/share/doc/nrsc5-studio/CHANGELOG.md", "644"],
+]
+
+# `cargo-generate-rpm` lays out the package against the same `assets` from
+# `[package.metadata.deb]` by default, but we redeclare here so the spec
+# is self-contained and so the file modes / paths land in Fedora's
+# /usr-merged conventions explicitly (cargo-generate-rpm currently does
+# not auto-translate Debian-style paths).
+[package.metadata.generate-rpm]
+license = "MIT"
+summary = "HD Radio FM receiver and station explorer built on nrsc5 and SoapySDR"
+# `requires` is intentionally minimal — rpmbuild's automatic
+# dependency generator picks up shared-library NEEDED entries from
+# the binary at build time and emits the right `Requires:` lines.
+# `recommends` / `suggests` (weak deps) point at the SDR driver
+# modules; they're modeled as TOML sub-tables further down.
+post_install_script = """if [ -x /usr/bin/update-desktop-database ]; then /usr/bin/update-desktop-database -q /usr/share/applications 2>/dev/null || true; fi
+if [ -x /usr/bin/gtk-update-icon-cache ]; then /usr/bin/gtk-update-icon-cache -q /usr/share/icons/hicolor 2>/dev/null || true; fi
+"""
+post_uninstall_script = """if [ -x /usr/bin/update-desktop-database ]; then /usr/bin/update-desktop-database -q /usr/share/applications 2>/dev/null || true; fi
+if [ -x /usr/bin/gtk-update-icon-cache ]; then /usr/bin/gtk-update-icon-cache -q /usr/share/icons/hicolor 2>/dev/null || true; fi
+"""
+
+# Weak deps. cargo-generate-rpm models these as TOML tables where the
+# key is the package name and the value is a version constraint
+# (`"*"` = any).
+[package.metadata.generate-rpm.recommends]
+soapysdr = "*"
+
+# Fedora packages source the soapysdr modules from `soapysdr` itself
+# rather than a separate package; rtl-sdr ships in `rtl-sdr`.
+[package.metadata.generate-rpm.suggests]
+rtl-sdr = "*"
+pipewire-pulseaudio = "*"
+
+[[package.metadata.generate-rpm.assets]]
+source = "target/release/nrsc5-studio"
+dest = "/usr/bin/nrsc5-studio"
+mode = "755"
+
+[[package.metadata.generate-rpm.assets]]
+source = "packaging/linux/nrsc5-studio.desktop"
+dest = "/usr/share/applications/nrsc5-studio.desktop"
+mode = "644"
+
+[[package.metadata.generate-rpm.assets]]
+source = "packaging/linux/io.github.ltcashraven.Nrsc5Studio.metainfo.xml"
+dest = "/usr/share/metainfo/io.github.ltcashraven.Nrsc5Studio.metainfo.xml"
+mode = "644"
+
+[[package.metadata.generate-rpm.assets]]
+source = "packaging/linux/icons/hicolor/16x16/apps/nrsc5-studio.png"
+dest = "/usr/share/icons/hicolor/16x16/apps/nrsc5-studio.png"
+mode = "644"
+
+[[package.metadata.generate-rpm.assets]]
+source = "packaging/linux/icons/hicolor/32x32/apps/nrsc5-studio.png"
+dest = "/usr/share/icons/hicolor/32x32/apps/nrsc5-studio.png"
+mode = "644"
+
+[[package.metadata.generate-rpm.assets]]
+source = "packaging/linux/icons/hicolor/48x48/apps/nrsc5-studio.png"
+dest = "/usr/share/icons/hicolor/48x48/apps/nrsc5-studio.png"
+mode = "644"
+
+[[package.metadata.generate-rpm.assets]]
+source = "packaging/linux/icons/hicolor/64x64/apps/nrsc5-studio.png"
+dest = "/usr/share/icons/hicolor/64x64/apps/nrsc5-studio.png"
+mode = "644"
+
+[[package.metadata.generate-rpm.assets]]
+source = "packaging/linux/icons/hicolor/128x128/apps/nrsc5-studio.png"
+dest = "/usr/share/icons/hicolor/128x128/apps/nrsc5-studio.png"
+mode = "644"
+
+[[package.metadata.generate-rpm.assets]]
+source = "packaging/linux/icons/hicolor/256x256/apps/nrsc5-studio.png"
+dest = "/usr/share/icons/hicolor/256x256/apps/nrsc5-studio.png"
+mode = "644"
+
+[[package.metadata.generate-rpm.assets]]
+source = "packaging/linux/nrsc5-studio.1"
+dest = "/usr/share/man/man1/nrsc5-studio.1"
+mode = "644"
+doc = true
+
+[[package.metadata.generate-rpm.assets]]
+source = "scripts/install-nrsc5-helper.sh"
+dest = "/usr/share/nrsc5-studio/install-nrsc5-helper.sh"
+mode = "755"
+
+[[package.metadata.generate-rpm.assets]]
+source = "README.md"
+dest = "/usr/share/doc/nrsc5-studio/README.md"
+mode = "644"
+doc = true
+
+[[package.metadata.generate-rpm.assets]]
+source = "docs/linux-install.md"
+dest = "/usr/share/doc/nrsc5-studio/linux-install.md"
+mode = "644"
+doc = true
+
+[[package.metadata.generate-rpm.assets]]
+source = "CHANGELOG.md"
+dest = "/usr/share/doc/nrsc5-studio/CHANGELOG.md"
+mode = "644"
+doc = true
+
+[[package.metadata.generate-rpm.assets]]
+source = "LICENSE"
+dest = "/usr/share/licenses/nrsc5-studio/LICENSE"
+mode = "644"
+doc = true

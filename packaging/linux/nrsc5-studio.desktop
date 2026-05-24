@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=NRSC5 Studio
+GenericName=HD Radio Receiver
+Comment=Listen to HD Radio FM broadcasts with an RTL-SDR or SDRplay dongle
+Exec=nrsc5-studio
+Icon=nrsc5-studio
+StartupWMClass=nrsc5-studio
+Terminal=false
+Categories=AudioVideo;Audio;Player;HamRadio;
+Keywords=HD;Radio;SDR;RTL-SDR;SDRplay;HackRF;FM;NRSC5;Broadcast;

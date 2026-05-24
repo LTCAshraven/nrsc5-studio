@@ -152,7 +152,7 @@ impl NrscEvent {
 
 #[derive(Debug, Error)]
 pub enum Nrsc5Error {
-    #[error("nrsc5.exe not found at any known location")]
+    #[error("nrsc5 helper not found at any known location")]
     ExeNotFound,
     #[error("failed to spawn nrsc5 process: {0}")]
     Spawn(std::io::Error),
@@ -880,11 +880,21 @@ fn parse_stderr<R: std::io::Read>(
     let reader = std::io::BufReader::new(stderr);
     let mut got_first_audio_bitrate = false;
 
+    // When `NRSC5_STUDIO_DEBUG=1` is set, mirror every raw stderr line
+    // from nrsc5 to our own stderr. Off by default so production runs
+    // stay quiet; turn on when diagnosing sync / MER / device issues.
+    // Cheap one-shot env read at thread start.
+    let debug_raw = std::env::var_os("NRSC5_STUDIO_DEBUG").is_some_and(|v| v == "1");
+
     for line in reader.lines() {
         let line = match line {
             Ok(l) => l,
             Err(_) => break,
         };
+
+        if debug_raw {
+            eprintln!("[nrsc5] {line}");
+        }
 
         // nrsc5 prefixes each line with "HH:MM:SS " (9 chars).
         let msg = if line.len() > 9 && line.as_bytes()[8] == b' ' {
@@ -1265,6 +1275,16 @@ fn find_nrsc5_exe() -> Option<PathBuf> {
     // Linux packaging often installs `nrsc5` into /usr/bin rather than
     // shipping it beside this app, so fall back to PATH lookup.
     find_on_path(exe_name)
+}
+
+/// Public probe for the `nrsc5` helper binary. Returns the resolved
+/// absolute path if one was found via the same search strategy used by
+/// [`Nrsc5Process::new`]. Used by the app shell at startup to surface a
+/// friendly "helper not installed" dialog on platforms where the helper
+/// is not bundled (Linux). On Windows the helper ships in `./bin/` so
+/// this always returns `Some(_)` for installed builds.
+pub fn locate_nrsc5_helper() -> Option<PathBuf> {
+    find_nrsc5_exe()
 }
 
 // -- Tests ------------------------------------------------------------

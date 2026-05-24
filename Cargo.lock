@@ -2230,7 +2230,7 @@ dependencies = [
 
 [[package]]
 name = "nrsc5-studio"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "anyhow",
  "bindgen 0.72.1",

@@ -1,0 +1,10 @@
+target/release/nrsc5-studio                                            usr/bin
+packaging/linux/nrsc5-studio.desktop                                   usr/share/applications
+packaging/linux/io.github.ltcashraven.Nrsc5Studio.metainfo.xml         usr/share/metainfo
+packaging/linux/icons/hicolor/16x16/apps/nrsc5-studio.png              usr/share/icons/hicolor/16x16/apps
+packaging/linux/icons/hicolor/32x32/apps/nrsc5-studio.png              usr/share/icons/hicolor/32x32/apps
+packaging/linux/icons/hicolor/48x48/apps/nrsc5-studio.png              usr/share/icons/hicolor/48x48/apps
+packaging/linux/icons/hicolor/64x64/apps/nrsc5-studio.png              usr/share/icons/hicolor/64x64/apps
+packaging/linux/icons/hicolor/128x128/apps/nrsc5-studio.png            usr/share/icons/hicolor/128x128/apps
+packaging/linux/icons/hicolor/256x256/apps/nrsc5-studio.png            usr/share/icons/hicolor/256x256/apps
+scripts/install-nrsc5-helper.sh                                        usr/share/nrsc5-studio
