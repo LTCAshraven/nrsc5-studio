@@ -4,6 +4,117 @@ All notable changes to NRSC5 Studio are documented here. The format roughly
 follows [Keep a Changelog](https://keepachangelog.com/), and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.3.8] - 2026-05-25
+
+In-process audio release. `nrsc5.exe` is now invoked with `-o -` and
+emits raw s16 LE 44.1 kHz stereo PCM on stdout; NRSC5 Studio reads
+that pipe and plays it through a single `cpal`-backed output stream
+owned by the studio process. The volume slider in the Windows mixer
+now sits under `nrsc5-studio.exe` instead of `nrsc5.exe`, which is
+the foundation Phase 2-4 (I/Q fan-out, multi-program decode, Opus
+recording) build on. SDR behavior, DSP, and AGC are unchanged from
+0.3.6 with two narrow exceptions: SDRplay AGC now walks up from
+39 dB (was: down from 38 dB) and settles noticeably faster on weak
+signals, and a loss-of-sync at the new gain correctly flips the
+walk direction back toward the best-seen gain.
+
+### Added
+
+- **In-process audio output** via `cpal 0.15`. Single output stream
+  owned by `nrsc5-studio.exe`; volume and mute are wait-free atomic
+  stores on the audio sink. The 200 ms bounded queue drops the
+  oldest packet on overflow so a stalled GUI thread never
+  back-pressures the SDR pump.
+- **Device-native sample-rate negotiation.** The output stream
+  opens at whatever rate WASAPI advertises (typically 48 kHz on
+  modern Windows defaults), and the playback callback does linear
+  interpolation 44.1 → device-native inline. Previously the stream
+  was hard-coded to 44.1 kHz and silently failed to open on the
+  many WASAPI default devices that only expose 48 kHz.
+- **`NrscEvent::ChildExited` event.** The PCM pump emits it on EOF
+  or BrokenPipe from `nrsc5.exe`'s stdout. The app handler treats
+  it like `LostDevice` but with status "stream ended", gated on
+  `is_streaming` so the user-`Stop` path stays a no-op. External
+  `taskkill /F /IM nrsc5.exe`, a child crash, or a clean nrsc5 exit
+  all auto-recover without the user pressing Stop+Start.
+- **Background SDR-presence probe.** `poll_sdr_presence` now runs
+  on a short-lived worker thread; the GUI thread only drains
+  results from an `mpsc::channel`. `soapysdr::enumerate("")` on
+  SDRplay hot-plug can block for seconds while the SDRplay API
+  service does its USB device-discovery handshake — doing that on
+  the GUI thread put the window into "Not Responding" the moment
+  the user replugged the dongle.
+- **Per-profile AGC initial direction.** `DeviceProfile` gains
+  `default_agc_initial_direction: i32`. SDRplay walks up from
+  39 dB; RTL-SDR and HackRF still walk down from their existing
+  starting points.
+
+### Changed
+
+- **`nrsc5.exe` invocation in piped mode** now passes `-o -`. Its
+  stdout is piped into a `pcm_pump` thread on our side; nrsc5 no
+  longer opens its own libao audio session.
+- **Volume slider and mute toggle are always live.** Both work
+  before a station is tuned (they previously waited for a per-app
+  audio session under `nrsc5.exe` to appear in WASAPI).
+- **`windows = "0.62"` dependency dropped.** With `winaudio`
+  retired, the `Win32_Media_Audio` / `Win32_System_Com_*` /
+  `Win32_System_Variant` / `Win32_UI_Shell_PropertiesSystem`
+  feature surface is no longer referenced anywhere in the tree.
+- **SDRplay AGC starting gain** moved from 38 dB to 39 dB with
+  `default_agc_initial_direction = +1`. The controller walks up
+  from there and stability-shortcuts when both neighbours have
+  been probed — settles in noticeably fewer ticks on weak
+  signals than the old "walk down from 38" strategy did.
+
+### Fixed
+
+- **Audio dead silence on non-44.1 kHz WASAPI defaults.** The
+  default audio device on modern Windows installs is almost always
+  48 kHz; cpal does not auto-negotiate sample rate on WASAPI, so
+  the stream silently failed to start. Fixed by opening at the
+  device's reported `default_output_config()` and resampling in
+  the callback.
+- **AGC walking into overload after total sync loss.** When the
+  new gain caused MER to go silent for the full probe window, the
+  direction picker treated `None` as "no info" and kept walking the
+  same way. A `None` after `best_mer_seen.is_finite()` is now read
+  as "worse" and flips back toward best.
+- **No-SDR popup false positive on SDRplay-only setups.** The
+  presence probe now falls back to `soapysdr::enumerate("")`
+  filtered to the supported-driver list when the librtlsdr probe
+  reports zero AND no stream is active. Previously the overlay
+  showed even with an SDRplay plugged in.
+- **GUI freeze ("Not Responding") on SDRplay re-plug.** See
+  Background SDR-presence probe above.
+- **Manual Stop + Start required after external `taskkill nrsc5.exe`.**
+  See `NrscEvent::ChildExited` above.
+
+### Internal
+
+- **Retired modules:** `src/winaudio/mod.rs`, `src/linaudio.rs`,
+  `src/audioctl.rs`. All three only existed to *control* libao's
+  per-platform audio session; with cpal owning playback they have
+  no purpose. The `volume_ctl` field, `poll_audio_session()`
+  function, and `audio_session_ready` / `audio_session_mode`
+  `AppState` fields are gone too.
+- **New module:** `src/audio/mod.rs` with `AudioPlayer` (owns the
+  cpal stream) and `AudioSink` (clone-cheap producer handle).
+- **`[profile.dev.package."*"] opt-level = 3`** added to
+  `Cargo.toml`. Debug-mode `rubato` couldn't keep up with 2 MHz
+  CS16 I/Q resampling in real time — `cargo run` produced silence
+  and a flood of `O` overflow markers from SoapySDRPlay3.
+  Optimising dependencies (but leaving our own code at the
+  default debug profile) keeps `cargo run` realtime without
+  hurting our own debug experience.
+- **Cross-platform.** `cpal` covers Windows (WASAPI), Linux
+  (ALSA / PulseAudio / PipeWire via the ALSA backend), and macOS
+  (CoreAudio). The new `src/audio/mod.rs` has no
+  `#[cfg(target_os)]` gates; the same code drives every platform.
+  Linux audio bring-up is therefore a no-op on the audio side —
+  pending validation of the rest of the Linux build chain on an
+  Ubuntu host.
+
 ## [0.3.6] - 2026-05-20
 
 PSD release. The Station Information panel is now split into two

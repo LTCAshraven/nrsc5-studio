@@ -162,3 +162,52 @@ pub fn device_count() -> Option<u32> {
     // since `lib()` first succeeded.
     Some(unsafe { (l.get_count)() })
 }
+
+/// Drivers we consider "an SDR" for the purposes of the no-SDR overlay.
+/// Mirror of `sdr::soapy::SoapySdr::SUPPORTED_DRIVERS` — duplicated here
+/// rather than re-exported because this presence probe runs every 2 s and
+/// we want it to stay independent of the full enumeration code path.
+const SOAPY_SUPPORTED_DRIVERS: &[&str] = &[
+    "rtlsdr",
+    "sdrplay",
+    "airspy",
+    "hackrf",
+    "lime",
+    "plutosdr",
+    "remote",
+];
+
+/// Returns the number of SDRs visible to libSoapySDR whose driver is in
+/// `SOAPY_SUPPORTED_DRIVERS`, or `None` if the enumeration itself
+/// failed (e.g. a Soapy module panicked during its find function).
+///
+/// **Cost:** one `soapysdr::enumerate("")` call. Empty USB bus returns
+/// in under 100 ms on Windows; an SDRplay-only setup typically returns
+/// in well under that. Cheap enough to call once per 2 s probe tick on
+/// the cold path (when the librtlsdr probe says zero), but the caller
+/// should still avoid running it during an active stream to prevent
+/// USB contention with the live device.
+///
+/// Used by the no-SDR overlay so an SDRplay (or any non-RTL Soapy
+/// device) is correctly recognized as "an SDR is present" \u2014 the
+/// librtlsdr probe alone misses these.
+pub fn soapy_supported_count() -> Option<u32> {
+    match soapysdr::enumerate("") {
+        Ok(devices) => {
+            let n = devices
+                .iter()
+                .filter(|args| {
+                    args.get("driver")
+                        .map(|d| {
+                            SOAPY_SUPPORTED_DRIVERS
+                                .iter()
+                                .any(|s| d.eq_ignore_ascii_case(s))
+                        })
+                        .unwrap_or(false)
+                })
+                .count() as u32;
+            Some(n)
+        }
+        Err(_) => None,
+    }
+}

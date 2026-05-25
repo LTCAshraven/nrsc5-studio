@@ -9,8 +9,20 @@ use egui_dock::{DockArea, DockState, NodeIndex, NodePath, SurfaceIndex};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
+use std::sync::mpsc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
+
+/// Result of one background SDR-presence probe. `rtl` is the librtlsdr
+/// device count (cheap, always probed); `soapy` is the Soapy supported-
+/// driver count (potentially slow, only probed when `rtl` came up
+/// empty and we're not streaming). `None` distinguishes "probe errored
+/// / unavailable" from "probed, zero devices".
+#[derive(Debug, Clone, Copy)]
+struct SdrProbeResult {
+    rtl: Option<u32>,
+    soapy: Option<u32>,
+}
 
 /// Hard cap on tracked album-art tiles — prevents the collage from getting
 /// unbounded if a session runs all day on a very busy station.
@@ -139,11 +151,11 @@ pub struct Nrsc5App {
     aas_dir: PathBuf,
     traffic_map: TrafficMap,
     weather_map: WeatherMap,
-    /// Per-process volume controller (Windows COM, Linux pactl).
-    #[cfg(any(target_os = "windows", target_os = "linux"))]
-    volume_ctl: crate::audioctl::ProcessVolumeControl,
-    /// Last time we tried to (re)discover the nrsc5 audio session.
-    last_session_probe_at: Option<Instant>,
+    /// In-process audio playback. Owns the cpal output stream and a
+    /// clone-cheap `AudioSink` that gets handed to every `Nrsc5Process`
+    /// for piped-mode PCM. Volume and mute are wait-free atomic stores
+    /// on the sink; no more per-process session probing.
+    audio_player: crate::audio::AudioPlayer,
     /// Histogram of unique album art images seen this session, keyed by a
     /// content hash so re-emissions of the same bytes — even under different
     /// LOT filenames — collapse into a single tile.
@@ -169,6 +181,20 @@ pub struct Nrsc5App {
     /// (which arrive via title/artist updates but without a fresh cover)
     /// don't pollute the log.
     last_cover_play_at: Option<i64>,
+    /// MPSC endpoints for background SDR-presence probes. The poll
+    /// tick spawns a one-shot worker thread whenever a probe is due and
+    /// no probe is currently in flight; the worker sends its result
+    /// back on `sdr_probe_tx` and pokes egui via `Context::request_repaint`
+    /// so the result is picked up promptly. Doing this on the GUI thread
+    /// was the source of the "Not Responding" freeze on SDRplay
+    /// hotplug: `soapysdr::enumerate("")` blocks for seconds while the
+    /// SDRplay API service finishes its device-discovery handshake.
+    sdr_probe_tx: mpsc::Sender<SdrProbeResult>,
+    sdr_probe_rx: mpsc::Receiver<SdrProbeResult>,
+    /// Set when a background probe is running, cleared when a result
+    /// is drained from `sdr_probe_rx`. Prevents stacking multiple
+    /// probes if one runs longer than the throttle interval.
+    sdr_probe_in_flight: bool,
 }
 
 impl Nrsc5App {
@@ -194,8 +220,20 @@ impl Nrsc5App {
         // every time the piped path starts. Done once at app startup
         // (and again when the backend is recreated on a config switch).
         let spectrum_tap = crate::dsp::SpectrumTap::new(1_488_375.0);
+        // Build the audio player (opens the default output device) and
+        // grab a clone-cheap sink for the nrsc5 backend to push PCM into.
+        // Device-open failures are surfaced via `init_error` rather than
+        // panicking; the app continues to run, just silently.
+        let audio_player = crate::audio::AudioPlayer::new();
+        let audio_sink = audio_player.sink();
+        // Push initial volume / mute from config into the audio player
+        // so the user's last session preferences take effect immediately
+        // — no waiting for them to wiggle the slider.
+        audio_player.set_volume(config.volume.clamp(0.0, 1.0));
+        audio_player.set_mute(config.muted);
         let nrsc5 = nrsc5.map(|mut backend| {
             backend.set_spectrum_tap(spectrum_tap.clone());
+            backend.set_audio_sink(audio_sink.clone());
             backend
         });
 
@@ -203,6 +241,11 @@ impl Nrsc5App {
             .as_ref()
             .map(|n| n.aas_dir().to_path_buf())
             .unwrap_or_else(crate::paths::aas_temp_dir);
+
+        // Channel for the background SDR-presence probe. Built here
+        // so both endpoints land in the struct literal as a matched
+        // pair without any post-construction reshuffling.
+        let (sdr_probe_tx, sdr_probe_rx) = mpsc::channel();
 
         // Open the on-disk art cache and load any history from previous
         // sessions. Failure here is non-fatal — we just start with an
@@ -247,9 +290,7 @@ impl Nrsc5App {
             aas_dir: aas_dir.clone(),
             traffic_map: TrafficMap::new(&aas_dir),
             weather_map: WeatherMap::new(&aas_dir),
-            #[cfg(any(target_os = "windows", target_os = "linux"))]
-            volume_ctl: crate::audioctl::ProcessVolumeControl::new(),
-            last_session_probe_at: None,
+            audio_player,
             art_history,
             art_cache,
             last_art_prune_at: None,
@@ -261,6 +302,9 @@ impl Nrsc5App {
                 log
             },
             last_cover_play_at: None,
+            sdr_probe_tx,
+            sdr_probe_rx,
+            sdr_probe_in_flight: false,
         }
     }
 }
@@ -446,9 +490,10 @@ impl eframe::App for Nrsc5App {
             self.handle_command(command);
         }
 
-        // Periodically try to discover/refresh the nrsc5 audio session so the
-        // volume slider becomes usable once playback starts.
-        self.poll_audio_session();
+        // Periodically refresh dock/layout bookkeeping.
+        // (Audio session probing was removed in v0.4.0 — the cpal-backed
+        //  AudioPlayer owns the stream in-process now, so there is no
+        //  external session to discover.)
 
         // Probe librtlsdr for attached devices every ~2 s so the no-SDR
         // overlay below reflects the current state of the USB bus.
@@ -715,123 +760,100 @@ impl Nrsc5App {
             self.nrsc5.as_ref().and_then(|n| n.active_manual_gain_tenths());
     }
 
-    /// Periodically attempt to (re)discover the nrsc5 audio session. The
-    /// session only exists once the child process starts producing audio,
-    /// so we retry every ~500ms while streaming until it appears, then
-    /// push the current volume/mute state into it.
-    fn poll_audio_session(&mut self) {
-        #[cfg(any(target_os = "windows", target_os = "linux"))]
-        {
-            let pid = self.nrsc5.as_ref().and_then(|p| p.pid());
-            let Some(pid) = pid else {
-                if self.app_state.audio_session_ready {
-                    self.app_state.audio_session_ready = false;
-                    self.app_state.audio_session_mode = None;
-                    self.volume_ctl.detach();
-                }
-                return;
-            };
-
-            // Throttle probe attempts.
-            let now = Instant::now();
-            let due = self
-                .last_session_probe_at
-                .map(|t| now.duration_since(t) >= Duration::from_millis(500))
-                .unwrap_or(true);
-            if !due && self.app_state.audio_session_ready {
-                return;
-            }
-            self.last_session_probe_at = Some(now);
-
-            // Try a no-op read to test/establish the session.
-            match self.volume_ctl.get_volume(pid) {
-                Ok(_) => {
-                    if !self.app_state.audio_session_ready {
-                        self.app_state.audio_session_ready = true;
-                        // First time we've seen the session this run: push
-                        // our persisted volume/mute state into it.
-                        self.apply_volume();
-                        self.apply_mute();
-                    }
-                    // Sync the mode label so the UI can show per-app vs system-sink.
-                    #[cfg(target_os = "linux")]
-                    {
-                        use crate::linaudio::ActiveMode;
-                        self.app_state.audio_session_mode =
-                            self.volume_ctl.active_mode.as_ref().map(|m| match m {
-                                ActiveMode::PerApp =>
-                                    crate::gui::state::AudioSessionMode::PerApp,
-                                ActiveMode::SystemSink =>
-                                    crate::gui::state::AudioSessionMode::SystemSink,
-                            });
-                    }
-                }
-                Err(_) => {
-                    #[cfg(target_os = "windows")]
-                    {
-                        self.app_state.audio_session_ready = false;
-                    }
-                    #[cfg(target_os = "linux")]
-                    {
-                        // Some PipeWire/Pulse setups do not expose per-stream
-                        // metadata consistently enough for session probing,
-                        // but volume commands can still work. Keep controls
-                        // enabled while streaming.
-                        self.app_state.audio_session_ready =
-                            self.app_state.is_streaming;
-                    }
-                }
-            }
-        }
-    }
-
+    /// Push the current `app_state.volume` into the audio player. Wait-
+    /// free atomic store; the cpal callback picks it up on the next fill.
     fn apply_volume(&mut self) {
-        #[cfg(any(target_os = "windows", target_os = "linux"))]
-        {
-            let Some(pid) = self.nrsc5.as_ref().and_then(|p| p.pid()) else {
-                return;
-            };
-            let _ = self.volume_ctl.set_volume(pid, self.app_state.volume);
-        }
+        self.audio_player.set_volume(self.app_state.volume);
     }
 
+    /// Push the current `app_state.muted` into the audio player. Wait-
+    /// free atomic store; the cpal callback picks it up on the next fill.
     fn apply_mute(&mut self) {
-        #[cfg(any(target_os = "windows", target_os = "linux"))]
-        {
-            let Some(pid) = self.nrsc5.as_ref().and_then(|p| p.pid()) else {
-                return;
-            };
-            let _ = self.volume_ctl.set_mute(pid, self.app_state.muted);
-        }
+        self.audio_player.set_mute(self.app_state.muted);
     }
 
-    /// Probe `librtlsdr` for the number of attached RTL-SDR devices and
-    /// update `app_state.sdr_present` / `sdr_probe_available`. Throttled to
-    /// roughly one probe every two seconds. If the probe is unavailable on
-    /// this system (DLL missing), we silently mark it so and never show the
-    /// no-SDR overlay — a false "missing" warning would be worse than no
-    /// warning at all.
+    /// Probe attached SDRs and update `app_state.sdr_present` /
+    /// `sdr_probe_available`. Throttled to roughly one probe every two
+    /// seconds. Two layers:
+    ///
+    ///   1. `librtlsdr` device count via `sdr_detect::device_count()`.
+    ///      Cheap (single-digit ms when no devices are attached), but
+    ///      only sees RTL-SDR dongles.
+    ///   2. `soapysdr::enumerate("")` filtered to the supported driver
+    ///      list. Catches SDRplay, Airspy, HackRF, etc. Only run when
+    ///      the cheap probe says zero AND we're not currently
+    ///      streaming, so we never contend with a live USB device.
+    ///
+    /// **Threading.** Both probes run on a short-lived background
+    /// worker thread — `soapysdr::enumerate` can block for several
+    /// seconds on SDRplay hotplug while the API service does its
+    /// device-discovery handshake, and running that on the GUI thread
+    /// would put the window into Windows' "Not Responding" state. The
+    /// GUI thread only drains results (non-blocking) and decides
+    /// whether to spawn another probe.
+    ///
+    /// If neither probe is available on this system (no `librtlsdr.dll`
+    /// AND Soapy enumeration errored) we silently mark probing
+    /// unavailable and never show the no-SDR overlay — a false
+    /// "missing" warning would be worse than no warning at all.
     fn poll_sdr_presence(&mut self, ctx: &egui::Context) {
+        // Drain any completed background probes. Keep only the latest
+        // result if more than one is queued (which shouldn't happen
+        // given the in-flight guard, but is cheap to handle anyway).
+        let mut latest: Option<SdrProbeResult> = None;
+        while let Ok(r) = self.sdr_probe_rx.try_recv() {
+            latest = Some(r);
+            self.sdr_probe_in_flight = false;
+        }
+        if let Some(r) = latest {
+            let any_probe_ok = r.rtl.is_some() || r.soapy.is_some();
+            let any_present = r.rtl.unwrap_or(0) > 0 || r.soapy.unwrap_or(0) > 0;
+            if any_probe_ok {
+                self.app_state.sdr_probe_available = true;
+                // While streaming, trust that a device is present (the
+                // stream is using one). Otherwise reflect probe results.
+                self.app_state.sdr_present =
+                    self.app_state.is_streaming || any_present;
+            } else {
+                self.app_state.sdr_probe_available = false;
+                self.app_state.sdr_present = true;
+            }
+        }
+
+        // Decide whether to kick off another probe. Throttle to one
+        // per ~2 s, and never stack a second probe while one is in
+        // flight (which can outlast the throttle interval when the
+        // SDRplay API service is slow).
         let now = Instant::now();
         let due = self
             .app_state
             .sdr_last_probed
             .map(|t| now.duration_since(t) >= Duration::from_millis(2000))
             .unwrap_or(true);
-        if !due {
-            return;
-        }
-        self.app_state.sdr_last_probed = Some(now);
 
-        match crate::sdr_detect::device_count() {
-            Some(n) => {
-                self.app_state.sdr_probe_available = true;
-                self.app_state.sdr_present = n > 0;
-            }
-            None => {
-                self.app_state.sdr_probe_available = false;
-                self.app_state.sdr_present = true;
-            }
+        if due && !self.sdr_probe_in_flight {
+            self.app_state.sdr_last_probed = Some(now);
+            self.sdr_probe_in_flight = true;
+            let tx = self.sdr_probe_tx.clone();
+            let is_streaming = self.app_state.is_streaming;
+            let repaint_ctx = ctx.clone();
+            std::thread::spawn(move || {
+                let rtl = crate::sdr_detect::device_count();
+                // Only run the heavier Soapy enumeration if librtlsdr
+                // came up empty AND no stream is active. Streaming
+                // with a non-RTL device (e.g. SDRplay) implies a
+                // device is present, and we don't want to contend with
+                // a live capture.
+                let soapy = match (rtl, is_streaming) {
+                    (Some(n), _) if n > 0 => None,
+                    (_, true) => None,
+                    _ => crate::sdr_detect::soapy_supported_count(),
+                };
+                let _ = tx.send(SdrProbeResult { rtl, soapy });
+                // Wake the GUI so the result is applied promptly
+                // even if the user isn't interacting with the app.
+                repaint_ctx.request_repaint();
+            });
         }
 
         // While the overlay is showing, ensure egui keeps repainting even
@@ -1224,6 +1246,31 @@ impl Nrsc5App {
             }
             NrscEvent::LostDeviceDetail(detail) => {
                 self.app_state.nrsc5_status = format!("device lost: {detail}");
+            }
+            NrscEvent::ChildExited => {
+                // The PCM pump saw EOF on the child's stdout. If we
+                // still think a stream is live, the child died on us
+                // (external taskkill, crash, or clean nrsc5 exit on
+                // an unrecoverable error) — mirror the LostDevice
+                // cleanup so the user doesn't have to Stop+Start to
+                // recover. If `is_streaming` is already false, our
+                // own `stop()` triggered this exit and there's
+                // nothing more to do.
+                if self.app_state.is_streaming {
+                    self.app_state.is_streaming = false;
+                    self.start_requested_at = None;
+                    self.last_signal_at = None;
+                    if let Some(nrsc5) = self.nrsc5.as_mut() {
+                        nrsc5.stop();
+                    }
+                    // Preserve any device-loss status already set in
+                    // the same failure cycle so we don't paper over a
+                    // more specific error with the generic "stream
+                    // ended" label.
+                    if !self.app_state.nrsc5_status.starts_with("device lost") {
+                        self.app_state.nrsc5_status = "stream ended".to_string();
+                    }
+                }
             }
             NrscEvent::Sync => {
                 self.last_signal_at = Some(Instant::now());

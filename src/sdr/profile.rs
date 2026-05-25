@@ -70,6 +70,14 @@ pub struct DeviceProfile {
     /// dB table but lands at the bottom of SDRplay's 20..48 dB table
     /// and forces a long climb before MER comes up).
     pub default_agc_initial_tenths: i32,
+    /// First direction the AGC walks the gain table when its initial
+    /// gain does not lock immediately. `-1` = walk DOWN first (RTL-SDR
+    /// legacy: stepping up from an over-clipped gain can lose sync).
+    /// `+1` = walk UP first — the right call when `default_agc_initial_tenths`
+    /// sits at or below the family's HD sweet spot, as on SDRplay's
+    /// 20..48 dB table where 39 dB is mid-table and the HD lock band
+    /// is typically 39..44 dB.
+    pub default_agc_initial_direction: i32,
     /// Names of every gain element the SDR Settings modal should
     /// render as a manual knob, in display order. Always includes the
     /// AGC target. Devices may expose extra elements (e.g. SDRplay's
@@ -124,7 +132,12 @@ pub const RTLSDR: DeviceProfile = DeviceProfile {
     agc_tick_ms: 500,    // R820T2's HD-Radio sweet spot is wide; 19.7 dB is mid-table and
     // matches the long-standing AGC default that produced quick lock
     // on the reference RTL-SDR Blog V3 + dipole bench setup.
-    default_agc_initial_tenths: 197,    manual_elements: &["TUNER"],
+    default_agc_initial_tenths: 197,
+    // Walk DOWN from 19.7 dB on miss: stepping up risks over-clipping
+    // on already-hot signals; stepping down from a working gain never
+    // loses sync. Matches the original v0.3.x AGC behavior.
+    default_agc_initial_direction: -1,
+    manual_elements: &["TUNER"],
     hd_radio_notes: "\
         RTL-SDR is the cheapest HD-Radio-capable receiver and the \
         reference platform for this app. Best results: external 12 V \
@@ -171,13 +184,19 @@ pub const SDRPLAY: DeviceProfile = DeviceProfile {
     // before the next probe; the steady-state lock time goes up
     // by maybe a second, which is invisible at the UI level.
     agc_tick_ms: 500,
-    // Start near the documented HD-Radio sweet spot (~38..44 dB on
-    // the RSP1A). Starting at 19.7 dB (the global default) meant the
-    // controller spent a noticeable amount of wall time walking up
-    // the table before MER came above lock threshold; 38 dB lands
-    // right in the middle of the usable HD band so first-tick is
-    // usually already inside lock range and the AGC converges fast.
-    default_agc_initial_tenths: 380,
+    // Start near the documented HD-Radio sweet spot (~39..44 dB on
+    // the RSP1A). 39 dB lands solidly inside the lock band so first-
+    // tick is usually already in range, and (combined with the +1
+    // walk-up below) the AGC climbs toward the optimum rather than
+    // first probing the noisier low-gain end of the table.
+    default_agc_initial_tenths: 390,
+    // Walk UP from 39 dB on miss: the SDRplay HD sweet spot is
+    // typically ABOVE the starting gain, not below, so the legacy
+    // walk-down (inherited from RTL-SDR's over-clipping caution)
+    // searches the wrong half of the table first and wastes probes.
+    // Stepping up from 39 dB rarely loses sync because we're not
+    // starting from an over-driven gain.
+    default_agc_initial_direction: 1,
     manual_elements: &["Gain"],
     hd_radio_notes: "\
         SDRplay RSPs cover much wider RF range than RTL-SDR and have \
@@ -224,6 +243,9 @@ pub const HACKRF: DeviceProfile = DeviceProfile {
     // Mid-table: 24 dB LNA is the documented HackRF starting point
     // for FM HD Radio per the notes below.
     default_agc_initial_tenths: 240,
+    // Walk DOWN from 24 dB on miss — same rationale as RTL-SDR.
+    // Revisit once a HackRF is on the bench and we have real data.
+    default_agc_initial_direction: -1,
     manual_elements: &["LNA", "VGA", "AMP"],
     hd_radio_notes: "\
         HackRF One has 8 MHz minimum analog bandwidth which is wide \

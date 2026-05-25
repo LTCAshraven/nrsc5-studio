@@ -1,6 +1,6 @@
 [package]
 name = "nrsc5-studio"
-version = "0.3.6"
+version = "0.3.8"
 edition = "2021"
 authors = ["LTCAshraven"]
 license = "MIT"
@@ -11,6 +11,14 @@ readme = "README.md"
 [dependencies]
 anyhow = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+# v0.3.8 (Phase 1 audio refactor): cpal owns the system audio output
+# stream now that `nrsc5.exe` is invoked with `-o -` and emits raw s16le
+# 44.1 kHz stereo PCM on stdout. This replaces the libao path that
+# nrsc5 used to drive itself, and retires `src/winaudio/`, `src/linaudio.rs`,
+# and `src/audioctl.rs` (which only existed to *control* libao's WASAPI /
+# pactl session — they had no PCM responsibilities of their own). Picking
+# cpal here also makes the eventual Linux build path near-free.
+cpal = "0.15"
 crossbeam-channel = "0.5"
 dirs = "6"
 eframe = { version = "0.34", features = ["persistence"] }
@@ -51,14 +59,14 @@ toml = "0.8"
 
 [target.'cfg(windows)'.dependencies]
 rfd = { version = "0.17", default-features = false }
-windows = { version = "0.62", features = [
-    "Win32_Foundation",
-    "Win32_Media_Audio",
-    "Win32_System_Com",
-    "Win32_System_Com_StructuredStorage",
-    "Win32_System_Variant",
-    "Win32_UI_Shell_PropertiesSystem",
-] }
+# v0.4.0: removed `windows = "0.62"` entirely. The only consumer in this
+# repo was `src/winaudio/mod.rs` (WASAPI session control of nrsc5's
+# libao output), which was retired by the cpal refactor. If a future
+# feature needs raw WASAPI / COM access, re-add the crate with only the
+# features it actually uses — previously we carried `Win32_Media_Audio`,
+# `Win32_System_Com`, `Win32_System_Com_StructuredStorage`,
+# `Win32_System_Variant`, and `Win32_UI_Shell_PropertiesSystem`, all
+# transitively unused after winaudio went away.
 
 [target.'cfg(target_os = "linux")'.dependencies]
 rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
@@ -78,3 +86,14 @@ lto = true           # Link-time optimization
 codegen-units = 1    # Better optimization (slower compile, smaller binary)
 strip = true         # Strip debug symbols
 panic = "abort"      # No unwinding (smaller binary; fine for a GUI app)
+
+# Debug builds optimize third-party dependencies even though our own
+# code stays unoptimized. Real-time DSP (rubato resampler at 2 MHz
+# CS16) and the SoapySDR FFI shims can't keep up with the SDRplay's
+# 4 MB/s USB stream when compiled at opt-level=0 — the SDR's internal
+# buffer overflows continuously and prints `O`s to stderr forever.
+# Setting opt-level=3 just for dependencies gives a clean dev build
+# (debuggable application code, fast dependencies) without forcing
+# the user into release mode for every smoke test.
+[profile.dev.package."*"]
+opt-level = 3

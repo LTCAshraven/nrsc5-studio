@@ -100,6 +100,15 @@ pub struct AgcConfig {
     /// stations sit comfortably while marginal stations need walking
     /// DOWN to find sync.
     pub initial_tenths: i32,
+    /// First direction the controller walks the gain table when its
+    /// initial gain does not lock immediately. `-1` = walk DOWN
+    /// (legacy RTL-SDR behavior — stepping up from an over-clipped
+    /// gain can lose sync, while stepping down from a working gain
+    /// never does). `+1` = walk UP first — the right call when the
+    /// initial gain sits near the conservative end of the table (e.g.
+    /// SDRplay starting at mid-table 39 dB where the HD sweet spot is
+    /// typically 39..44 dB, not below).
+    pub initial_direction: i32,
 }
 
 impl Default for AgcConfig {
@@ -109,6 +118,7 @@ impl Default for AgcConfig {
             probe_period: Duration::from_millis(5000),
             bail_after_changes: 15,
             initial_tenths: 197,
+            initial_direction: -1,
         }
     }
 }
@@ -187,11 +197,14 @@ impl AgcController {
     pub fn new(table: &[i32], cfg: AgcConfig) -> Self {
         debug_assert!(!table.is_empty(), "AGC requires a non-empty gain table");
         let gain_idx = nearest_idx(table, cfg.initial_tenths);
+        // Normalize the configured direction to ±1. Anything zero or
+        // bogus falls back to the legacy walk-down behavior.
+        let last_dir = if cfg.initial_direction >= 1 { 1 } else { -1 };
         Self {
             table: table.to_vec(),
             cfg,
             gain_idx,
-            last_dir: -1,
+            last_dir,
             ema_mer_min: None,
             best_mer_seen: f32::NEG_INFINITY,
             best_gain_idx: gain_idx,
@@ -346,10 +359,22 @@ impl AgcController {
         // -- 4. Pick direction. ---------------------------------------
         //
         // If the latest probe was the best, keep walking the same way.
-        // Else flip. For no-sync probes, keep current direction.
+        // If it was strictly worse, flip. If MER vanished entirely AND
+        // we previously had a working gain, that's a strong "we just
+        // walked off the cliff" signal (typical when SDRplay or RTL-SDR
+        // hits front-end overload at high gain -- sync drops, no MER
+        // events arrive for the full probe window, current_ema stays
+        // None). Treat it the same as a strictly-worse probe and flip
+        // back toward the known-good gain. Without this, the controller
+        // would keep stepping in the original direction and walk
+        // arbitrarily deep into overload before the bail budget
+        // eventually rescues it. The "no MER yet, no best either"
+        // case (first probes on a weak station) still keeps the
+        // current direction so we can scan looking for any lock.
         let preferred_dir = match current_ema {
             Some(e) if (e - self.best_mer_seen).abs() < 0.01 => self.last_dir,
             Some(_) => -self.last_dir,
+            None if self.best_mer_seen.is_finite() => -self.last_dir,
             None => self.last_dir,
         };
 
@@ -498,6 +523,7 @@ mod tests {
             probe_period: Duration::from_millis(0),
             bail_after_changes: 10,
             initial_tenths: 197,
+            initial_direction: -1,
         }
     }
 

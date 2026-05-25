@@ -20,6 +20,13 @@ pub enum NrscEvent {
     /// Backend stream failed; carries the underlying Soapy error text
     /// for diagnostics/UI status.
     LostDeviceDetail(String),
+    /// The nrsc5.exe child process closed its stdout pipe. Emitted from
+    /// the PCM pump on EOF / BrokenPipe — covers external `taskkill`,
+    /// child crash, child clean exit, or our own `stop()` path. Handled
+    /// idempotently in the app: if we still think we're streaming, tear
+    /// down; if Stop already ran, ignore. Lets us detect a dead child
+    /// without polling `child.try_wait()` on every GUI frame.
+    ChildExited,
     Sync,
     LostSync,
     Mer { lower: f32, upper: f32 },
@@ -123,6 +130,7 @@ impl NrscEvent {
         match self {
             Self::LostDevice => "lost-device",
             Self::LostDeviceDetail(_) => "lost-device-detail",
+            Self::ChildExited => "child-exited",
             Self::Sync => "sync",
             Self::LostSync => "lost-sync",
             Self::Mer { .. } => "mer",
@@ -180,6 +188,19 @@ pub struct Nrsc5Process {
     /// `ChildStdin` directly so dropping the thread closes the pipe
     /// (sending EOF to nrsc5).
     iq_thread: Option<JoinHandle<()>>,
+    /// PCM pump thread for the piped-SDR path. `Some` only while a
+    /// piped Start is active; cleared by `stop`. Reads s16le 44.1 kHz
+    /// stereo PCM from `nrsc5.exe`'s stdout (started with `-o -`) and
+    /// pushes it into the shared `AudioSink`. Exits cleanly on stdout
+    /// EOF (i.e. when the child dies or is killed).
+    pcm_thread: Option<JoinHandle<()>>,
+    /// Optional clone-cheap audio sink installed by the app at
+    /// startup (via `set_audio_sink`). When `Some`, `start_piped`
+    /// will request PCM on stdout from `nrsc5.exe` (`-o -`) and feed
+    /// it to this sink. When `None`, the piped path falls back to
+    /// `Stdio::null()` for stdout (audio is silently discarded —
+    /// useful for headless testing).
+    audio_sink: Option<crate::audio::AudioSink>,
     /// SDR backend for the active piped stream. `Some` between
     /// `start_piped` and `stop`; `None` otherwise.
     ///
@@ -347,6 +368,8 @@ impl Nrsc5Process {
             child: None,
             stderr_thread: None,
             iq_thread: None,
+            pcm_thread: None,
+            audio_sink: None,
             sdr: None,
             last_mode: None,
             spectrum_tap: None,
@@ -370,6 +393,17 @@ impl Nrsc5Process {
     /// read on every paint.
     pub fn set_spectrum_tap(&mut self, tap: crate::dsp::SpectrumTap) {
         self.spectrum_tap = Some(tap);
+    }
+
+    /// Install an audio sink that will receive PCM from `nrsc5.exe`
+    /// (invoked with `-o -`) whenever a piped stream is active. Call
+    /// once at app startup. When absent, the piped path runs with
+    /// `Stdio::null()` on the child's stdout and produces no audio.
+    /// Only the piped path emits PCM through this sink — the legacy
+    /// `start()` (USB direct) and `start_rtltcp()` paths still let
+    /// `nrsc5.exe` drive libao itself.
+    pub fn set_audio_sink(&mut self, sink: crate::audio::AudioSink) {
+        self.audio_sink = Some(sink);
     }
 
     /// Read-only snapshot of the closed-loop AGC controller for the UI.
@@ -592,6 +626,13 @@ impl Nrsc5Process {
 
         let mut cmd = Command::new(&self.exe_path);
         // -r -  : read raw I/Q from stdin.
+        // -o -  : emit decoded PCM (s16le 44.1 kHz stereo) on stdout
+        //         when an audio sink is installed. v0.4.0 Phase 1
+        //         refactor — the Rust app owns playback now instead
+        //         of letting nrsc5 drive libao itself. When no sink
+        //         is installed (headless tests), stdout is nulled
+        //         and nrsc5 still plays its own audio via libao
+        //         (legacy fallback; harmless in single-process tests).
         // -l 1  : librtlsdr-style log verbosity.
         //
         // In `-r -` mode nrsc5 v3.1.0 only accepts a SINGLE positional
@@ -601,11 +642,19 @@ impl Nrsc5Process {
         let _ = frequency_mhz;
         cmd.arg("-l").arg("1");
         cmd.arg("-r").arg("-");
+        let have_sink = self.audio_sink.is_some();
+        if have_sink {
+            cmd.arg("-o").arg("-");
+        }
         cmd.arg("--dump-aas-files").arg(&self.aas_dir);
         cmd.arg(program.to_string());
 
         cmd.stdin(Stdio::piped());
-        cmd.stdout(Stdio::null());
+        if have_sink {
+            cmd.stdout(Stdio::piped());
+        } else {
+            cmd.stdout(Stdio::null());
+        }
         cmd.stderr(Stdio::piped());
 
         #[cfg(target_os = "windows")]
@@ -617,6 +666,16 @@ impl Nrsc5Process {
         let mut child = cmd.spawn().map_err(Nrsc5Error::Spawn)?;
         let mut child_stdin = child.stdin.take().expect("stdin was piped");
         let stderr = child.stderr.take().expect("stderr was piped");
+        // When an audio sink is installed, grab the child's stdout so
+        // the pcm_pump thread (spawned just below) can read decoded
+        // PCM and push it into the shared playback queue. When no
+        // sink is installed we left stdout as `Stdio::null()`, so
+        // `child.stdout` is `None` and there is no pump.
+        let child_stdout = if have_sink {
+            Some(child.stdout.take().expect("stdout was piped when sink installed"))
+        } else {
+            None
+        };
 
         // ----- AGC controller (only in `Auto` mode) -----------------
         // Build the controller, apply its initial gain to the SDR, and
@@ -640,9 +699,13 @@ impl Nrsc5Process {
             // gain. The global `AgcConfig::default()` aims at the RTL-SDR
             // sweet spot (19.7 dB); SDRplay and HackRF override it via
             // `default_agc_initial_tenths` so they land closer to their
-            // own HD lock range on first tick.
+            // own HD lock range on first tick. Each profile also
+            // picks the initial search direction — RTL-SDR walks
+            // DOWN from 19.7 dB (over-clip caution), SDRplay walks UP
+            // from 39 dB (HD sweet spot is above the start, not below).
             let mut agc_cfg = AgcConfig::default();
             agc_cfg.initial_tenths = profile.default_agc_initial_tenths;
+            agc_cfg.initial_direction = profile.default_agc_initial_direction;
             let agc_ctrl = AgcController::new(
                 profile.agc_tenths_table,
                 agc_cfg,
@@ -737,9 +800,76 @@ impl Nrsc5Process {
             }
         });
 
+        // ----- PCM pump (only when an audio sink is installed) -----
+        // Reads interleaved s16 LE 44.1 kHz stereo from `nrsc5.exe`'s
+        // stdout in ~10 ms chunks and pushes them into the shared
+        // playback queue via the cloned sink. Exits cleanly on
+        // EOF (child died / killed / closed stdout). Allocation-free
+        // hot path: one fixed scratch buffer reused for every read.
+        //
+        // On exit (any cause — EOF, BrokenPipe, real I/O error) the
+        // thread emits a `ChildExited` event so the app can detect a
+        // dead child without polling `Child::try_wait` every frame.
+        let pcm_thread = match (child_stdout, self.audio_sink.clone()) {
+            (Some(mut stdout), Some(sink)) => {
+                // Make sure we don't carry over PCM from a previous
+                // stream session into the speakers.
+                sink.clear();
+                let exit_tx = self.tx.clone();
+                let handle = std::thread::spawn(move || {
+                    use std::io::Read;
+                    // 2048 bytes = 1024 s16 samples = 512 stereo
+                    // frames ≈ 11.6 ms at 44.1 kHz. Small enough to
+                    // keep wake-up latency low, big enough to keep
+                    // syscall overhead negligible.
+                    const BYTES_PER_READ: usize = 2048;
+                    let mut byte_buf = [0u8; BYTES_PER_READ];
+                    let mut sample_buf: Vec<i16> = Vec::with_capacity(BYTES_PER_READ / 2);
+                    loop {
+                        match stdout.read(&mut byte_buf) {
+                            Ok(0) => break, // EOF — child closed stdout
+                            Ok(n) => {
+                                // Reinterpret the read bytes as s16 LE.
+                                // We always read into the front of
+                                // `byte_buf` so the partial-read case
+                                // is just `n` bytes / 2 samples; an
+                                // odd `n` byte is dropped on the
+                                // floor (extremely unlikely with
+                                // OS-level pipe semantics, but
+                                // tolerated rather than panicked on).
+                                let pair_count = n / 2;
+                                sample_buf.clear();
+                                sample_buf.reserve(pair_count);
+                                for chunk in byte_buf[..pair_count * 2].chunks_exact(2) {
+                                    sample_buf.push(i16::from_le_bytes([chunk[0], chunk[1]]));
+                                }
+                                sink.push(&sample_buf);
+                            }
+                            Err(e) => {
+                                // Genuine I/O error. Most commonly
+                                // a BrokenPipe when the child was
+                                // killed mid-write. Treated identically
+                                // to EOF: bail out cleanly.
+                                let _ = e;
+                                break;
+                            }
+                        }
+                    }
+                    // Notify the app that the child closed its stdout.
+                    // Idempotent on the receiving side — if `stop()`
+                    // was the cause, the app's `is_streaming` flag has
+                    // already been cleared and the event is ignored.
+                    let _ = exit_tx.send(NrscEvent::ChildExited);
+                });
+                Some(handle)
+            }
+            _ => None,
+        };
+
         self.child = Some(child);
         self.stderr_thread = Some(stderr_thread);
         self.iq_thread = Some(iq_thread);
+        self.pcm_thread = pcm_thread;
         self.sdr = Some(sdr);
         self.last_mode = Some(LastStartMode::Piped);
         self.last_gain_mode = Some(gain_mode);
@@ -844,6 +974,16 @@ impl Nrsc5Process {
         if let Some(mut child) = self.child.take() {
             let _ = child.kill();
             let _ = child.wait();
+        }
+        // Now that the child is dead, its stdout has closed and the
+        // pcm_pump's read loop has returned EOF. Joining is fast.
+        if let Some(handle) = self.pcm_thread.take() {
+            let _ = handle.join();
+        }
+        // Discard any PCM still sitting in the queue so the next
+        // Start doesn't replay a fraction of a second of stale audio.
+        if let Some(sink) = self.audio_sink.as_ref() {
+            sink.clear();
         }
         if let Some(handle) = self.stderr_thread.take() {
             let _ = handle.join();

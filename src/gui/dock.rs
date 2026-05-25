@@ -246,15 +246,14 @@ impl DockViewer<'_> {
         ui.separator();
         ui.add_space(2.0);
 
-        // Volume slider + mute toggle. Both are disabled until the audio
-        // session for the nrsc5 child has been discovered.
+        // Volume slider + mute toggle. Always enabled — the cpal-backed
+        // AudioPlayer is constructed at app startup and reflects any
+        // wait-free volume/mute store on the very next audio callback,
+        // whether or not a station is currently tuned.
         ui.horizontal(|ui| {
             let mute_icon = if self.app_state.muted { "🔇" } else { "🔊" };
             let mute_btn = ui
-                .add_enabled(
-                    self.app_state.audio_session_ready,
-                    egui::Button::new(RichText::new(mute_icon).size(14.0)),
-                )
+                .button(RichText::new(mute_icon).size(14.0))
                 .on_hover_text("Toggle mute");
             if mute_btn.clicked() {
                 self.commands
@@ -263,8 +262,7 @@ impl DockViewer<'_> {
 
             // Slider works in 0..=100 for display, mapped to 0.0..=1.0 internally.
             let mut percent = (self.app_state.volume * 100.0).round() as i32;
-            let slider_resp = ui.add_enabled(
-                self.app_state.audio_session_ready,
+            let slider_resp = ui.add(
                 egui::Slider::new(&mut percent, 0..=100)
                     .suffix("%")
                     .show_value(true),
@@ -274,26 +272,6 @@ impl DockViewer<'_> {
                 self.commands.push(UiCommand::SetVolume(new_vol));
             }
         });
-        if !self.app_state.audio_session_ready {
-            ui.label(
-                RichText::new("(volume available once audio is playing)")
-                    .small()
-                    .color(Color32::from_gray(120)),
-            );
-        } else if let Some(mode) = &self.app_state.audio_session_mode {
-            use crate::gui::state::AudioSessionMode;
-            let (label, color) = match mode {
-                AudioSessionMode::PerApp => (
-                    "🎚 per-app volume",
-                    Color32::from_gray(120),
-                ),
-                AudioSessionMode::SystemSink => (
-                    "🔊 system sink (no per-app session found)",
-                    Color32::from_rgb(180, 140, 60),
-                ),
-            };
-            ui.label(RichText::new(label).small().color(color));
-        }
         ui.add_space(2.0);
         ui.separator();
         ui.add_space(4.0);

@@ -6,15 +6,6 @@ use crate::dsp::{AgcSnapshot, SpectrumSnapshot, SpectrumTap};
 use crate::sdr::{DeviceInfo, GainElement};
 use crate::station_info::StationInfo;
 
-/// How volume is being controlled for the active audio session.
-#[derive(Debug, Clone, PartialEq)]
-pub enum AudioSessionMode {
-    /// Per-process sink-input found and targeted (best case).
-    PerApp,
-    /// Default system sink used as fallback when per-process match failed.
-    SystemSink,
-}
-
 /// One tile in the album-art heat-map collage: the file path to the image,
 /// the number of times it has appeared, and the unique (title, artist) pairs
 /// observed while it was on screen. Used to render hover tooltips.
@@ -124,16 +115,11 @@ pub struct AppState {
     /// True for the single frame after entering preset-edit mode so we can
     /// request focus once without trapping focus forever.
     pub editing_preset_just_opened: bool,
-    /// Current output volume for the nrsc5 audio session (0.0..=1.0).
+    /// Current output volume for the in-process audio player (0.0..=1.0).
+    /// Applied via wait-free atomic store; no session probing needed.
     pub volume: f32,
-    /// Mute state for the nrsc5 audio session.
+    /// Mute state for the in-process audio player.
     pub muted: bool,
-    /// True once the per-process audio session has been located. Slider is
-    /// disabled until this becomes true.
-    pub audio_session_ready: bool,
-    /// Describes how volume control is being applied on the current platform.
-    /// `None` means not yet established or not supported.
-    pub audio_session_mode: Option<AudioSessionMode>,
     /// Rolling ring buffer of synthesized QPSK constellation samples, in
     /// normalized symbol coordinates (ideal points at (±1, ±1)). Allocated
     /// lazily by the Constellation panel on first paint.
