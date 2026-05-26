@@ -1,0 +1,20 @@
+nrsc5-studio (0.3.7-1) unstable; urgency=medium
+
+  * Linux packaging debut. .deb and .rpm now built from the same Rust
+    source tree as the Windows portable zip. No DSP/SDR behavior
+    change versus 0.3.6 — packaging metadata, install scripts,
+    AppStream metainfo, .desktop launcher, hicolor icons, manpage,
+    and a first-launch missing-helper dialog.
+  * End-user .deb builds are produced by cargo-deb against
+    [package.metadata.deb] in Cargo.toml (see packaging/debian/README.md).
+
+ -- LTCAshraven <LTCAshraven@users.noreply.github.com>  Sun, 24 May 2026 00:00:00 +0000
+
+nrsc5-studio (0.3.6-1) UNRELEASED; urgency=medium
+
+  * Initial Debian source package skeleton. Not yet uploaded to the
+    Debian archive. End-user .deb builds are produced by cargo-deb
+    against [package.metadata.deb] in Cargo.toml (see
+    packaging/debian/README.md).
+
+ -- LTCAshraven <LTCAshraven@users.noreply.github.com>  Sat, 23 May 2026 00:00:00 +0000
