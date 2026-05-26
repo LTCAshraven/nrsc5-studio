@@ -322,3 +322,270 @@ fn open_stream(
 
     (Some(stream), None)
 }
+
+// ---------------------------------------------------------------------------
+// Phase 3 multi-decoder routing layer
+// ---------------------------------------------------------------------------
+//
+// `PcmRing` is one decoder's private bounded ring of interleaved s16
+// stereo PCM. Each `DecoderInstance`'s pcm_pump pushes into its own
+// ring instead of into the cpal `AudioSink` directly. A single
+// `SpeakerRouter` thread, owned by `Nrsc5Process`, drains every
+// registered ring on a short polling loop and forwards the *active*
+// program's samples into the cpal `AudioSink`. Inactive programs'
+// samples are drained-and-discarded — this is what keeps an inactive
+// decoder's ring from growing without bound while still letting it
+// run in the background (Phase 4 will pull from these same rings for
+// per-program Opus recording).
+//
+// Chunk 2 wires this routing in for the single-decoder case so the
+// new plumbing can be smoke-tested in isolation; Chunk 3 turns
+// `Nrsc5Process` into a multiplexer and adds the public
+// `add_decoder` / `remove_decoder` / `set_active_speaker` API.
+
+use crossbeam_channel::{unbounded, RecvTimeoutError, Sender, TryRecvError};
+use std::collections::HashMap;
+use std::thread::JoinHandle;
+use std::time::Duration;
+
+/// Per-decoder bounded ring of interleaved s16 stereo PCM at 44.1 kHz.
+///
+/// Identical drop-oldest semantics to `AudioSink`'s internal queue —
+/// when the producer (`pcm_pump`) outruns the consumer (`SpeakerRouter`)
+/// the oldest samples are evicted to keep latency bounded.
+pub(crate) struct PcmRing {
+    queue: Mutex<VecDeque<i16>>,
+}
+
+impl PcmRing {
+    pub fn new() -> Self {
+        Self {
+            queue: Mutex::new(VecDeque::with_capacity(MAX_QUEUE_LEN)),
+        }
+    }
+
+    /// Drop-oldest push. Matches `AudioSink::push` byte-for-byte so
+    /// the routing layer is a transparent insertion in the audio path.
+    pub fn push(&self, frames: &[i16]) {
+        if frames.is_empty() {
+            return;
+        }
+        let Ok(mut q) = self.queue.lock() else { return };
+        let total = q.len() + frames.len();
+        if total > MAX_QUEUE_LEN {
+            let q_len = q.len();
+            let drop_n = (total - MAX_QUEUE_LEN).min(q_len);
+            q.drain(..drop_n);
+        }
+        q.extend(frames.iter().copied());
+    }
+
+    /// Drain the entire ring into `dst`. `dst` is cleared first.
+    /// Called by the `SpeakerRouter` on every poll tick.
+    fn drain_into(&self, dst: &mut Vec<i16>) {
+        dst.clear();
+        let Ok(mut q) = self.queue.lock() else { return };
+        dst.reserve(q.len());
+        dst.extend(q.drain(..));
+    }
+}
+
+/// Commands sent from the FFI layer to the `SpeakerRouter` worker
+/// thread. The router maintains its own `HashMap<program, ring>` so
+/// adding/removing decoders is wait-free from the caller's side.
+pub(crate) enum SpeakerCmd {
+    /// Register a new decoder's PCM ring. The router will start
+    /// draining it on the next tick; whether its samples reach the
+    /// speakers depends on `SetActive`.
+    AddDecoder { program: u32, ring: Arc<PcmRing> },
+    /// Stop draining and forget the ring for `program`. Idempotent;
+    /// if `program` was the active speaker the router goes silent
+    /// until the next `SetActive`.
+    RemoveDecoder(u32),
+    /// Route this program's samples to the cpal sink. If no decoder
+    /// is registered for `program` yet the router remembers the
+    /// request and applies it once `AddDecoder(program)` arrives.
+    SetActive(u32),
+    /// Attach an Opus recorder tap to a decoder's stream. The router
+    /// will `try_send` a clone of every drained chunk for `program`
+    /// down `tap` after the normal speaker-routing path runs. The
+    /// tap is independent of the active speaker so the recorder can
+    /// follow a different subchannel than the cpal sink — e.g.
+    /// recording HD1 music while listening to HD2 talk. `try_send`
+    /// means encoder back-pressure drops the oldest tick rather than
+    /// stalling the audio path. Sending `AttachRecorder` for a
+    /// program that's already tapped replaces the previous tap
+    /// (last-writer-wins); the old `Sender` gets dropped and the
+    /// previous recorder thread exits naturally.
+    AttachRecorder { program: u32, tap: Sender<Vec<i16>> },
+    /// Remove the Opus recorder tap for `program`. Idempotent;
+    /// safe to call even if no tap is attached.
+    DetachRecorder(u32),
+    /// Tear down. Sent on `Nrsc5Process::Drop`.
+    Stop,
+}
+
+/// Handle to the speaker-routing worker thread. Cheap to clone the
+/// command sender; the join handle stays on the `Nrsc5Process` for
+/// orderly teardown.
+pub(crate) struct SpeakerRouter {
+    cmd_tx: Sender<SpeakerCmd>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl SpeakerRouter {
+    /// Spawn the router thread. It will drain registered rings and
+    /// forward the active one's samples into `sink`. Long-lived;
+    /// survives multiple Start/Stop cycles. Killed via `shutdown()`
+    /// or implicitly on drop.
+    pub fn spawn(sink: AudioSink) -> Self {
+        let (cmd_tx, cmd_rx) = unbounded();
+        let join = std::thread::spawn(move || run_speaker_loop(sink, cmd_rx));
+        Self {
+            cmd_tx,
+            join: Some(join),
+        }
+    }
+
+    /// Clone of the command sender, safe to hand to other threads.
+    /// Currently the FFI layer is the only sender.
+    pub fn cmd_tx(&self) -> Sender<SpeakerCmd> {
+        self.cmd_tx.clone()
+    }
+
+    /// Send `Stop` and join the worker. Called from `Drop`.
+    pub fn shutdown(&mut self) {
+        let _ = self.cmd_tx.send(SpeakerCmd::Stop);
+        if let Some(h) = self.join.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+impl Drop for SpeakerRouter {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+/// Drain interval when at least one ring is registered. Short enough
+/// to keep latency low (one cpal callback is ~10 ms at typical
+/// buffer sizes) but long enough that the wake-up rate stays cheap.
+const ROUTER_TICK_MS: u64 = 5;
+
+fn run_speaker_loop(
+    sink: AudioSink,
+    cmd_rx: crossbeam_channel::Receiver<SpeakerCmd>,
+) {
+    let mut rings: HashMap<u32, Arc<PcmRing>> = HashMap::new();
+    let mut active: Option<u32> = None;
+    // Phase 4 (Chunk 4.2): per-program Opus recorder tap. Sits next
+    // to `rings` so the per-tick drain loop can fan-out one ring's
+    // samples to *both* the cpal sink (if `active`) and the
+    // recorder tap (if attached) in one pass. Independent from
+    // `active` so the recorder can follow a different subchannel
+    // than the speakers — the entire reason this lives in the
+    // router instead of being a property of the cpal sink.
+    let mut recorders: HashMap<u32, Sender<Vec<i16>>> = HashMap::new();
+    // Reusable scratch buffer to avoid per-tick allocation. Sized for
+    // the worst-case drain of one ring at MAX_QUEUE_LEN.
+    let mut scratch: Vec<i16> = Vec::with_capacity(MAX_QUEUE_LEN);
+
+    loop {
+        // 1. Drain pending commands non-blocking.
+        loop {
+            match cmd_rx.try_recv() {
+                Ok(SpeakerCmd::AddDecoder { program, ring }) => {
+                    rings.insert(program, ring);
+                }
+                Ok(SpeakerCmd::RemoveDecoder(p)) => {
+                    rings.remove(&p);
+                    // A program with no ring can't be recorded; drop
+                    // any stale recorder tap so the encoder thread
+                    // exits cleanly (its forwarder sees a closed
+                    // channel and forwards a Stop).
+                    recorders.remove(&p);
+                    if active == Some(p) {
+                        active = None;
+                    }
+                }
+                Ok(SpeakerCmd::SetActive(p)) => {
+                    active = Some(p);
+                }
+                Ok(SpeakerCmd::AttachRecorder { program, tap }) => {
+                    // Last-writer-wins: inserting a new tap drops
+                    // any previous Sender for the same program, and
+                    // the old recorder thread's forwarder sees the
+                    // dropped channel → sends Stop → file flushes.
+                    recorders.insert(program, tap);
+                }
+                Ok(SpeakerCmd::DetachRecorder(p)) => {
+                    recorders.remove(&p);
+                }
+                Ok(SpeakerCmd::Stop) => return,
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => return,
+            }
+        }
+
+        // 2. If no rings registered, block on the command channel
+        // until there's work to do — saves the periodic wake-up when
+        // no stream is running.
+        if rings.is_empty() {
+            match cmd_rx.recv_timeout(Duration::from_secs(60)) {
+                Ok(SpeakerCmd::AddDecoder { program, ring }) => {
+                    rings.insert(program, ring);
+                }
+                Ok(SpeakerCmd::RemoveDecoder(p)) => {
+                    rings.remove(&p);
+                    recorders.remove(&p);
+                    if active == Some(p) {
+                        active = None;
+                    }
+                }
+                Ok(SpeakerCmd::SetActive(p)) => {
+                    active = Some(p);
+                }
+                Ok(SpeakerCmd::AttachRecorder { program, tap }) => {
+                    recorders.insert(program, tap);
+                }
+                Ok(SpeakerCmd::DetachRecorder(p)) => {
+                    recorders.remove(&p);
+                }
+                Ok(SpeakerCmd::Stop) => return,
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => return,
+            }
+            continue;
+        }
+
+        // 3. Drain every ring; forward only the active program's
+        // samples to the cpal sink, and (independently) clone
+        // anything we just drained into the recorder tap if one is
+        // attached for that program.
+        for (prog, ring) in rings.iter() {
+            ring.drain_into(&mut scratch);
+            if scratch.is_empty() {
+                continue;
+            }
+            if active == Some(*prog) {
+                sink.push(&scratch);
+            }
+            if let Some(tap) = recorders.get(prog) {
+                // Clone the scratch into a fresh Vec for the
+                // recorder thread. `try_send` so a backed-up
+                // encoder drops the tick instead of stalling the
+                // speaker path; if the channel is also full or
+                // disconnected we just drop the tick — either
+                // way the audio path stays unblocked.
+                if tap.try_send(scratch.clone()).is_err() {
+                    // No-op: full channel = lost tick (typ. ~5 ms),
+                    // disconnected = recorder thread already exited
+                    // and a future DetachRecorder will clean up.
+                }
+            }
+        }
+
+        std::thread::sleep(Duration::from_millis(ROUTER_TICK_MS));
+    }
+}

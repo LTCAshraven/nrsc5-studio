@@ -4,6 +4,100 @@ All notable changes to NRSC5 Studio are documented here. The format roughly
 follows [Keep a Changelog](https://keepachangelog.com/), and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.3.9] - 2026-05-26
+
+Recording release, plus the first Linux packages. Opus 96 kbps session
+recording is now a first-class feature: a Rec button on the Tuner
+dock, a one-knob "max minutes per file" rotation setting in Settings,
+and per-file Vorbis tags carrying station / subchannel / wall-clock
+metadata. The release also ships .deb and .rpm packages so Ubuntu /
+Debian and Fedora users get the same first-run experience Windows
+users have always had. A handful of UI polish items round out the
+release: the Constellation panel no longer drops "no lock" when you
+flip subchannels, the light-mode theme is readable instead of pastel,
+and recordings default into a folder next to the executable so the
+portable design stays portable end-to-end.
+
+### Added
+
+- **Opus 96 kbps session recording.** The Rec button on the Tuner
+  panel starts an Ogg/Opus capture of whatever subchannel is on the
+  speakers at the time the button was clicked. The recorder runs on
+  its own thread, never touches the cpal output path, and tolerates
+  arbitrary GUI lag without back-pressuring the SDR. The encoder
+  takes nrsc5's 44.1 kHz s16 stereo PCM, resamples to 48 kHz with a
+  high-quality sinc resampler, and writes 96 kbps VBR Opus to disk.
+- **Time-based file rotation.** Settings → Recording exposes a
+  `recording_max_minutes` knob (default 60, range 1..=240). When a
+  file reaches that duration, the recorder writes a clean Ogg EOS
+  page, opens a new file with a fresh wall-clock timestamp in its
+  name, and keeps the encoder + resampler state alive across the
+  boundary — no audible click at the seam. The user can also stop
+  recording manually at any time.
+- **Per-file Vorbis tags.** Each `.opus` file is tagged with
+  `ARTIST=<call sign>`, `ALBUM=<call sign> HD<N>`,
+  `TITLE=HD<N> recorded YYYY-MM-DD HH:MM:SS`, `DATE=YYYY-MM-DD`,
+  and `COMMENT=<frequency MHz> HD<N>`. VLC / foobar2000 / Rhythmbox
+  pick these up natively.
+- **Linux packages.** `.deb` (Ubuntu 22.04+, Debian 12+) and `.rpm`
+  (Fedora 38+) packages are now first-class release artifacts.
+  System dependencies (`libsoapysdr0.8`, `librtlsdr0`, `libasound2`
+  on Debian; `SoapySDR`, `rtl-sdr`, `alsa-lib` on Fedora) are
+  declared so `apt install ./nrsc5-studio_0.3.9_amd64.deb` and
+  `dnf install ./nrsc5-studio-0.3.9-1.x86_64.rpm` resolve them
+  automatically. `nrsc5` is declared as `Recommends:` on Debian
+  (not `Requires:`) because Fedora's default repos don't ship it;
+  the GUI surfaces a clear "nrsc5 not found on PATH" status if
+  the user hasn't installed it yet.
+- **Recordings folder defaults next to the executable.** The
+  default recording dir is now `<exe_dir>/recordings/` instead of
+  the user's Documents folder. Keeps the portable-first design
+  consistent: a USB-stick install owns its own captures, and an
+  installed run that points at a writable exe directory does the
+  same. Users can still override the path in Settings → Recording.
+
+### Changed
+
+- **App accent color is now theme-aware.** The previous soft blue
+  (RGB 100/160/255) was readable in dark mode but only reached
+  ~2.3:1 contrast on white, which fails WCAG-AA for body text and
+  made the "M.I.A." / "Eagle-FM" callouts and PSD/SIS headings
+  feel washed out in light mode. Light mode now uses a darker,
+  more saturated blue (RGB 28/100/210, ~5.5:1 contrast). Dark
+  mode is unchanged.
+- **Package description widened to "Windows and Linux"** to
+  reflect the new platform parity.
+
+### Fixed
+
+- **Constellation panel no longer drops "no lock" on subchannel
+  switch.** The panel was inferring sync state by string-matching
+  the transient `nrsc5_status` field, which gets clobbered to
+  `"switched to HD2"` when the user clicks another HD button. The
+  underlying demod is still locked the whole time. Now reads the
+  dedicated `currently_synced` flag, which is the real source of
+  truth (set by `NrscEvent::Sync` / `LostSync`).
+
+### Internal
+
+- **New module: `src/recorder/mod.rs`.** Owns the encoder thread
+  via `RecordingSession::spawn`. Outer/inner loop pattern keeps
+  one `ogg::PacketWriter` alive per file (required for Ogg page
+  sequence numbers) while sharing one Opus encoder + rubato
+  resampler across rotations.
+- **New PCM tap path.** `SpeakerRouter` now exposes
+  `AttachRecorder { program, tap }` and `DetachRecorder { program }`
+  commands. The audio thread fans out decoded PCM to both the cpal
+  output sink and (optionally) a per-program `crossbeam-channel`
+  feeding the recorder, so recording and listening can target
+  different subchannels independently.
+- **Linux packaging metadata.** `[package.metadata.deb]` and
+  `[package.metadata.generate-rpm]` sections in `Cargo.toml`
+  declare assets + runtime deps for `cargo-deb` and
+  `cargo-generate-rpm`. `scripts/build-linux-release.sh` runs
+  both tools end-to-end after `cargo build --release` on the
+  Linux host.
+
 ## [0.3.8] - 2026-05-25
 
 In-process audio release. `nrsc5.exe` is now invoked with `-o -` and

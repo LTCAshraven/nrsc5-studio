@@ -211,3 +211,117 @@ pub fn soapy_supported_count() -> Option<u32> {
         Err(_) => None,
     }
 }
+
+/// Coarse state of the Windows `SDRplayAPIService` SCM service.
+///
+/// The SDRplay API runs as a Windows service that the libSoapySDR
+/// `sdrplay` driver talks to on behalf of every client. When the
+/// service is stopped, `SoapySDRDevice_make("driver=sdrplay")` either
+/// hangs (waiting for the named pipe) or returns a confusing
+/// "device not found" error — and any *cached* enumeration result
+/// from when the service *was* running gets stale, so the app keeps
+/// thinking SDRplay is available.
+///
+/// Querying the service state is the cheap, reliable signal: an
+/// unprivileged user can call `OpenSCManager(SC_MANAGER_CONNECT)` +
+/// `OpenService(SERVICE_QUERY_STATUS)` (or, in our case, `sc.exe
+/// query`) without admin rights. Starting / stopping the service
+/// *would* need admin (`SERVICE_START` / `SERVICE_STOP`), so we
+/// don't try — we just surface the state so the user can flip it via
+/// Services.msc themselves.
+#[cfg(target_os = "windows")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SdrplayServiceState {
+    /// Service exists and is currently running. SDRplay-via-Soapy
+    /// should work.
+    Running,
+    /// Service exists and is fully stopped. SDRplay opens will fail
+    /// fast or hang; surface to the user with a "please start the
+    /// service" hint.
+    Stopped,
+    /// Service exists and is in the middle of starting or stopping.
+    /// Transient; the next probe tick should observe a settled state.
+    Pending,
+    /// Service exists but is in an unexpected state (paused, etc.).
+    /// Treat as not-running for UI purposes.
+    Other,
+}
+
+#[cfg(not(target_os = "windows"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SdrplayServiceState {
+    /// Placeholder so the type compiles on non-Windows targets. The
+    /// SDRplay API is Windows-only in practice; on Linux the probe
+    /// always returns `None`.
+    Running,
+    Stopped,
+    Pending,
+    Other,
+}
+
+/// Probe the Windows `SDRplayAPIService` state without elevation.
+///
+/// Returns:
+/// * `None` — the service isn't installed on this machine (no SDRplay
+///   API ever installed, or wiped). Treated as "SDRplay support not
+///   available"; the UI says nothing about it.
+/// * `Some(Running)` — green-light SDRplay enumeration / open.
+/// * `Some(Stopped | Pending | Other)` — SDRplay support is present
+///   but currently unusable. UI shows an actionable hint.
+///
+/// Implementation note: we shell out to `sc.exe query` (a stock
+/// Windows tool that ships in every supported SKU) rather than pull
+/// in `windows-sys` just for `OpenSCManager` / `QueryServiceStatus`.
+/// One subprocess per ~2 s probe tick is well within the budget and
+/// avoids growing the dependency graph. `CREATE_NO_WINDOW` keeps the
+/// transient console invisible.
+#[cfg(target_os = "windows")]
+pub fn sdrplay_service_state() -> Option<SdrplayServiceState> {
+    use std::os::windows::process::CommandExt;
+    use std::process::Command;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    const SDRPLAY_SERVICE_NAME: &str = "SDRplayAPIService";
+    let out = Command::new("sc.exe")
+        .args(["query", SDRPLAY_SERVICE_NAME])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        // sc returns exit 1060 ("service does not exist") when the
+        // service isn't installed. Treat any non-success as "no
+        // SDRplay API installed" — we don't want to surface false
+        // positives.
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for line in stdout.lines() {
+        // The line we want looks like:
+        //   "        STATE              : 4  RUNNING"
+        // Match on the "STATE" key (LHS of the first colon) so we
+        // don't confuse it with other lines that happen to contain
+        // the word.
+        let trimmed = line.trim_start();
+        if let Some(idx) = trimmed.find(':') {
+            if trimmed[..idx].trim_end() != "STATE" {
+                continue;
+            }
+            let rhs = trimmed[idx + 1..].trim();
+            // RHS is e.g. "4  RUNNING" — the second whitespace token
+            // is the human-readable state word.
+            let word = rhs.split_whitespace().nth(1).unwrap_or("");
+            return Some(match word {
+                "RUNNING" => SdrplayServiceState::Running,
+                "STOPPED" => SdrplayServiceState::Stopped,
+                "START_PENDING" | "STOP_PENDING" => SdrplayServiceState::Pending,
+                _ => SdrplayServiceState::Other,
+            });
+        }
+    }
+    None
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn sdrplay_service_state() -> Option<SdrplayServiceState> {
+    // SDRplay API is Windows-only; no analog on Linux/macOS.
+    None
+}

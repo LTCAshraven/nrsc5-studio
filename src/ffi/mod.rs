@@ -10,7 +10,10 @@ use thiserror::Error;
 use crate::config::GainMode;
 use crate::dsp::{AgcConfig, AgcController, AgcSnapshot};
 use crate::sdr::profile::DeviceProfile;
-use crate::sdr::{Sdr, SdrConfig, SdrError, StreamControl};
+use crate::sdr::{IqBus, Sdr, SdrConfig, SdrError, StreamControl};
+
+mod decoder;
+use decoder::DecoderInstance;
 
 // -- Events -----------------------------------------------------------
 
@@ -58,12 +61,20 @@ pub enum NrscEvent {
     },
     /// LOT file received. `lot` is the LOT ID, `name` is the filename
     /// written to the AAS directory (e.g. "42_cover.jpg").
+    /// `program` is the HD subchannel whose decoder produced this
+    /// event — stamped by `parse_stderr` from the per-child context.
+    /// Used by the multi-decoder routing layer to attribute album art
+    /// and station logo updates to the correct `programs[]` slot.
     LotFile {
+        program: u32,
         lot: String,
         name: String,
     },
     /// XHDR event — param 0 = cover art, param 1 = station logo.
+    /// `program` is the HD subchannel whose decoder produced this
+    /// event; same routing role as on `LotFile`.
     Xhdr {
+        program: u32,
         param: u32,
         lot: String,
     },
@@ -158,6 +169,15 @@ impl NrscEvent {
 
 // -- Errors -----------------------------------------------------------
 
+/// Hard cap on the number of concurrently-running decoders against
+/// one shared SDR pipeline. Each decoder is a full nrsc5.exe child
+/// process plus three pump threads, so the cost scales linearly;
+/// eight covers every HD Radio station's advertised program count
+/// (HD1–HD8) with a margin of safety. Default streaming behavior is
+/// single-decoder; the user opts in to extras via the per-program
+/// decode toggle in the HD grid.
+pub const MAX_DECODERS: usize = 8;
+
 #[derive(Debug, Error)]
 pub enum Nrsc5Error {
     #[error("nrsc5.exe not found at any known location")]
@@ -166,6 +186,23 @@ pub enum Nrsc5Error {
     Spawn(std::io::Error),
     #[error("SDR backend error: {0}")]
     Sdr(#[from] SdrError),
+    /// `add_decoder` / `set_active_speaker` called before any
+    /// `start_piped` succeeded. The shared SDR + IqBus pipeline
+    /// must be running before per-program decoders can be added.
+    #[error("no piped session is active (call start_piped first)")]
+    NotStarted,
+    /// `add_decoder(program)` called for a program that's already
+    /// being decoded. Idempotent failure — nothing was changed.
+    #[error("program {0} is already being decoded")]
+    DecoderAlreadyActive(u32),
+    /// `add_decoder` called when [`MAX_DECODERS`] are already
+    /// running. Tear one down before adding another.
+    #[error("decoder cap reached ({0} of {1})")]
+    DecoderCapReached(usize, usize),
+    /// `set_active_speaker(program)` referenced a program that
+    /// isn't being decoded. The speaker selection is unchanged.
+    #[error("no decoder is running for program {0}")]
+    NoSuchDecoder(u32),
 }
 
 // -- Process Backend --------------------------------------------------
@@ -181,19 +218,30 @@ enum LastStartMode {
 }
 
 pub struct Nrsc5Process {
-    child: Option<Child>,
-    stderr_thread: Option<JoinHandle<()>>,
-    /// I/Q pump thread for the piped-SDR path. `Some` only while a
-    /// piped Start is active; cleared by `stop`. Owns `nrsc5.exe`'s
-    /// `ChildStdin` directly so dropping the thread closes the pipe
-    /// (sending EOF to nrsc5).
+    /// Active decoders for the current piped session (and the single
+    /// entry for the legacy USB / rtl_tcp paths). Empty between
+    /// `stop()` and the next `start*` call. Phase 3 Chunk 3 turned
+    /// this into a `Vec` so multiple HD programs can be decoded in
+    /// parallel against the same SDR pipeline; the public
+    /// `add_decoder` / `remove_decoder` / `set_active_speaker` API
+    /// arrived in the same chunk. Capped at [`MAX_DECODERS`].
+    decoders: Vec<DecoderInstance>,
+    /// I/Q **source** pump thread for the piped-SDR path. `Some`
+    /// only while a piped Start is active; cleared by `stop`. Runs
+    /// `sdr.run_stream`, feeds the spectrum tap, and publishes each
+    /// raw I/Q payload onto `iq_bus`. Phase 2 of the 0.4.0 audio-path
+    /// refactor split the previous single-thread "read SDR + write to
+    /// nrsc5 stdin" loop into producer (this thread) and one or more
+    /// consumers (`stdin_thread` below; per-program decoders in
+    /// Phase 3).
     iq_thread: Option<JoinHandle<()>>,
-    /// PCM pump thread for the piped-SDR path. `Some` only while a
-    /// piped Start is active; cleared by `stop`. Reads s16le 44.1 kHz
-    /// stereo PCM from `nrsc5.exe`'s stdout (started with `-o -`) and
-    /// pushes it into the shared `AudioSink`. Exits cleanly on stdout
-    /// EOF (i.e. when the child dies or is killed).
-    pcm_thread: Option<JoinHandle<()>>,
+    /// Fan-out bus that carries raw I/Q payloads from `iq_thread`
+    /// (the one producer) to the nrsc5 stdin pump (Phase 2's single
+    /// consumer) and, in Phase 3, to per-program decoder instances.
+    /// `Some` only while a piped Start is active; reset by `stop`
+    /// (we build a fresh bus on every `start_piped` so there is no
+    /// stale state to migrate across stream sessions).
+    iq_bus: Option<Arc<IqBus>>,
     /// Optional clone-cheap audio sink installed by the app at
     /// startup (via `set_audio_sink`). When `Some`, `start_piped`
     /// will request PCM on stdout from `nrsc5.exe` (`-o -`) and feed
@@ -201,6 +249,18 @@ pub struct Nrsc5Process {
     /// `Stdio::null()` for stdout (audio is silently discarded —
     /// useful for headless testing).
     audio_sink: Option<crate::audio::AudioSink>,
+    /// Long-lived speaker-routing thread spawned when an audio sink
+    /// is installed. Receives per-decoder PCM rings via its command
+    /// channel and forwards the active program's samples into the
+    /// cpal sink. `None` in headless builds where no sink is wired.
+    /// Phase 3 Chunk 2 wires this in for the single-decoder case;
+    /// Chunk 3 makes `Nrsc5Process` a true multiplexer on top of it.
+    speaker_router: Option<crate::audio::SpeakerRouter>,
+    /// Program number whose decoded PCM is currently routed to the
+    /// speakers. `Some` between `start_piped` and `stop`; `None`
+    /// otherwise. Kept in sync with the router's own `active` state
+    /// by sending `SpeakerCmd::SetActive` whenever this changes.
+    active_speaker: Option<u32>,
     /// SDR backend for the active piped stream. `Some` between
     /// `start_piped` and `stop`; `None` otherwise.
     ///
@@ -365,11 +425,12 @@ impl Nrsc5Process {
         let aas_dir = crate::paths::aas_temp_dir();
         let _ = std::fs::create_dir_all(&aas_dir);
         Ok(Self {
-            child: None,
-            stderr_thread: None,
+            decoders: Vec::new(),
             iq_thread: None,
-            pcm_thread: None,
+            iq_bus: None,
             audio_sink: None,
+            speaker_router: None,
+            active_speaker: None,
             sdr: None,
             last_mode: None,
             spectrum_tap: None,
@@ -402,8 +463,318 @@ impl Nrsc5Process {
     /// Only the piped path emits PCM through this sink — the legacy
     /// `start()` (USB direct) and `start_rtltcp()` paths still let
     /// `nrsc5.exe` drive libao itself.
+    ///
+    /// Also spawns the long-lived `SpeakerRouter` thread that drains
+    /// per-decoder PCM rings into this sink. If a sink was previously
+    /// installed, the prior router is shut down before the new one is
+    /// spawned so we never have two routers competing for the sink.
     pub fn set_audio_sink(&mut self, sink: crate::audio::AudioSink) {
+        // Shut down any pre-existing router first; safe even when
+        // mid-stream because the router only forwards samples — the
+        // decoder rings stay alive on the live `DecoderInstance` and
+        // the new router will pick them up via fresh `AddDecoder`
+        // commands on the next `start_piped`.
+        if let Some(mut prev) = self.speaker_router.take() {
+            prev.shutdown();
+        }
+        self.speaker_router = Some(crate::audio::SpeakerRouter::spawn(sink.clone()));
         self.audio_sink = Some(sink);
+    }
+
+    // ---------------------------------------------------------------
+    // Multi-decoder API (Phase 3 Chunk 3)
+    //
+    // `start_piped` brings up the shared SDR + IqBus + speaker router
+    // and spawns the first decoder. Callers can then add up to
+    // [`MAX_DECODERS`] additional decoders against the same SDR via
+    // `add_decoder`, switch which one is audible via
+    // `set_active_speaker`, and tear individual ones down via
+    // `remove_decoder`. `stop()` always tears down everything.
+    //
+    // The legacy USB and rtl_tcp paths (`start` / `start_rtltcp`) are
+    // single-decoder only; calling `add_decoder` against them returns
+    // `Nrsc5Error::NotStarted` because there's no IqBus to subscribe
+    // a new decoder to.
+    // ---------------------------------------------------------------
+
+    /// Programs currently being decoded, in spawn order. Cheap; the
+    /// returned Vec is freshly allocated and owned by the caller. The
+    /// GUI calls this every frame to drive the HD1-HD8 grid's
+    /// "decoded" indicators.
+    pub fn decoded_programs(&self) -> Vec<u32> {
+        self.decoders.iter().map(|d| d.program).collect()
+    }
+
+    /// Whether `program` is currently being decoded against the
+    /// shared SDR pipeline. O(N) over the small `decoders` vec
+    /// (capped at [`MAX_DECODERS`]).
+    pub fn is_decoding(&self, program: u32) -> bool {
+        self.decoders.iter().any(|d| d.program == program)
+    }
+
+    /// Program whose decoded PCM is currently routed to the
+    /// speakers, or `None` when no piped session is active.
+    pub fn active_speaker(&self) -> Option<u32> {
+        self.active_speaker
+    }
+
+    /// Spawn an additional decoder for `program` against the
+    /// currently-running shared SDR pipeline. The decoder subscribes
+    /// to the IqBus, gets its own PCM ring registered with the
+    /// speaker router, and starts producing events on the shared
+    /// `events()` channel just like the first decoder did.
+    ///
+    /// Does **not** change the active speaker — call
+    /// `set_active_speaker(program)` afterwards to listen to it. The
+    /// new decoder runs silently in the background until then; its
+    /// PCM ring is drained-and-discarded by the router, which keeps
+    /// CPU steady but doesn't ship samples to the cpal sink.
+    ///
+    /// Errors:
+    /// * [`Nrsc5Error::NotStarted`] — no piped session is active.
+    /// * [`Nrsc5Error::DecoderAlreadyActive`] — `program` is already
+    ///   being decoded; idempotent (no state changed).
+    /// * [`Nrsc5Error::DecoderCapReached`] — already at
+    ///   [`MAX_DECODERS`]; tear one down first.
+    /// * [`Nrsc5Error::Spawn`] — failed to spawn nrsc5.exe.
+    pub fn add_decoder(&mut self, program: u32) -> Result<(), Nrsc5Error> {
+        // Validate the shared pipeline is up and we have headroom.
+        if self.iq_bus.is_none() {
+            return Err(Nrsc5Error::NotStarted);
+        }
+        if self.is_decoding(program) {
+            return Err(Nrsc5Error::DecoderAlreadyActive(program));
+        }
+        if self.decoders.len() >= MAX_DECODERS {
+            return Err(Nrsc5Error::DecoderCapReached(
+                self.decoders.len(),
+                MAX_DECODERS,
+            ));
+        }
+
+        // Build the nrsc5 child. Mirrors `start_piped`'s argv exactly
+        // except this isn't the first decoder, so we don't reset the
+        // cpal queue (would interrupt the currently-playing decoder).
+        let have_sink = self.audio_sink.is_some();
+        let mut cmd = Command::new(&self.exe_path);
+        cmd.arg("-l").arg("1");
+        cmd.arg("-r").arg("-");
+        if have_sink {
+            cmd.arg("-o").arg("-");
+        }
+        cmd.arg("--dump-aas-files").arg(&self.aas_dir);
+        cmd.arg(program.to_string());
+        cmd.stdin(Stdio::piped());
+        if have_sink {
+            cmd.stdout(Stdio::piped());
+        } else {
+            cmd.stdout(Stdio::null());
+        }
+        cmd.stderr(Stdio::piped());
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        }
+
+        let mut child = cmd.spawn().map_err(Nrsc5Error::Spawn)?;
+        let mut child_stdin = child.stdin.take().expect("stdin was piped");
+        let stderr = child.stderr.take().expect("stderr was piped");
+        let child_stdout = if have_sink {
+            Some(child.stdout.take().expect("stdout was piped when sink installed"))
+        } else {
+            None
+        };
+
+        // stderr pump. Additional decoders do NOT drive the AGC
+        // controller — only the first decoder spawned by
+        // `start_piped` gets that responsibility. See the
+        // `agc_stderr_handle` plumbing in `start_piped`.
+        let stderr_tx = self.tx.clone();
+        let stderr_thread = std::thread::spawn(move || {
+            parse_stderr(stderr, stderr_tx, program, None);
+        });
+
+        // I/Q stdin pump. Subscribes its own receiver on the shared
+        // bus; the bus's prune-on-Disconnected logic in
+        // `IqBus::publish` cleans up automatically when the receiver
+        // drops at thread exit.
+        let bus = self.iq_bus.as_ref().expect("iq_bus is_some, checked above");
+        let stdin_rx = bus.subscribe(64);
+        let stdin_thread = std::thread::spawn(move || {
+            while let Ok(payload) = stdin_rx.recv() {
+                if child_stdin.write_all(&payload).is_err() {
+                    break;
+                }
+            }
+            drop(child_stdin);
+        });
+
+        // PCM ring + pump (identical to start_piped's pcm_pump body).
+        let pcm_ring: Option<Arc<crate::audio::PcmRing>> = match (child_stdout.is_some(), have_sink) {
+            (true, true) => Some(Arc::new(crate::audio::PcmRing::new())),
+            _ => None,
+        };
+        let pcm_thread = match (child_stdout, pcm_ring.clone()) {
+            (Some(mut stdout), Some(ring)) => {
+                let exit_tx = self.tx.clone();
+                let ring_for_thread = Arc::clone(&ring);
+                let handle = std::thread::spawn(move || {
+                    use std::io::Read;
+                    const BYTES_PER_READ: usize = 2048;
+                    let mut byte_buf = [0u8; BYTES_PER_READ];
+                    let mut sample_buf: Vec<i16> = Vec::with_capacity(BYTES_PER_READ / 2);
+                    loop {
+                        match stdout.read(&mut byte_buf) {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                let pair_count = n / 2;
+                                sample_buf.clear();
+                                sample_buf.reserve(pair_count);
+                                for chunk in byte_buf[..pair_count * 2].chunks_exact(2) {
+                                    sample_buf.push(i16::from_le_bytes([chunk[0], chunk[1]]));
+                                }
+                                ring_for_thread.push(&sample_buf);
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    let _ = exit_tx.send(NrscEvent::ChildExited);
+                });
+                Some(handle)
+            }
+            _ => None,
+        };
+
+        // Register the new ring with the router. Do NOT auto-activate
+        // it as speaker — caller decides via `set_active_speaker`.
+        if let (Some(router), Some(ring)) =
+            (self.speaker_router.as_ref(), pcm_ring.as_ref())
+        {
+            let _ = router.cmd_tx().send(crate::audio::SpeakerCmd::AddDecoder {
+                program,
+                ring: Arc::clone(ring),
+            });
+        }
+
+        self.decoders.push(DecoderInstance {
+            program,
+            child,
+            stderr_thread,
+            stdin_thread: Some(stdin_thread),
+            pcm_thread,
+            pcm_ring,
+        });
+        Ok(())
+    }
+
+    /// Tear down the decoder for `program`. Idempotent — returns
+    /// `false` when no decoder was running for that program.
+    ///
+    /// If the removed decoder was the active speaker, the speaker
+    /// goes silent until the next `set_active_speaker` call. The
+    /// shared SDR pipeline stays running; call `stop()` for a full
+    /// teardown.
+    pub fn remove_decoder(&mut self, program: u32) -> bool {
+        let Some(idx) = self.decoders.iter().position(|d| d.program == program) else {
+            return false;
+        };
+        let DecoderInstance {
+            program,
+            mut child,
+            stderr_thread,
+            stdin_thread,
+            pcm_thread,
+            pcm_ring,
+        } = self.decoders.remove(idx);
+
+        // Same teardown order as `stop()`: detach router → kill child
+        // → join threads. The IqBus subscriber is owned by
+        // `stdin_thread`; killing the child causes BrokenPipe on the
+        // next write, which exits the loop and drops the Receiver.
+        // The bus's `publish` prune logic removes the subscriber on
+        // its next call.
+        if let Some(router) = self.speaker_router.as_ref() {
+            let _ = router
+                .cmd_tx()
+                .send(crate::audio::SpeakerCmd::RemoveDecoder(program));
+        }
+        if Some(program) == self.active_speaker {
+            self.active_speaker = None;
+        }
+        let _ = pcm_ring;
+        let _ = child.kill();
+        let _ = child.wait();
+        if let Some(handle) = stdin_thread {
+            let _ = handle.join();
+        }
+        if let Some(handle) = pcm_thread {
+            let _ = handle.join();
+        }
+        let _ = stderr_thread.join();
+        true
+    }
+
+    /// Route `program`'s decoded PCM to the speakers. The previous
+    /// active speaker (if any) stays decoding in the background —
+    /// its ring is drained-and-discarded by the router. Returns
+    /// `NoSuchDecoder` if `program` isn't currently being decoded.
+    pub fn set_active_speaker(&mut self, program: u32) -> Result<(), Nrsc5Error> {
+        if !self.is_decoding(program) {
+            return Err(Nrsc5Error::NoSuchDecoder(program));
+        }
+        if let Some(router) = self.speaker_router.as_ref() {
+            let _ = router
+                .cmd_tx()
+                .send(crate::audio::SpeakerCmd::SetActive(program));
+        }
+        // Clear the cpal queue so the transition is immediate
+        // rather than playing through whatever 100-200 ms of the
+        // previous program is still buffered.
+        if let Some(sink) = self.audio_sink.as_ref() {
+            sink.clear();
+        }
+        self.active_speaker = Some(program);
+        Ok(())
+    }
+
+    /// Attach an Opus recorder tap to `program`'s PCM stream. The
+    /// recorder receives a clone of every chunk the `SpeakerRouter`
+    /// drains from `program`'s ring, independent of which subchannel
+    /// is currently on the speakers — so the user can listen to HD2
+    /// while recording HD1, or vice versa. Returns `NoSuchDecoder` if
+    /// `program` isn't currently being decoded (a recorder against a
+    /// dead decoder would just produce a zero-byte file). The tap is
+    /// last-writer-wins: attaching twice to the same program drops
+    /// the previous recorder cleanly (its forwarder sees the closed
+    /// channel and flushes the file).
+    pub fn attach_recorder(
+        &mut self,
+        program: u32,
+        tap: crossbeam_channel::Sender<Vec<i16>>,
+    ) -> Result<(), Nrsc5Error> {
+        if !self.is_decoding(program) {
+            return Err(Nrsc5Error::NoSuchDecoder(program));
+        }
+        if let Some(router) = self.speaker_router.as_ref() {
+            let _ = router
+                .cmd_tx()
+                .send(crate::audio::SpeakerCmd::AttachRecorder { program, tap });
+        }
+        Ok(())
+    }
+
+    /// Detach the Opus recorder tap (if any) from `program`. After
+    /// this returns the recorder thread sees a closed forwarder
+    /// channel, sends itself a Stop, encodes any leftover frames,
+    /// and writes the Ogg EOS page. Idempotent — safe to call when
+    /// no tap is attached.
+    pub fn detach_recorder(&mut self, program: u32) {
+        if let Some(router) = self.speaker_router.as_ref() {
+            let _ = router
+                .cmd_tx()
+                .send(crate::audio::SpeakerCmd::DetachRecorder(program));
+        }
     }
 
     /// Read-only snapshot of the closed-loop AGC controller for the UI.
@@ -481,8 +852,14 @@ impl Nrsc5Process {
     }
 
     /// PID of the running nrsc5 process, or `None` if not running.
+    /// In Phase 3 Chunk 3+ this will return the active speaker's PID
+    /// when multiple decoders are running; for now there's at most one.
     pub fn pid(&self) -> Option<u32> {
-        self.child.as_ref().map(|c| c.id())
+        // Multi-decoder: return the first running decoder's PID. The
+        // GUI displays this in the status bar; with multi-decode
+        // active, callers that want a specific program should iterate
+        // `decoded_programs()` and look up each `Child::id` themselves.
+        self.decoders.first().map(|d| d.child.id())
     }
 
     /// Start the nrsc5 process.
@@ -522,8 +899,14 @@ impl Nrsc5Process {
             parse_stderr(stderr, tx, program, None);
         });
 
-        self.child = Some(child);
-        self.stderr_thread = Some(stderr_thread);
+        self.decoders.push(DecoderInstance {
+            program,
+            child,
+            stderr_thread,
+            stdin_thread: None,
+            pcm_thread: None,
+            pcm_ring: None,
+        });
         self.last_mode = Some(LastStartMode::Usb);
         Ok(())
     }
@@ -562,8 +945,14 @@ impl Nrsc5Process {
             parse_stderr(stderr, tx, program, None);
         });
 
-        self.child = Some(child);
-        self.stderr_thread = Some(stderr_thread);
+        self.decoders.push(DecoderInstance {
+            program,
+            child,
+            stderr_thread,
+            stdin_thread: None,
+            pcm_thread: None,
+            pcm_ring: None,
+        });
         self.last_mode = Some(LastStartMode::RtlTcp {
             host: host.to_string(),
             port,
@@ -747,12 +1136,40 @@ impl Nrsc5Process {
             parse_stderr(stderr, stderr_tx, program, agc_stderr_handle);
         });
 
-        // I/Q pump. Owns the SDR (via Arc clone) and `child_stdin`
-        // directly, so dropping the thread closes the pipe and sends
-        // EOF to nrsc5. The callback returns `Stop` on the first write
-        // error (BrokenPipe = nrsc5 exited), which makes `run_stream`
-        // return cleanly.
+        // I/Q fan-out bus (Phase 2 of the 0.4.0 audio-path refactor).
+        // One producer (this method's SDR pump thread), one consumer
+        // today (the stdin pump below). Phase 3 will subscribe one
+        // additional consumer per HD program. Capacity 64 ≈ 100 ms of
+        // buffer at 1.488 Msps CS16 in ~4 KB chunks — enough to
+        // absorb consumer scheduling jitter without back-pressuring
+        // the SDR.
+        let bus = Arc::new(IqBus::new());
+        let stdin_rx = bus.subscribe(64);
+
+        // nrsc5 stdin pump. Subscribes to the bus, writes each
+        // payload to the child's stdin. Exits when the bus
+        // disconnects (SDR pump shutdown) or when stdin breaks (child
+        // died). Drops `ChildStdin` on exit so nrsc5 gets EOF
+        // immediately.
+        let stdin_thread = std::thread::spawn(move || {
+            while let Ok(payload) = stdin_rx.recv() {
+                if child_stdin.write_all(&payload).is_err() {
+                    // BrokenPipe: child is gone. The pcm_pump will
+                    // independently observe stdout EOF and emit
+                    // `ChildExited` to the app, which calls `stop()`.
+                    break;
+                }
+            }
+            drop(child_stdin);
+        });
+
+        // I/Q source pump. Runs `run_stream`, feeds the spectrum tap,
+        // and publishes raw bytes onto the bus. On exit (clean
+        // cancel, USB unplug, etc.) calls `bus.shutdown()` so every
+        // subscriber (the stdin pump above, plus any Phase 3
+        // decoders) sees `Disconnected` on `recv` and exits cleanly.
         let sdr_for_thread: Arc<dyn Sdr> = Arc::clone(&sdr);
+        let bus_for_sdr = Arc::clone(&bus);
         let evt_tx = self.tx.clone();
         // Optional FFT tap clone for the Spectrum panel. `None` when the
         // GUI side hasn't installed one (e.g. headless test builds).
@@ -761,33 +1178,28 @@ impl Nrsc5Process {
             tap.set_center_freq_hz((frequency_mhz as f64) * 1_000_000.0);
         }
         let iq_thread = std::thread::spawn(move || {
-            let mut write_err_seen = false;
             let run_res = sdr_for_thread.run_stream(&mut |bytes| {
                 // Spectrum tap first — it's cheap (and internally
                 // throttled) and we want the panel to keep updating
-                // even if the nrsc5 stdin write below blocks briefly.
+                // regardless of any consumer back-pressure on the bus.
                 if let Some(tap) = spectrum_tap.as_ref() {
                     tap.feed(bytes);
                 }
-                if write_err_seen {
-                    return StreamControl::Stop;
-                }
-                match child_stdin.write_all(bytes) {
-                    Ok(()) => StreamControl::Continue,
-                    Err(_) => {
-                        write_err_seen = true;
-                        StreamControl::Stop
-                    }
-                }
+                // Non-blocking publish. Slow / dead subscribers are
+                // handled inside the bus (drop payload on Full, prune
+                // on Disconnected). The SDR pump itself never blocks.
+                bus_for_sdr.publish(bytes);
+                StreamControl::Continue
             });
-            // Drop child_stdin explicitly so nrsc5 gets EOF the moment
-            // we leave the stream loop (rather than at thread teardown).
-            drop(child_stdin);
+            // Tear down every subscriber so the stdin pump (and any
+            // Phase 3 decoders) wake from their blocking `recv` with
+            // `Err(RecvError)` and exit. Idempotent; safe even if a
+            // subscriber already pruned itself via BrokenPipe.
+            bus_for_sdr.shutdown();
             // `run_stream` returns Err on real backend failure (e.g.
             // USB unplugged). A user-initiated Stop trips the cancel
             // flag, which the rtl backend translates to Ok per
-            // `stop_flag` discriminator in `src/sdr/rtl.rs`. A clean
-            // BrokenPipe-driven exit (write_err_seen) also returns Ok.
+            // `stop_flag` discriminator in `src/sdr/rtl.rs`.
             if let Err(e) = &run_res {
                 // Surface the real Soapy error on stderr so a user
                 // hitting "device lost" can see whether it was a
@@ -802,20 +1214,35 @@ impl Nrsc5Process {
 
         // ----- PCM pump (only when an audio sink is installed) -----
         // Reads interleaved s16 LE 44.1 kHz stereo from `nrsc5.exe`'s
-        // stdout in ~10 ms chunks and pushes them into the shared
-        // playback queue via the cloned sink. Exits cleanly on
-        // EOF (child died / killed / closed stdout). Allocation-free
-        // hot path: one fixed scratch buffer reused for every read.
+        // stdout in ~10 ms chunks and pushes them into this decoder's
+        // private `PcmRing`. The shared `SpeakerRouter` thread (spawned
+        // in `set_audio_sink`) drains the ring on its own polling tick
+        // and forwards samples to the cpal `AudioSink` only when this
+        // decoder is the active speaker. Phase 3 Chunk 2 wires the
+        // routing through one ring; Chunk 3 expands to N rings.
+        //
+        // Exits cleanly on EOF (child died / killed / closed stdout).
+        // Allocation-free hot path: one fixed scratch buffer reused
+        // for every read.
         //
         // On exit (any cause — EOF, BrokenPipe, real I/O error) the
         // thread emits a `ChildExited` event so the app can detect a
         // dead child without polling `Child::try_wait` every frame.
-        let pcm_thread = match (child_stdout, self.audio_sink.clone()) {
-            (Some(mut stdout), Some(sink)) => {
-                // Make sure we don't carry over PCM from a previous
-                // stream session into the speakers.
+        let pcm_ring: Option<Arc<crate::audio::PcmRing>> =
+            match (child_stdout.is_some(), self.audio_sink.is_some()) {
+                (true, true) => Some(Arc::new(crate::audio::PcmRing::new())),
+                _ => None,
+            };
+        let pcm_thread = match (child_stdout, self.audio_sink.clone(), pcm_ring.clone()) {
+            (Some(mut stdout), Some(sink), Some(ring)) => {
+                // Drop anything currently queued in the cpal sink so
+                // the next Start doesn't replay stale audio from the
+                // previous session. The router-owned per-decoder ring
+                // is brand new (just allocated above), so it starts
+                // empty by construction.
                 sink.clear();
                 let exit_tx = self.tx.clone();
+                let ring_for_thread = Arc::clone(&ring);
                 let handle = std::thread::spawn(move || {
                     use std::io::Read;
                     // 2048 bytes = 1024 s16 samples = 512 stereo
@@ -843,7 +1270,7 @@ impl Nrsc5Process {
                                 for chunk in byte_buf[..pair_count * 2].chunks_exact(2) {
                                     sample_buf.push(i16::from_le_bytes([chunk[0], chunk[1]]));
                                 }
-                                sink.push(&sample_buf);
+                                ring_for_thread.push(&sample_buf);
                             }
                             Err(e) => {
                                 // Genuine I/O error. Most commonly
@@ -866,10 +1293,31 @@ impl Nrsc5Process {
             _ => None,
         };
 
-        self.child = Some(child);
-        self.stderr_thread = Some(stderr_thread);
+        // Hand the new ring to the router and make this decoder the
+        // active speaker. Both commands are sent over the long-lived
+        // command channel set up in `set_audio_sink`; the router
+        // applies them on its next tick. Skipped when no audio sink
+        // is installed (no router, no ring).
+        if let (Some(router), Some(ring)) = (self.speaker_router.as_ref(), pcm_ring.as_ref()) {
+            let tx = router.cmd_tx();
+            let _ = tx.send(crate::audio::SpeakerCmd::AddDecoder {
+                program,
+                ring: Arc::clone(ring),
+            });
+            let _ = tx.send(crate::audio::SpeakerCmd::SetActive(program));
+            self.active_speaker = Some(program);
+        }
+
+        self.decoders.push(DecoderInstance {
+            program,
+            child,
+            stderr_thread,
+            stdin_thread: Some(stdin_thread),
+            pcm_thread,
+            pcm_ring,
+        });
         self.iq_thread = Some(iq_thread);
-        self.pcm_thread = pcm_thread;
+        self.iq_bus = Some(bus);
         self.sdr = Some(sdr);
         self.last_mode = Some(LastStartMode::Piped);
         self.last_gain_mode = Some(gain_mode);
@@ -963,30 +1411,83 @@ impl Nrsc5Process {
         if let Some(handle) = self.agc_thread.take() {
             let _ = handle.join();
         }
-        // Join the I/Q pump first so its `ChildStdin` is released
-        // before we try to wait on the child (avoids a deadlock where
-        // nrsc5 is mid-write but stdin is still held open by our thread).
+        // Join the I/Q source pump first. `cancel_stream` above made
+        // `run_stream` return; on exit the source thread already
+        // called `bus.shutdown()`, which drops every subscriber's
+        // `Sender` — so the stdin pump (joined next) and any Phase 3
+        // decoders will wake from `recv` with `Err(RecvError)`.
         if let Some(handle) = self.iq_thread.take() {
             let _ = handle.join();
         }
-        // Kill the nrsc5 child as a belt-and-suspenders backstop in
-        // case it didn't exit on its own from EOF.
-        if let Some(mut child) = self.child.take() {
+        // Tear down every running decoder. For Chunk 3 there can be
+        // more than one (the user may have opted in to extras via
+        // `add_decoder`). The teardown order per decoder matches the
+        // single-instance flow: detach from the speaker router →
+        // join stdin pump → kill child → join pcm pump → join
+        // stderr pump.
+        //
+        // The shared SDR pump above has already called
+        // `bus.shutdown()`, so every decoder's stdin pump has
+        // already woken from its blocking `recv` and exited. The
+        // joins below are therefore fast (microseconds).
+        let drained: Vec<DecoderInstance> = self.decoders.drain(..).collect();
+        let any_decoder = !drained.is_empty();
+        for decoder in drained {
+            let DecoderInstance {
+                program,
+                mut child,
+                stderr_thread,
+                stdin_thread,
+                pcm_thread,
+                pcm_ring,
+            } = decoder;
+            // Detach this program's ring from the speaker router so
+            // the router stops draining (and forwarding) samples
+            // from a soon-to-be-dead child. Idempotent on the
+            // router's side. The ring itself is dropped when
+            // `pcm_ring` goes out of scope at the end of this block.
+            if let Some(router) = self.speaker_router.as_ref() {
+                let _ = router.cmd_tx().send(
+                    crate::audio::SpeakerCmd::RemoveDecoder(program),
+                );
+            }
+            if Some(program) == self.active_speaker {
+                self.active_speaker = None;
+            }
+            let _ = pcm_ring;
+            // Join the nrsc5 stdin pump. By this point its bus
+            // receiver is disconnected (the source thread above
+            // already called `bus.shutdown`), so it has exited its
+            // `recv -> write_all` loop and dropped `ChildStdin`,
+            // sending EOF to nrsc5. `None` on legacy USB / rtl_tcp.
+            if let Some(handle) = stdin_thread {
+                let _ = handle.join();
+            }
+            // Kill the nrsc5 child as a belt-and-suspenders backstop
+            // in case it didn't exit on its own from EOF.
             let _ = child.kill();
             let _ = child.wait();
+            // Now that the child is dead, its stdout has closed and
+            // the pcm_pump's read loop has returned EOF. Joining is
+            // fast. `None` when no audio sink is installed or on the
+            // legacy USB / rtl_tcp paths.
+            if let Some(handle) = pcm_thread {
+                let _ = handle.join();
+            }
+            let _ = stderr_thread.join();
         }
-        // Now that the child is dead, its stdout has closed and the
-        // pcm_pump's read loop has returned EOF. Joining is fast.
-        if let Some(handle) = self.pcm_thread.take() {
-            let _ = handle.join();
-        }
-        // Discard any PCM still sitting in the queue so the next
-        // Start doesn't replay a fraction of a second of stale audio.
-        if let Some(sink) = self.audio_sink.as_ref() {
-            sink.clear();
-        }
-        if let Some(handle) = self.stderr_thread.take() {
-            let _ = handle.join();
+        // Bus is single-use per stream — drop it so a stale
+        // reference isn't carried into the next `start_piped`
+        // (which builds a fresh bus).
+        self.iq_bus = None;
+        // Discard any PCM still sitting in the cpal queue so the
+        // next Start doesn't replay a fraction of a second of stale
+        // audio. The per-decoder rings are dropped above when their
+        // `pcm_ring` Arcs go out of scope.
+        if any_decoder {
+            if let Some(sink) = self.audio_sink.as_ref() {
+                sink.clear();
+            }
         }
         // Drop the SDR last — all Arc clones (the one held by
         // iq_thread is already gone) are released, refcount hits zero,
@@ -1181,12 +1682,12 @@ fn parse_line(msg: &str, program: u32, got_first_audio: &mut bool) -> Option<Nrs
 
     // "LOT file: port=1001 lot=42 name=cover.jpg size=12345 mime=BE4B7536 ..."
     if let Some(rest) = msg.strip_prefix("LOT file: ") {
-        return parse_lot(rest);
+        return parse_lot(rest, program);
     }
 
     // "XHDR: 0 BE4B7536 42"
     if let Some(rest) = msg.strip_prefix("XHDR: ") {
-        return parse_xhdr(rest);
+        return parse_xhdr(rest, program);
     }
 
     // "Station name: KROQ-FM"
@@ -1282,7 +1783,7 @@ fn parse_audio_bitrate(rest: &str) -> Option<f32> {
     rest.split_whitespace().next()?.parse::<f32>().ok()
 }
 
-fn parse_lot(rest: &str) -> Option<NrscEvent> {
+fn parse_lot(rest: &str, program: u32) -> Option<NrscEvent> {
     // "port=0802 lot=16502 name=KDGE HD2HD024076.jpg size=10115 mime=1E653E9C"
     // name= value may contain spaces, so we extract it between "name=" and " size=".
     let lot_start = rest.find("lot=")?;
@@ -1296,7 +1797,7 @@ fn parse_lot(rest: &str) -> Option<NrscEvent> {
 
     // nrsc5 writes the file as "{lot}_{name}" in the aas directory.
     let filename = format!("{}_{}", lot, name);
-    Some(NrscEvent::LotFile { lot, name: filename })
+    Some(NrscEvent::LotFile { program, lot, name: filename })
 }
 
 fn parse_sig_service_audio(rest: &str) -> Option<NrscEvent> {
@@ -1374,13 +1875,13 @@ fn parse_audio_program(rest: &str) -> Option<NrscEvent> {
     })
 }
 
-fn parse_xhdr(rest: &str) -> Option<NrscEvent> {
+fn parse_xhdr(rest: &str, program: u32) -> Option<NrscEvent> {
     // "0 BE4B7536 42"
     let mut parts = rest.split_whitespace();
     let param = parts.next()?.parse::<u32>().ok()?;
     let _mime = parts.next()?; // skip mime hash
     let lot = parts.next()?.to_string();
-    Some(NrscEvent::Xhdr { param, lot })
+    Some(NrscEvent::Xhdr { program, param, lot })
 }
 
 // -- Exe discovery ----------------------------------------------------

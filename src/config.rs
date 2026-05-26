@@ -21,6 +21,38 @@ pub enum GainMode {
     HardwareAgc,
 }
 
+/// Phase 4 — Opus 96 kbps recording mode. Persisted so the user's
+/// choice survives across sessions. Chunk 4.3 wires Off and
+/// Continuous; Chunk 4.4 adds the PerSong PSD-split logic on top of
+/// the same `RecordingSession` lifecycle.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordingMode {
+    /// Pressing the Record button is a no-op; the recorder never
+    /// spawns. Default — we don't want to surprise a user with disk
+    /// fills on first launch.
+    #[default]
+    Off,
+    /// Record the locked subchannel continuously, rotating to a
+    /// fresh file whenever `recording_max_minutes` is reached. The
+    /// old `per_song` and `continuous` config values both
+    /// deserialize to this — PSD timing on real-world stations is
+    /// too irregular for reliable song-boundary splits, so they're
+    /// folded into one "just record" mode.
+    #[serde(alias = "per_song", alias = "continuous")]
+    On,
+}
+
+impl RecordingMode {
+    /// Short label for the Settings dropdown.
+    pub fn label(self) -> &'static str {
+        match self {
+            RecordingMode::Off => "Off",
+            RecordingMode::On => "Record (rotate at max minutes)",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Preset {
     pub name: String,
@@ -79,6 +111,48 @@ pub struct AppConfig {
     /// rtl_tcp restoration can still find them.
     #[serde(default)]
     pub sdr: SdrConfigSection,
+    /// When true, the HD program selector exposes HD5..HD8 in a
+    /// second row below HD1..HD4. Off by default because most
+    /// stations only advertise up to HD4 and the extra row eats
+    /// vertical dock space; users can flip it once they tune to a
+    /// station with the MP11 partition.
+    #[serde(default)]
+    pub show_hd5_hd8: bool,
+    /// When true, every subchannel advertised by SIS gets a
+    /// background decoder spawned automatically as soon as it shows
+    /// up in the station info table. Off by default — most users
+    /// only want HD1 streaming, and an MP3 station with four
+    /// advertised programs would otherwise pin 3× the per-decoder
+    /// CPU as soon as you tune. Persisted so power users who do
+    /// want all subchannels always-on can set it once.
+    #[serde(default)]
+    pub auto_decode_all_advertised: bool,
+    /// Phase 4 — selected recording mode. See `RecordingMode` for the
+    /// behavior of each variant.
+    #[serde(default)]
+    pub recording_mode: RecordingMode,
+    /// Override for the recording output directory. `None` means "use
+    /// `paths::default_recording_dir()`" — portable root in portable
+    /// mode, `~/Documents/nrsc5-studio/recordings/` otherwise. The
+    /// SDR Settings → Recording dialog writes here when the user
+    /// picks a custom location.
+    #[serde(default)]
+    pub recording_dir: Option<String>,
+    /// Per-file rotation cap in minutes. Applies to both Continuous
+    /// (file rotates at this many minutes elapsed) and PerSong
+    /// (file closes at this cap even if metadata hasn't changed,
+    /// catching stations stuck broadcasting the same PSD for hours).
+    /// Default 60 minutes — fits a typical talk-show hour, keeps
+    /// per-file size around 40 MB at 96 kbps so a crash never loses
+    /// more than ~40 MB of audio.
+    #[serde(default = "default_recording_max_minutes")]
+    pub recording_max_minutes: u32,
+    /// When true, recordings get filed under a per-station subfolder
+    /// (e.g. `recordings/KEGL-FM_The Eagle/...`) rather than directly
+    /// in the output root. Default true — the alternative gets
+    /// unmanageable fast once you've recorded from a few stations.
+    #[serde(default = "default_true")]
+    pub recording_subfolder_per_station: bool,
 }
 
 /// SoapySDR-keyed configuration for the v0.3.0 in-process backend.
@@ -158,6 +232,14 @@ fn default_play_log_retention_hours() -> u32 {
     24
 }
 
+fn default_recording_max_minutes() -> u32 {
+    60
+}
+
+fn default_true() -> bool {
+    true
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
@@ -184,6 +266,12 @@ impl Default for AppConfig {
             manual_gain_tenths: 197,
             play_log_retention_hours: 24,
             sdr: SdrConfigSection::default(),
+            show_hd5_hd8: false,
+            auto_decode_all_advertised: false,
+            recording_mode: RecordingMode::Off,
+            recording_dir: None,
+            recording_max_minutes: 60,
+            recording_subfolder_per_station: true,
         }
     }
 }

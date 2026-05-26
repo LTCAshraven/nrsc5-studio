@@ -16,12 +16,15 @@ use std::time::{Duration, Instant};
 /// Result of one background SDR-presence probe. `rtl` is the librtlsdr
 /// device count (cheap, always probed); `soapy` is the Soapy supported-
 /// driver count (potentially slow, only probed when `rtl` came up
-/// empty and we're not streaming). `None` distinguishes "probe errored
-/// / unavailable" from "probed, zero devices".
+/// empty and we're not streaming); `sdrplay_service` is the Windows
+/// `SDRplayAPIService` SCM state (cheap, always probed on Windows;
+/// always `None` on other platforms). `None` distinguishes "probe
+/// errored / unavailable / not applicable" from a real reading.
 #[derive(Debug, Clone, Copy)]
 struct SdrProbeResult {
     rtl: Option<u32>,
     soapy: Option<u32>,
+    sdrplay_service: Option<crate::sdr_detect::SdrplayServiceState>,
 }
 
 /// Hard cap on tracked album-art tiles — prevents the collage from getting
@@ -63,6 +66,25 @@ fn snap_to_gain_table(tenths: i32, table: &[i32]) -> i32 {
         }
     }
     best
+}
+
+/// Replace characters Windows refuses in filenames (and a couple more
+/// that confuse shells / players) with `_`. Used for the per-station
+/// subfolder name when persisting recordings. Conservative: ASCII-safe
+/// subset only — anything outside `[A-Za-z0-9._-]` becomes `_`.
+fn sanitize_filename(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-') {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    if out.is_empty() {
+        out.push('_');
+    }
+    out
 }
 /// Rolling window for the album-art collage. Plays older than this are
 /// pruned on every new event so the heat-map keeps moving instead of
@@ -142,6 +164,12 @@ pub struct Nrsc5App {
     nrsc5: Option<Nrsc5Process>,
     /// Background thread for retune (kill old process + start new).
     retune_task: Option<JoinHandle<(Nrsc5Process, Option<String>)>>,
+    /// Phase 4 — live Opus recording session, if any. Locked to one
+    /// HD subchannel (see `RecordingSession::program()`) independent
+    /// of the active speaker. Set on `UiCommand::StartRecording`,
+    /// cleared on `StopRecording` or on stream teardown
+    /// (Stop / TuneMhz / decoder removal of the recorded program).
+    recording_session: Option<crate::recorder::RecordingSession>,
     start_requested_at: Option<Instant>,
     last_signal_at: Option<Instant>,
     _collage: CollageEngine,
@@ -268,11 +296,15 @@ impl Nrsc5App {
                 muted: config.muted,
                 gain_mode: config.gain_mode,
                 manual_gain_tenths: config.manual_gain_tenths,
+                show_hd5_hd8: config.show_hd5_hd8,
+                auto_decode_all_advertised: config.auto_decode_all_advertised,
+                recording_mode: config.recording_mode,
                 // Default to "present" + "probe available" so the no-SDR
                 // overlay only appears once we've actually probed and seen
                 // zero devices — avoids a flash on launch.
                 sdr_present: true,
                 sdr_probe_available: true,
+                sdrplay_service_stopped: false,
                 art_tiles,
                 art_session_started,
                 collage_tile_cap: collage_tile_cap(&config) as u32,
@@ -283,6 +315,7 @@ impl Nrsc5App {
             config,
             nrsc5,
             retune_task: None,
+            recording_session: None,
             start_requested_at: None,
             last_signal_at: None,
             _collage: CollageEngine::new(8),
@@ -318,6 +351,37 @@ impl eframe::App for Nrsc5App {
         self.update_runtime_metrics();
         ui.ctx().request_repaint_after(Duration::from_millis(50));
 
+        // Phase 4: rotate the active recording's .opus file when its
+        // per-file max-minutes cap is reached. No-op when no
+        // recording is active.
+        self.maybe_rotate_recording();
+
+        // Mirror the speaker router's current active program into
+        // AppState so the GUI's Now Playing panel (and every other
+        // reader of `active_idx()`) follows speaker switches without
+        // having to plumb a query through every call site. Falls
+        // back to `None` when no piped session is running so the
+        // panel naturally drops back to `selected_program`.
+        self.app_state.active_speaker =
+            self.nrsc5.as_ref().and_then(|n| n.active_speaker());
+
+        // Mirror the per-subchannel decoded-state bitmap so the
+        // HD selector's toggle switches reflect reality (e.g. an
+        // `add_decoder` that failed against the cap, or one that
+        // exited on its own after losing its child process) instead
+        // of the user's last click intent. Reset to all-false when
+        // no session is running so toggling a stale "on" doesn't
+        // try to drive a dead backend.
+        let mut decoded = [false; 8];
+        if let Some(n) = self.nrsc5.as_ref() {
+            for p in n.decoded_programs() {
+                if (p as usize) < decoded.len() {
+                    decoded[p as usize] = true;
+                }
+            }
+        }
+        self.app_state.decoded = decoded;
+
         // Drain events from the nrsc5 process.
         if let Some(nrsc5) = &self.nrsc5 {
             let mut pending = Vec::new();
@@ -329,6 +393,14 @@ impl eframe::App for Nrsc5App {
                 self.handle_nrsc5_event(evt);
             }
         }
+
+        // Auto-spawn decoders for every advertised subchannel when
+        // the user has opted in via the SDR Settings "Auto-decode
+        // all advertised" toggle. Runs after the event drain so a
+        // fresh SIS update in this frame is visible to the reconcile
+        // loop. Cheap: at most 8 array lookups + a single
+        // `add_decoder` per slot per session.
+        self.reconcile_auto_decoders();
 
         // Check if a background retune task finished.
         if let Some(handle) = self.retune_task.as_ref() {
@@ -353,6 +425,54 @@ impl eframe::App for Nrsc5App {
                     Err(_panic) => {
                         self.app_state.nrsc5_status = "retune thread panicked".to_string();
                     }
+                }
+            }
+        }
+
+        // --- Debug multi-decoder keyboard shortcuts (Phase 3 Chunk 3) -----
+        // Temporary, hidden until the HD1-HD8 grid lands in Chunk 6.
+        // Lets us exercise the new `add_decoder` / `set_active_speaker`
+        // / `remove_decoder` API live without any GUI plumbing.
+        // Visible feedback goes to stderr (see the launch terminal).
+        //
+        //   Ctrl+Alt+1..8  -> add_decoder(N-1)     (background decode)
+        //   Alt+1..8       -> set_active_speaker(N-1)
+        //   Ctrl+Alt+X     -> remove_decoder(active_speaker())
+        if let Some(nrsc5) = self.nrsc5.as_mut() {
+            const NUM_KEYS: [egui::Key; 8] = [
+                egui::Key::Num1, egui::Key::Num2, egui::Key::Num3, egui::Key::Num4,
+                egui::Key::Num5, egui::Key::Num6, egui::Key::Num7, egui::Key::Num8,
+            ];
+            for (idx, key) in NUM_KEYS.iter().enumerate() {
+                let program = idx as u32;
+                let add = egui::KeyboardShortcut::new(
+                    egui::Modifiers::CTRL | egui::Modifiers::ALT,
+                    *key,
+                );
+                let speak = egui::KeyboardShortcut::new(egui::Modifiers::ALT, *key);
+                if ui.ctx().input_mut(|i| i.consume_shortcut(&add)) {
+                    match nrsc5.add_decoder(program) {
+                        Ok(()) => eprintln!("[multi] add_decoder({program}) ok"),
+                        Err(e) => eprintln!("[multi] add_decoder({program}) err: {e}"),
+                    }
+                }
+                if ui.ctx().input_mut(|i| i.consume_shortcut(&speak)) {
+                    match nrsc5.set_active_speaker(program) {
+                        Ok(()) => eprintln!("[multi] set_active_speaker({program}) ok"),
+                        Err(e) => eprintln!("[multi] set_active_speaker({program}) err: {e}"),
+                    }
+                }
+            }
+            let remove_active = egui::KeyboardShortcut::new(
+                egui::Modifiers::CTRL | egui::Modifiers::ALT,
+                egui::Key::X,
+            );
+            if ui.ctx().input_mut(|i| i.consume_shortcut(&remove_active)) {
+                if let Some(p) = nrsc5.active_speaker() {
+                    let removed = nrsc5.remove_decoder(p);
+                    eprintln!("[multi] remove_decoder({p}) -> {removed}");
+                } else {
+                    eprintln!("[multi] no active speaker to remove");
                 }
             }
         }
@@ -405,7 +525,7 @@ impl eframe::App for Nrsc5App {
             ui.label(
                 egui::RichText::new("NRSC5 Studio")
                     .strong()
-                    .color(egui::Color32::from_rgb(100, 160, 255)),
+                    .color(crate::gui::accent_color(self.app_state.dark_mode)),
             );
             ui.separator();
             ui.label(
@@ -671,7 +791,7 @@ impl Nrsc5App {
     }
 
     fn apply_theme(ctx: &egui::Context, dark: bool) {
-        let accent = egui::Color32::from_rgb(100, 160, 255);
+        let accent = crate::gui::accent_color(dark);
         let theme = if dark {
             egui::Theme::Dark
         } else {
@@ -808,6 +928,18 @@ impl Nrsc5App {
         if let Some(r) = latest {
             let any_probe_ok = r.rtl.is_some() || r.soapy.is_some();
             let any_present = r.rtl.unwrap_or(0) > 0 || r.soapy.unwrap_or(0) > 0;
+            // SDRplay API service state is independent of the RTL /
+            // Soapy probes: it's installed-or-not, running-or-not.
+            // When the service exists but isn't Running, surface the
+            // hint regardless of whether any other SDR was detected
+            // — a user with both an RTL dongle and an SDRplay still
+            // benefits from knowing the SDRplay path is blocked.
+            self.app_state.sdrplay_service_stopped = matches!(
+                r.sdrplay_service,
+                Some(crate::sdr_detect::SdrplayServiceState::Stopped)
+                    | Some(crate::sdr_detect::SdrplayServiceState::Pending)
+                    | Some(crate::sdr_detect::SdrplayServiceState::Other)
+            );
             if any_probe_ok {
                 self.app_state.sdr_probe_available = true;
                 // While streaming, trust that a device is present (the
@@ -839,17 +971,43 @@ impl Nrsc5App {
             let repaint_ctx = ctx.clone();
             std::thread::spawn(move || {
                 let rtl = crate::sdr_detect::device_count();
+                // Cheap (one `sc.exe query`); always probe so the UI
+                // notices a service stop/start mid-session without
+                // waiting for the next attempted Start to fail.
+                //
+                // We need this BEFORE the Soapy enumerate below: once
+                // the SDRplay Soapy module has been loaded into the
+                // process, calling `enumerate("")` against a stopped
+                // service can crash the module's `find_SDRplay` (it
+                // segfaults trying to talk to the dead named pipe),
+                // which on Windows brings down the whole process via
+                // SEH. Pre-checking the service lets us skip the
+                // Soapy probe entirely when SDRplay support is
+                // present but not running.
+                let sdrplay_service = crate::sdr_detect::sdrplay_service_state();
+                let sdrplay_blocked = matches!(
+                    sdrplay_service,
+                    Some(crate::sdr_detect::SdrplayServiceState::Stopped)
+                        | Some(crate::sdr_detect::SdrplayServiceState::Pending)
+                        | Some(crate::sdr_detect::SdrplayServiceState::Other)
+                );
                 // Only run the heavier Soapy enumeration if librtlsdr
-                // came up empty AND no stream is active. Streaming
-                // with a non-RTL device (e.g. SDRplay) implies a
-                // device is present, and we don't want to contend with
-                // a live capture.
-                let soapy = match (rtl, is_streaming) {
-                    (Some(n), _) if n > 0 => None,
-                    (_, true) => None,
+                // came up empty AND no stream is active AND the
+                // SDRplay API service isn't in a state that could
+                // crash the module. Streaming with a non-RTL device
+                // (e.g. SDRplay) implies a device is present, and we
+                // don't want to contend with a live capture.
+                let soapy = match (rtl, is_streaming, sdrplay_blocked) {
+                    (Some(n), _, _) if n > 0 => None,
+                    (_, true, _) => None,
+                    (_, _, true) => None,
                     _ => crate::sdr_detect::soapy_supported_count(),
                 };
-                let _ = tx.send(SdrProbeResult { rtl, soapy });
+                let _ = tx.send(SdrProbeResult {
+                    rtl,
+                    soapy,
+                    sdrplay_service,
+                });
                 // Wake the GUI so the result is applied promptly
                 // even if the user isn't interacting with the app.
                 repaint_ctx.request_repaint();
@@ -921,6 +1079,32 @@ impl Nrsc5App {
                                 .small()
                                 .color(egui::Color32::from_gray(150)),
                             );
+                            // Extra hint when the SDRplay API service
+                            // is installed but stopped: tell the user
+                            // exactly what to do. Starting / stopping
+                            // a Windows service requires admin, so we
+                            // can't fix it ourselves \u2014 the message
+                            // points at Services.msc.
+                            if self.app_state.sdrplay_service_stopped {
+                                ui.add_space(12.0);
+                                ui.label(
+                                    egui::RichText::new(
+                                        "SDRplay API service is stopped.",
+                                    )
+                                    .size(13.0)
+                                    .color(egui::Color32::from_rgb(
+                                        230, 160, 100,
+                                    )),
+                                );
+                                ui.add_space(2.0);
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Start it from Services.msc (admin), then Refresh.",
+                                    )
+                                    .small()
+                                    .color(egui::Color32::from_gray(180)),
+                                );
+                            }
                             ui.add_space(16.0);
                             let btn = ui.add_sized(
                                 [140.0, 30.0],
@@ -953,11 +1137,12 @@ impl Nrsc5App {
     /// repeated XHDR emissions don't inflate the count.
     ///
     /// Also takes ownership of the cover-display lifecycle: sets
-    /// `app_state.cover_art_path` to the durable cache copy when we have one
-    /// (falling back to the AAS-dump path otherwise), and deletes the
-    /// redundant AAS-dump file after a successful cache write so the temp
-    /// dir doesn't accumulate ~50 KB per song forever.
-    fn record_album_art(&mut self, full_path: &std::path::Path, path_str: &str) {
+    /// `programs[program].cover_art_path` to the durable cache copy when we
+    /// have one (falling back to the AAS-dump path otherwise), and deletes
+    /// the redundant AAS-dump file after a successful cache write so the
+    /// temp dir doesn't accumulate ~50 KB per song forever.
+    fn record_album_art(&mut self, program: u32, full_path: &std::path::Path, path_str: &str) {
+        let slot_idx = (program as usize).min(self.app_state.programs.len() - 1);
         let now = Instant::now();
         // Anchor the session timestamp on the first art event so the UI can
         // still report "how long you've been listening" — it's now purely
@@ -979,7 +1164,7 @@ impl Nrsc5App {
         let Ok(bytes) = std::fs::read(full_path) else {
             // Couldn't read the dump — fall back to the AAS path so the
             // live cover at least *tries* to load. Don't delete anything.
-            self.app_state.cover_art_path = Some(path_str.to_string());
+            self.app_state.programs[slot_idx].cover_art_path = Some(path_str.to_string());
             return;
         };
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -995,7 +1180,7 @@ impl Nrsc5App {
             if let Some(&last) = existing.plays.back() {
                 if now.duration_since(last) < ART_COUNT_COOLDOWN {
                     let cached_path = existing.path.clone();
-                    self.app_state.cover_art_path = Some(cached_path.clone());
+                    self.app_state.programs[slot_idx].cover_art_path = Some(cached_path.clone());
                     // Only delete the AAS dump if we actually have a cache
                     // path to fall back on (cached_path != AAS path).
                     if self.art_cache.is_some() && cached_path != path_str {
@@ -1020,7 +1205,7 @@ impl Nrsc5App {
             .unwrap_or_else(|| path_str.to_string());
 
         // Live cover display follows the cache when possible.
-        self.app_state.cover_art_path = Some(resolved_path.clone());
+        self.app_state.programs[slot_idx].cover_art_path = Some(resolved_path.clone());
         // With a durable cache copy in hand, the AAS-dir dump is dead weight.
         if cached_path.is_some() {
             let _ = std::fs::remove_file(full_path);
@@ -1028,10 +1213,13 @@ impl Nrsc5App {
 
         // Grab the song metadata currently on display so we can label this
         // cover later in tooltips. Trim and skip empty pieces so we don't
-        // accumulate noise entries like ("", "").
-        let title = self.app_state.title.trim().to_string();
-        let artist = self.app_state.artist.trim().to_string();
-        let album = self.app_state.album.trim().to_string();
+        // accumulate noise entries like ("", ""). Pulled from the same
+        // program slot whose cover just changed so the labels match the
+        // image regardless of which subchannel is on the speakers.
+        let slot = &self.app_state.programs[slot_idx];
+        let title = slot.title.trim().to_string();
+        let artist = slot.artist.trim().to_string();
+        let album = slot.album.trim().to_string();
 
         let entry = self.art_history.entry(key).or_insert_with(|| ArtEntry {
             path: resolved_path.clone(),
@@ -1065,18 +1253,355 @@ impl Nrsc5App {
         // belong to a real song vs. a station-slogan flap, and try to push
         // the play to the rolling 24-hour log right now.
         self.last_cover_play_at = Some(crate::play_log::now_millis());
-        self.try_record_play();
+        self.try_record_play(program);
+    }
+
+    /// Walk the SIS programs table and, for every subchannel that's
+    /// advertised but not yet decoding, fire a one-shot `add_decoder`.
+    /// Called every frame after the event drain so a fresh SIS update
+    /// is acted on within one tick.
+    ///
+    /// Gated by `auto_decode_all_advertised` (off by default — each
+    /// extra decoder is roughly one extra CPU core). HD5..HD8 are
+    /// skipped unless the user has also enabled the second-row
+    /// visibility toggle, so MP1/MP3 stations don't fan out to slots
+    /// the user can't see.
+    ///
+    /// Per-slot `auto_add_attempted` flag prevents the loop from
+    /// hammering `add_decoder` every frame on a station that
+    /// legitimately can't allocate another decoder (e.g. the
+    /// `MAX_DECODERS` cap is already saturated). Cleared on Stop /
+    /// TuneMhz / toggling the setting back on, so a re-Start or
+    /// re-tune gets a fresh shot.
+    fn reconcile_auto_decoders(&mut self) {
+        if !self.app_state.auto_decode_all_advertised {
+            return;
+        }
+        let Some(nrsc5) = self.nrsc5.as_mut() else {
+            return;
+        };
+        let visible_cap = if self.app_state.show_hd5_hd8 { 8 } else { 4 };
+        for i in 0..visible_cap {
+            if self.app_state.auto_add_attempted[i] {
+                continue;
+            }
+            let advertised = self
+                .app_state
+                .station_info
+                .programs
+                .get(i)
+                .map(|s| s.is_some())
+                .unwrap_or(false);
+            if !advertised {
+                continue;
+            }
+            if self.app_state.decoded[i] {
+                // Already running (user toggled it on manually, or a
+                // previous reconcile pass landed it). Mark attempted
+                // so we stop checking until the next session.
+                self.app_state.auto_add_attempted[i] = true;
+                continue;
+            }
+            self.app_state.auto_add_attempted[i] = true;
+            // Best-effort: failures (cap reached, child spawn failed)
+            // surface naturally via the mirrored `decoded[]` array on
+            // the next frame, which keeps the GUI's toggle in sync
+            // with reality.
+            let _ = nrsc5.add_decoder(i as u32);
+        }
+    }
+
+    /// Phase 4 — spawn a new Opus recording locked to whatever
+    /// subchannel the user currently has *selected* (not necessarily
+    /// the active speaker; the recorder follows the selection at
+    /// start time, then stays put even if the user swaps speakers).
+    ///
+    /// Refuses to start if:
+    ///   * no stream is running                                    (Start first)
+    ///   * `recording_mode` is `Off`                                (toggle in Settings first)
+    ///   * a recording is already active                            (Stop the current one first)
+    ///   * the selected program isn't being decoded                 (caller auto-spawns via SelectProgram, but if that fails we surface it here)
+    ///
+    /// Surfaces all of the above through `nrsc5_status` rather than
+    /// failing silently — the dock's Record button has no other way
+    /// to tell the user what's wrong.
+    fn start_recording(&mut self) {
+        use crate::config::RecordingMode;
+
+        if self.recording_session.is_some() {
+            self.app_state.nrsc5_status =
+                "already recording — Stop before starting again".to_string();
+            return;
+        }
+        if !self.app_state.is_streaming {
+            self.app_state.nrsc5_status =
+                "press Start before recording".to_string();
+            return;
+        }
+        if self.config.recording_mode == RecordingMode::Off {
+            self.app_state.nrsc5_status =
+                "recording is Off — pick a mode in SDR Settings first".to_string();
+            return;
+        }
+
+        // Lock the recording target to the *selected* program at the
+        // moment of Record. Stays put across speaker swaps.
+        let program = self.app_state.selected_program;
+        // Quick "is the decoder up?" check (drops the borrow before
+        // we compute paths/tags below — those need an immutable
+        // borrow of self).
+        let decoder_up = self
+            .nrsc5
+            .as_ref()
+            .map(|n| n.is_decoding(program))
+            .unwrap_or(false);
+        if self.nrsc5.is_none() {
+            self.app_state.nrsc5_status =
+                "no SDR backend — cannot record".to_string();
+            return;
+        }
+        if !decoder_up {
+            self.app_state.nrsc5_status = format!(
+                "HD{} isn't decoding — toggle it on before recording",
+                program + 1,
+            );
+            return;
+        }
+
+        // Resolve output path: <base>/<station_subfolder?>/<yyyy-mm-dd>_HD<n>_<timestamp>.opus
+        let base_dir = match self
+            .config
+            .recording_dir
+            .as_ref()
+            .map(std::path::PathBuf::from)
+            .or_else(crate::paths::default_recording_dir)
+        {
+            Some(p) => p,
+            None => {
+                self.app_state.nrsc5_status =
+                    "no recording directory resolved — set one in Settings".to_string();
+                return;
+            }
+        };
+        let mut dir = base_dir;
+        if self.config.recording_subfolder_per_station {
+            let station = self
+                .app_state
+                .station_info
+                .call_sign
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .map(sanitize_filename)
+                .unwrap_or_else(|| {
+                    format!("{:.1}MHz", self.config.frequency_mhz)
+                });
+            dir.push(station);
+        }
+        let now = chrono::Local::now();
+        let stamp = now.format("%Y-%m-%d_%H%M%S").to_string();
+        let filename = format!("{}_HD{}_recording.opus", stamp, program + 1);
+        let output_path = dir.join(filename);
+        let tags = self.build_recording_tags(program, &now);
+
+        // Now take the mutable borrow on nrsc5 for the actual spawn
+        // + attach. Re-check existence in case something dropped it
+        // between the read-only probe above and here (impossible on
+        // current code paths, but defensive).
+        let Some(nrsc5) = self.nrsc5.as_mut() else {
+            self.app_state.nrsc5_status =
+                "no SDR backend — cannot record".to_string();
+            return;
+        };
+
+        match crate::recorder::RecordingSession::spawn(program, output_path.clone(), tags) {
+            Ok((session, pcm_tx)) => {
+                // Wire the SpeakerRouter tap. Failure here means the
+                // program disappeared between the is_decoding check
+                // above and now — race against decoder teardown.
+                if let Err(err) = nrsc5.attach_recorder(program, pcm_tx) {
+                    self.app_state.nrsc5_status = format!(
+                        "recording attach failed for HD{}: {err}",
+                        program + 1,
+                    );
+                    // Drop the session so its forwarder sees a
+                    // closed channel and flushes the (empty) file.
+                    drop(session);
+                    return;
+                }
+                self.app_state.recording = Some(crate::gui::state::RecordingStatus {
+                    program,
+                    started_at: Instant::now(),
+                    output_path: output_path.display().to_string(),
+                });
+                self.recording_session = Some(session);
+                self.app_state.nrsc5_status = format!(
+                    "● recording HD{} → {}",
+                    program + 1,
+                    output_path.display(),
+                );
+            }
+            Err(err) => {
+                self.app_state.nrsc5_status =
+                    format!("recording start failed: {err}");
+            }
+        }
+    }
+
+    /// Phase 4 — stop the active recording (if any), flush the
+    /// .opus file, detach the SpeakerRouter tap. `fatal == true`
+    /// when the recording is being closed by stream teardown
+    /// (Stop / TuneMhz / SDR disconnect) rather than the user
+    /// explicitly hitting Stop on the Record button — changes the
+    /// status-line wording so the user knows the closure was a
+    /// side-effect of the bigger action, not the recorder choking.
+    fn stop_recording(&mut self, fatal: bool) {
+        let Some(session) = self.recording_session.take() else {
+            if !fatal {
+                self.app_state.nrsc5_status =
+                    "no active recording to stop".to_string();
+            }
+            return;
+        };
+        let program = session.program();
+        let path = session.output_path().display().to_string();
+        // Detach the router tap *before* calling session.stop() so
+        // the forwarder thread sees its sender drop first, sends a
+        // clean RecorderCmd::Stop, and the encoder thread exits via
+        // its normal flush path rather than via the 60-second
+        // recv_timeout fallback.
+        if let Some(nrsc5) = self.nrsc5.as_mut() {
+            nrsc5.detach_recorder(program);
+        }
+        match session.stop() {
+            Ok(()) => {
+                self.app_state.nrsc5_status = if fatal {
+                    format!("recording closed (stream stopped) → {path}")
+                } else {
+                    format!("recording saved → {path}")
+                };
+            }
+            Err(err) => {
+                self.app_state.nrsc5_status =
+                    format!("recording stop error: {err}");
+            }
+        }
+        self.app_state.recording = None;
+    }
+
+    /// Build the file-lifetime metadata baked into the OpusTags
+    /// packet at the start of each recording file (and again after
+    /// each rotation). PSD timing on real-world stations is too
+    /// irregular to put per-song TITLE/ARTIST in here, so the tags
+    /// are intentionally station-level only: call sign, HD slot,
+    /// tuned frequency, and the wall-clock when *this file* started
+    /// (not the recording session — each rotated file gets a fresh
+    /// timestamp).
+    fn build_recording_tags(
+        &self,
+        program: u32,
+        now: &chrono::DateTime<chrono::Local>,
+    ) -> crate::recorder::RecordingTags {
+        crate::recorder::RecordingTags {
+            station: self
+                .app_state
+                .station_info
+                .call_sign
+                .clone()
+                .unwrap_or_default(),
+            program,
+            frequency_mhz: self.config.frequency_mhz,
+            started_human: now.format("%Y-%m-%d %H:%M:%S").to_string(),
+            date: now.format("%Y-%m-%d").to_string(),
+        }
+    }
+
+    /// Per-frame check called from `ui()`: if the active recording
+    /// has been writing the *current* file for longer than
+    /// `recording_max_minutes`, send a Rotate command to the
+    /// encoder thread (which closes the current .opus file cleanly
+    /// and opens a fresh one with a new timestamp). No-op when no
+    /// recording is active or when the cap hasn't been reached.
+    fn maybe_rotate_recording(&mut self) {
+        let Some(status) = self.app_state.recording.as_ref() else {
+            return;
+        };
+        let cap = Duration::from_secs(
+            (self.config.recording_max_minutes as u64).saturating_mul(60),
+        );
+        if status.started_at.elapsed() < cap {
+            return;
+        }
+        let program = status.program;
+        if self.recording_session.is_none() {
+            return;
+        }
+
+        // Compute the new file path with a fresh timestamp, using
+        // the same base-dir + per-station-subfolder layout
+        // start_recording uses. Anything that's changed since (new
+        // call sign, new freq) gets re-resolved naturally here.
+        let base_dir = match self
+            .config
+            .recording_dir
+            .as_ref()
+            .map(std::path::PathBuf::from)
+            .or_else(crate::paths::default_recording_dir)
+        {
+            Some(p) => p,
+            None => return,
+        };
+        let mut dir = base_dir;
+        if self.config.recording_subfolder_per_station {
+            let station = self
+                .app_state
+                .station_info
+                .call_sign
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .map(sanitize_filename)
+                .unwrap_or_else(|| format!("{:.1}MHz", self.config.frequency_mhz));
+            dir.push(station);
+        }
+        let now = chrono::Local::now();
+        let stamp = now.format("%Y-%m-%d_%H%M%S").to_string();
+        let filename = format!("{}_HD{}_recording.opus", stamp, program + 1);
+        let new_path = dir.join(filename);
+        let tags = self.build_recording_tags(program, &now);
+
+        // Take the session borrow last so the immutable borrow used
+        // by build_recording_tags above is already released.
+        let Some(session) = self.recording_session.as_mut() else {
+            return;
+        };
+        session.rotate(new_path.clone(), tags);
+        // Update the mirror so the dock's REC timer resets to 0 for
+        // the new file, and the hover-text path follows.
+        self.app_state.recording = Some(crate::gui::state::RecordingStatus {
+            program,
+            started_at: Instant::now(),
+            output_path: new_path.display().to_string(),
+        });
+        self.app_state.nrsc5_status = format!(
+            "● recording HD{} → rotated to {}",
+            program + 1,
+            new_path.display(),
+        );
     }
 
     /// Try to record the currently-displayed song into the rolling play
     /// log. Idempotent — the log's own gate (pair-equality dedup +
-    /// rate-limit) drops noisy re-calls. Persists on success.
-    fn try_record_play(&mut self) {
+    /// rate-limit) drops noisy re-calls. Persists on success. `program`
+    /// is the HD subchannel that produced the song (i.e. the originating
+    /// `NrscEvent::Metadata.program`), not necessarily the active
+    /// speaker — each decoder's metadata gets logged against its own
+    /// subchannel.
+    fn try_record_play(&mut self, program: u32) {
         let now_ms = crate::play_log::now_millis();
-        let title = self.app_state.title.clone();
-        let artist = self.app_state.artist.clone();
+        let slot_idx = (program as usize).min(self.app_state.programs.len() - 1);
+        let slot = &self.app_state.programs[slot_idx];
+        let title = slot.title.clone();
+        let artist = slot.artist.clone();
         let freq = self.config.frequency_mhz;
-        let program = self.app_state.selected_program;
         let call_sign = self.app_state.call_sign.clone();
         if self.play_log.try_push(
             now_ms,
@@ -1248,15 +1773,22 @@ impl Nrsc5App {
                 self.app_state.nrsc5_status = format!("device lost: {detail}");
             }
             NrscEvent::ChildExited => {
-                // The PCM pump saw EOF on the child's stdout. If we
-                // still think a stream is live, the child died on us
-                // (external taskkill, crash, or clean nrsc5 exit on
-                // an unrecoverable error) — mirror the LostDevice
-                // cleanup so the user doesn't have to Stop+Start to
-                // recover. If `is_streaming` is already false, our
-                // own `stop()` triggered this exit and there's
-                // nothing more to do.
-                if self.app_state.is_streaming {
+                // The PCM pump saw EOF on the child's stdout. With
+                // multi-decoder support (Phase 3 Chunk 3), this fires
+                // once per decoder \u2014 explicit removals via
+                // `remove_decoder` also trigger it. Treat it as
+                // pipeline-fatal only when no other decoders survive:
+                // a sibling decoder dying mid-stream is a localized
+                // failure that the user can recover from by toggling
+                // its switch back on, while *all* decoders gone means
+                // the stream really has ended (taskkill, crash, clean
+                // nrsc5 exit on unrecoverable error, etc.).
+                let any_decoders_left = self
+                    .nrsc5
+                    .as_ref()
+                    .map(|n| !n.decoded_programs().is_empty())
+                    .unwrap_or(false);
+                if self.app_state.is_streaming && !any_decoders_left {
                     self.app_state.is_streaming = false;
                     self.start_requested_at = None;
                     self.last_signal_at = None;
@@ -1347,35 +1879,37 @@ impl Nrsc5App {
                 }
             }
             NrscEvent::Metadata {
+                program,
                 title,
                 artist,
                 album,
                 genre,
-                ..
             } => {
                 if !self.app_state.is_streaming {
                     return;
                 }
 
                 self.last_signal_at = Some(Instant::now());
-                self.app_state.active_program = self.app_state.selected_program;
+                self.app_state.active_program = program;
 
                 let now = Instant::now();
+                let slot_idx = (program as usize).min(self.app_state.programs.len() - 1);
+                let slot = &mut self.app_state.programs[slot_idx];
                 if !title.is_empty() {
-                    self.app_state.title = title;
-                    self.app_state.title_updated = Some(now);
+                    slot.title = title;
+                    slot.title_updated = Some(now);
                 }
                 if !artist.is_empty() {
-                    self.app_state.artist = artist;
-                    self.app_state.artist_updated = Some(now);
+                    slot.artist = artist;
+                    slot.artist_updated = Some(now);
                 }
                 if !album.is_empty() {
-                    self.app_state.album = album;
-                    self.app_state.album_updated = Some(now);
+                    slot.album = album;
+                    slot.album_updated = Some(now);
                 }
                 if !genre.is_empty() {
-                    self.app_state.genre = genre;
-                    self.app_state.genre_updated = Some(now);
+                    slot.genre = genre;
+                    slot.genre_updated = Some(now);
                 }
 
                 // Try to record this metadata update to the play log only
@@ -1386,12 +1920,11 @@ impl Nrsc5App {
                 if let Some(last) = self.last_cover_play_at {
                     let now_ms = crate::play_log::now_millis();
                     if now_ms - last < 30_000 {
-                        self.try_record_play();
+                        self.try_record_play(program);
                     }
                 }
             }
-            NrscEvent::LotFile { lot, name } => {
-                // Try to derive the broadcaster call sign from the filename.
+            NrscEvent::LotFile { lot, name, .. } => {
                 if self.app_state.call_sign.is_empty() {
                     if let Some(cs) = extract_call_sign(&name) {
                         self.app_state.call_sign = cs;
@@ -1433,19 +1966,22 @@ impl Nrsc5App {
                 }
                 self.lot_files.insert(lot, name);
             }
-            NrscEvent::Xhdr { param, lot } => {
+            NrscEvent::Xhdr { program, param, lot } => {
                 if let Some(filename) = self.lot_files.get(&lot) {
                     let full_path = self.aas_dir.join(filename);
                     if full_path.exists() {
                         let path_str = full_path.to_string_lossy().to_string();
                         if param == 0 {
                             // Cover art. `record_album_art` sets
-                            // `cover_art_path` itself (preferring the durable
-                            // cache copy) and prunes the AAS-dir dump after
-                            // a successful cache write.
-                            self.record_album_art(&full_path, &path_str);
+                            // `programs[program].cover_art_path` itself
+                            // (preferring the durable cache copy) and
+                            // prunes the AAS-dir dump after a successful
+                            // cache write.
+                            self.record_album_art(program, &full_path, &path_str);
                         } else if param == 1 {
-                            // Station logo
+                            // Station logo — stays global; one logo
+                            // per station regardless of which subchannel
+                            // first transmitted it.
                             self.app_state.station_logo_path = Some(path_str);
                         }
                     }
@@ -1624,6 +2160,17 @@ impl Nrsc5App {
                     return;
                 }
 
+                // Phase 4: a Stop tears down every decoder, which
+                // takes the recorder's source ring with it. Flush
+                // the .opus file cleanly *before* killing the
+                // stream so the EOS page is the last thing on
+                // disk \u2014 otherwise the file would just end at
+                // whatever frame the encoder happened to have
+                // queued when the channel disconnected.
+                if self.recording_session.is_some() {
+                    self.stop_recording(/* fatal = */ true);
+                }
+
                 if let Some(nrsc5) = self.nrsc5.as_mut() {
                     nrsc5.stop();
                 }
@@ -1634,7 +2181,6 @@ impl Nrsc5App {
                 self.app_state.currently_synced = false;
                 self.app_state.lost_sync_at = None;
                 self.lot_files.clear();
-                self.app_state.cover_art_path = None;
                 self.app_state.station_logo_path = None;
                 self.app_state.traffic_map_path = None;
                 self.app_state.weather_frames.clear();
@@ -1645,23 +2191,33 @@ impl Nrsc5App {
                 // from scratch rather than rendering stale fields from the
                 // last session.
                 self.app_state.station_info.reset();
-                // Wipe PSD so the Station Info panel doesn't claim the
-                // last-heard track is the "current" one once the stream
-                // is no longer running.
-                self.app_state.title.clear();
-                self.app_state.artist.clear();
-                self.app_state.album.clear();
-                self.app_state.genre.clear();
-                self.app_state.title_updated = None;
-                self.app_state.artist_updated = None;
-                self.app_state.album_updated = None;
-                self.app_state.genre_updated = None;
+                // Wipe per-program PSD + cover art so the Station Info
+                // panel doesn't claim the last-heard track is the
+                // "current" one once the stream is no longer running.
+                self.app_state.clear_all_programs();
+                self.app_state.active_speaker = None;
+                // Fresh session → fresh shot at auto-decoding every
+                // advertised subchannel. Without this, re-Starting on
+                // the same frequency would skip slots we previously
+                // tried (and possibly failed against the cap on).
+                self.app_state.auto_add_attempted = [false; 8];
                 self.traffic_map.clear();
                 self.weather_map.clear();
                 self.app_state.nrsc5_status = "stream stopped".to_string();
             }
             UiCommand::TuneMhz(mhz) => {
                 self.app_state.frequency_mhz = mhz;
+                // Phase 4: a tune is a station change — the recording's
+                // station-identity metadata (and the per-station
+                // subfolder if enabled) is now wrong. Close the file
+                // before we move on; the user can hit Record again
+                // after the new station's SIS arrives if they want
+                // to capture it. Treat as fatal so the status line
+                // reflects "saved <path>" instead of "stopped by
+                // user".
+                if self.recording_session.is_some() {
+                    self.stop_recording(/* fatal = */ true);
+                }
                 // Wipe per-station identity/state so a stale call sign,
                 // SIS data, or LOT filename from the previous station
                 // can't bleed into the new one before its first SIS
@@ -1673,16 +2229,13 @@ impl Nrsc5App {
                 self.app_state.lost_sync_at = None;
                 self.app_state.call_sign.clear();
                 // PSD belongs to the previous station's broadcast; clear
-                // it so the panel doesn't show the wrong song while the
-                // new station's SIS / PSD roll in.
-                self.app_state.title.clear();
-                self.app_state.artist.clear();
-                self.app_state.album.clear();
-                self.app_state.genre.clear();
-                self.app_state.title_updated = None;
-                self.app_state.artist_updated = None;
-                self.app_state.album_updated = None;
-                self.app_state.genre_updated = None;
+                // every program slot so the panel doesn't show the wrong
+                // song while the new station's SIS / PSD roll in.
+                self.app_state.clear_all_programs();
+                // New station → retry auto-decode against whatever it
+                // advertises. The previous station's bitmap is
+                // meaningless against the new SIS table.
+                self.app_state.auto_add_attempted = [false; 8];
                 self.lot_files.clear();
                 self.config.frequency_mhz = mhz;
                 save_config(&self.config);
@@ -1724,40 +2277,154 @@ impl Nrsc5App {
             }
             UiCommand::SelectProgram(program) => {
                 let clamped = program.min(7);
-                if clamped == self.app_state.selected_program {
-                    return;
-                }
 
+                // Multi-decoder semantics (Phase 3 Chunk 6): selecting
+                // an HD subchannel means "make it the active speaker",
+                // not "tear down and rebuild on this program". If a
+                // background decoder is already running for `clamped`
+                // we just route the speaker to it; otherwise we spawn
+                // one and then route to it. Either way, every other
+                // decoder keeps running so the user doesn't lose
+                // metadata or audio continuity on the channels they
+                // weren't actively listening to.
                 self.app_state.selected_program = clamped;
                 self.config.selected_program = clamped;
                 save_config(&self.config);
 
-                // If streaming, restart with the new program.
                 if self.app_state.is_streaming {
-                    if let Some(backend) = self.nrsc5.take() {
-                        self.app_state.is_streaming = false;
-
-                        let mhz = self.app_state.frequency_mhz;
-                        let device_index = self.config.rtl_device_index;
-                        let handle = std::thread::spawn(move || {
-                            let mut backend = backend;
-                            if let Err(err) =
-                                backend.retune(mhz, clamped, device_index)
-                            {
-                                return (backend, Some(format!("{err}")));
+                    if let Some(nrsc5) = self.nrsc5.as_mut() {
+                        if !nrsc5.is_decoding(clamped) {
+                            // Spin up a background decoder for the
+                            // target program. Errors (cap reached,
+                            // duplicate, no bus, etc.) surface to the
+                            // status bar but don't abort the switch
+                            // attempt \u2014 set_active_speaker below will
+                            // simply fail too and we'll log the
+                            // underlying reason.
+                            if let Err(err) = nrsc5.add_decoder(clamped) {
+                                self.app_state.nrsc5_status = format!(
+                                    "could not start HD{} decoder: {err}",
+                                    clamped + 1
+                                );
                             }
-                            (backend, None)
-                        });
-
-                        self.retune_task = Some(handle);
-                        self.app_state.nrsc5_status =
-                            format!("switching to HD{}...", clamped + 1);
-                        return;
+                        }
+                        match nrsc5.set_active_speaker(clamped) {
+                            Ok(()) => {
+                                self.app_state.nrsc5_status = format!(
+                                    "switched to HD{}",
+                                    clamped + 1
+                                );
+                            }
+                            Err(err) => {
+                                self.app_state.nrsc5_status = format!(
+                                    "could not switch to HD{}: {err}",
+                                    clamped + 1
+                                );
+                            }
+                        }
                     }
+                    return;
                 }
 
                 self.app_state.nrsc5_status =
                     format!("selected HD{} (staged)", clamped + 1);
+            }
+            UiCommand::SetDecoderEnabled(program, enabled) => {
+                let clamped = program.min(7);
+                let Some(nrsc5) = self.nrsc5.as_mut() else {
+                    self.app_state.nrsc5_status =
+                        "press Start before toggling decoders".to_string();
+                    return;
+                };
+                if enabled {
+                    match nrsc5.add_decoder(clamped) {
+                        Ok(()) => {
+                            self.app_state.nrsc5_status = format!(
+                                "decoding HD{} in background",
+                                clamped + 1
+                            );
+                        }
+                        Err(err) => {
+                            self.app_state.nrsc5_status = format!(
+                                "could not start HD{} decoder: {err}",
+                                clamped + 1
+                            );
+                        }
+                    }
+                } else {
+                    // Refuse to remove the active speaker's decoder \u2014
+                    // that would yank audio out from under the user
+                    // with no fallback. The toggle in the GUI snaps
+                    // back to "on" on the next frame because the
+                    // mirrored decoded[] array hasn't changed.
+                    if nrsc5.active_speaker() == Some(clamped) {
+                        self.app_state.nrsc5_status = format!(
+                            "HD{} is on the speakers — switch to another \
+                             subchannel first",
+                            clamped + 1
+                        );
+                        return;
+                    }
+                    let removed = nrsc5.remove_decoder(clamped);
+                    self.app_state.nrsc5_status = if removed {
+                        format!("stopped HD{} decoder", clamped + 1)
+                    } else {
+                        format!("HD{} was not decoding", clamped + 1)
+                    };
+                }
+            }
+            UiCommand::SetShowHd5Hd8(flag) => {
+                self.app_state.show_hd5_hd8 = flag;
+                self.config.show_hd5_hd8 = flag;
+                save_config(&self.config);
+            }
+            UiCommand::SetAutoDecodeAllAdvertised(flag) => {
+                self.app_state.auto_decode_all_advertised = flag;
+                self.config.auto_decode_all_advertised = flag;
+                save_config(&self.config);
+                // Flipping on mid-session: clear the "already tried"
+                // bitmap so the reconcile loop gets a fresh shot at
+                // every advertised slot on the very next frame.
+                // Flipping off: also clear it so a subsequent re-enable
+                // doesn't skip slots the user has since manually toggled
+                // off (we want "on" to mean "actively decode everything
+                // advertised", not "resume whatever we tried last time").
+                if flag {
+                    self.app_state.auto_add_attempted = [false; 8];
+                }
+                self.app_state.nrsc5_status = if flag {
+                    "auto-decoding all advertised subchannels".to_string()
+                } else {
+                    "auto-decode disabled; manual HD toggles only".to_string()
+                };
+            }
+            UiCommand::StartRecording => self.start_recording(),
+            UiCommand::StopRecording => self.stop_recording(/* fatal = */ false),
+            UiCommand::SetRecordingMode(mode) => {
+                self.config.recording_mode = mode;
+                self.app_state.recording_mode = mode;
+                save_config(&self.config);
+                self.app_state.nrsc5_status = match mode {
+                    crate::config::RecordingMode::Off => {
+                        "recording disabled".to_string()
+                    }
+                    crate::config::RecordingMode::On => {
+                        "recording enabled (rotates at max minutes)".to_string()
+                    }
+                };
+            }
+            UiCommand::SetRecordingMaxMinutes(mins) => {
+                let clamped = mins.clamp(1, 240);
+                self.config.recording_max_minutes = clamped;
+                save_config(&self.config);
+            }
+            UiCommand::SetRecordingSubfolderPerStation(flag) => {
+                self.config.recording_subfolder_per_station = flag;
+                save_config(&self.config);
+            }
+            UiCommand::SetRecordingDir(dir) => {
+                self.config.recording_dir = dir;
+                save_config(&self.config);
             }
             UiCommand::SavePreset(slot) => {
                 // Fallback chain for the preset's display name:
@@ -1777,8 +2444,8 @@ impl Nrsc5App {
                     .unwrap_or_default();
                 let name = if !short.is_empty() {
                     short
-                } else if !self.app_state.artist.is_empty() {
-                    self.app_state.artist.clone()
+                } else if !self.app_state.active_program().artist.is_empty() {
+                    self.app_state.active_program().artist.clone()
                 } else if let Some(cs) = self.app_state.station_info.call_sign.clone()
                 {
                     cs
@@ -2099,6 +2766,7 @@ impl Nrsc5App {
         let active_args = self.config.sdr.to_args_string();
         let active_driver = self.config.sdr.driver.clone();
         let current_ppm = self.config.sdr.freq_correction_ppm;
+        let show_hd5_hd8 = self.app_state.show_hd5_hd8;
         let last_refreshed_label = self
             .app_state
             .sdr_devices_last_refreshed
@@ -2316,6 +2984,179 @@ impl Nrsc5App {
                 ui.add_space(12.0);
                 ui.separator();
 
+                // ---- Display ------------------------------------------
+                // Per-app UI preferences that don't fit the device /
+                // gains / PPM groupings above. Right now this only
+                // hosts the HD5\u2013HD8 row visibility toggle, but it's
+                // the natural spot to grow into a "Settings" section
+                // as we add more user-facing knobs.
+                ui.heading("Display");
+                let mut show_hd5_hd8 = show_hd5_hd8;
+                let resp = ui.checkbox(
+                    &mut show_hd5_hd8,
+                    "Show HD5\u{2013}HD8 row in program selector",
+                );
+                ui.label(
+                    egui::RichText::new(
+                        "Most stations only advertise HD1\u{2013}HD4. Enable \
+                         this when tuning to an MP11-partition broadcaster \
+                         with up to 8 audio subchannels.",
+                    )
+                    .small()
+                    .color(egui::Color32::from_gray(140)),
+                );
+                if resp.changed() {
+                    commands.push(UiCommand::SetShowHd5Hd8(show_hd5_hd8));
+                }
+
+                let mut auto_decode = self.app_state.auto_decode_all_advertised;
+                let resp = ui.checkbox(
+                    &mut auto_decode,
+                    "Auto-decode every advertised subchannel",
+                );
+                ui.label(
+                    egui::RichText::new(
+                        "When a station's SIS table advertises HD2–HD4 (or \
+                         more), spawn a background decoder for each as soon \
+                         as it appears. Off by default: each extra decoder \
+                         is roughly one extra CPU core, and most listeners \
+                         only want HD1.",
+                    )
+                    .small()
+                    .color(egui::Color32::from_gray(140)),
+                );
+                if resp.changed() {
+                    commands.push(UiCommand::SetAutoDecodeAllAdvertised(auto_decode));
+                }
+
+                ui.add_space(12.0);
+                ui.separator();
+                ui.add_space(4.0);
+
+                // ---- Recording ----------------------------------------
+                ui.heading("Recording");
+                ui.label(
+                    egui::RichText::new(
+                        "Record any one HD subchannel as a 96 kbps Opus \
+                         file. The recording locks to whichever HD button \
+                         is selected at the moment you press Record \u{2014} \
+                         you can then listen to a different subchannel \
+                         without disturbing it.",
+                    )
+                    .small()
+                    .color(egui::Color32::from_gray(140)),
+                );
+                ui.add_space(4.0);
+
+                // Mode dropdown
+                let current_mode = self.config.recording_mode;
+                ui.horizontal(|ui| {
+                    ui.label("Mode:");
+                    egui::ComboBox::from_id_salt("recording_mode_combo")
+                        .selected_text(current_mode.label())
+                        .show_ui(ui, |ui| {
+                            for mode in [
+                                crate::config::RecordingMode::Off,
+                                crate::config::RecordingMode::On,
+                            ] {
+                                if ui
+                                    .selectable_label(
+                                        current_mode == mode,
+                                        mode.label(),
+                                    )
+                                    .clicked()
+                                    && current_mode != mode
+                                {
+                                    commands.push(UiCommand::SetRecordingMode(mode));
+                                }
+                            }
+                        });
+                });
+
+                // Folder picker
+                let current_dir = self
+                    .config
+                    .recording_dir
+                    .clone()
+                    .unwrap_or_else(|| {
+                        crate::paths::default_recording_dir()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_else(|| "<unresolved>".to_string())
+                    });
+                ui.horizontal(|ui| {
+                    ui.label("Folder:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut current_dir.clone())
+                            .desired_width(280.0)
+                            .interactive(false),
+                    );
+                    if ui.button("Browse\u{2026}").clicked() {
+                        let start_dir = self
+                            .config
+                            .recording_dir
+                            .as_ref()
+                            .map(std::path::PathBuf::from)
+                            .or_else(crate::paths::default_recording_dir);
+                        let mut dialog = rfd::FileDialog::new()
+                            .set_title("Choose recordings folder");
+                        if let Some(d) = start_dir.as_ref() {
+                            dialog = dialog.set_directory(d);
+                        }
+                        if let Some(chosen) = dialog.pick_folder() {
+                            commands.push(UiCommand::SetRecordingDir(Some(
+                                chosen.display().to_string(),
+                            )));
+                        }
+                    }
+                    if self.config.recording_dir.is_some()
+                        && ui
+                            .button("Reset")
+                            .on_hover_text("Revert to the default recordings folder")
+                            .clicked()
+                    {
+                        commands.push(UiCommand::SetRecordingDir(None));
+                    }
+                });
+
+                // Max minutes per file
+                let mut max_minutes = self.config.recording_max_minutes as i32;
+                ui.horizontal(|ui| {
+                    ui.label("Max minutes per file:");
+                    let resp = ui.add(
+                        egui::DragValue::new(&mut max_minutes)
+                            .range(1..=240)
+                            .speed(1.0)
+                            .suffix(" min"),
+                    );
+                    if resp.changed() {
+                        commands.push(UiCommand::SetRecordingMaxMinutes(
+                            max_minutes.clamp(1, 240) as u32,
+                        ));
+                    }
+                });
+                ui.label(
+                    egui::RichText::new(
+                        "Hard cap on a single .opus file. Continuous mode \
+                         rotates to a new file when reached; per-song mode \
+                         splits sooner whenever the song changes.",
+                    )
+                    .small()
+                    .color(egui::Color32::from_gray(140)),
+                );
+
+                // Subfolder per station
+                let mut subfolder = self.config.recording_subfolder_per_station;
+                let resp = ui.checkbox(
+                    &mut subfolder,
+                    "Group files into per-station subfolders",
+                );
+                if resp.changed() {
+                    commands.push(UiCommand::SetRecordingSubfolderPerStation(subfolder));
+                }
+
+                ui.add_space(12.0);
+                ui.separator();
+
                 // ---- Footer buttons -----------------------------------
                 ui.horizontal(|ui| {
                     if ui.button("Reset to defaults").clicked() {
@@ -2357,7 +3198,7 @@ impl Nrsc5App {
                 ui.vertical_centered(|ui| {
                     ui.heading(
                         egui::RichText::new("NRSC5 Studio")
-                            .color(egui::Color32::from_rgb(100, 160, 255)),
+                            .color(crate::gui::accent_color(self.app_state.dark_mode)),
                     );
                     ui.label(
                         egui::RichText::new(format!("Version {}", env!("CARGO_PKG_VERSION")))

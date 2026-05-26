@@ -6,6 +6,30 @@ use crate::dsp::{AgcSnapshot, SpectrumSnapshot, SpectrumTap};
 use crate::sdr::{DeviceInfo, GainElement};
 use crate::station_info::StationInfo;
 
+/// Lightweight mirror of the live `RecordingSession` for the GUI to
+/// read every frame. Lives on `AppState` so the dock can render a
+/// "● REC HD<N> — 0:34" pill without touching the actual
+/// `RecordingSession` handle (which owns a `JoinHandle` and is
+/// neither `Clone` nor cheaply borrowable from the dock layer).
+/// Updated by `App::update` whenever the recording session is
+/// started, stopped, or rotated to a new file.
+#[derive(Debug, Clone)]
+pub struct RecordingStatus {
+    /// HD subchannel (0..=7) currently being recorded. Independent of
+    /// `active_speaker` — the user can be listening to HD2 while
+    /// recording HD1, or vice versa.
+    pub program: u32,
+    /// Wall-clock moment the *current file* was opened. Drives the
+    /// elapsed-time readout in the REC pill (e.g. "0:34") and is
+    /// consulted by the file-rotation logic against
+    /// `recording_max_minutes`.
+    pub started_at: Instant,
+    /// Path to the .opus file currently being written. Surfaced via
+    /// the dock's hover-text and in the post-stop "saved to ..."
+    /// toast.
+    pub output_path: String,
+}
+
 /// One tile in the album-art heat-map collage: the file path to the image,
 /// the number of times it has appeared, and the unique (title, artist) pairs
 /// observed while it was on screen. Used to render hover tooltips.
@@ -17,6 +41,55 @@ pub struct ArtTile {
     pub songs: Vec<(String, String)>,
     /// Most recently observed album name for this cover, if any.
     pub album: String,
+}
+
+/// Per-HD-program runtime metadata. One slot per subchannel (HD1–HD8)
+/// in [`AppState::programs`]. Holds everything that has to track the
+/// active speaker independently of the others: now-playing PSD
+/// (title / artist / album / genre + each field's freshness
+/// timestamp), and the live cover-art path for that subchannel.
+///
+/// Station-level metadata (call sign, slogan, location, etc.) and
+/// the global album-art collage / heat-map stay on `AppState` directly
+/// — those are shared across all subchannels of one station and don't
+/// need per-program duplication.
+#[derive(Default, Debug, Clone)]
+pub struct ProgramRuntime {
+    pub title: String,
+    pub artist: String,
+    pub album: String,
+    pub genre: String,
+    /// Wall-clock time the `title` field was last refreshed by a
+    /// `NrscEvent::Metadata` event. `None` whenever no value has
+    /// been observed since the last retune / Stop. Per-field
+    /// freshness lets the Station Information panel fade out
+    /// individual rows (some stations drop Genre/Album between
+    /// songs while still pushing Title/Artist).
+    pub title_updated: Option<Instant>,
+    pub artist_updated: Option<Instant>,
+    pub album_updated: Option<Instant>,
+    pub genre_updated: Option<Instant>,
+    /// Full path to the current cover-art image for this program,
+    /// if any. Set by `record_album_art` via
+    /// `NrscEvent::Xhdr { param: 0, .. }`. Cleared by retune / Stop.
+    pub cover_art_path: Option<String>,
+}
+
+impl ProgramRuntime {
+    /// Clear every field. Called on retune / Stop / LostDevice so a
+    /// stale program slot doesn't carry song metadata into the next
+    /// session.
+    pub fn clear(&mut self) {
+        self.title.clear();
+        self.artist.clear();
+        self.album.clear();
+        self.genre.clear();
+        self.title_updated = None;
+        self.artist_updated = None;
+        self.album_updated = None;
+        self.genre_updated = None;
+        self.cover_art_path = None;
+    }
 }
 
 #[derive(Default)]
@@ -50,26 +123,60 @@ pub struct AppState {
     /// `Station name:` line). Used by the play log heuristics and as a
     /// fallback when SIS hasn't arrived yet.
     pub call_sign: String,
-    pub title: String,
-    pub artist: String,
-    pub album: String,
-    pub genre: String,
-    /// Wall-clock time the `title` field was last refreshed by a
-    /// `NrscEvent::Metadata` event. Used by the Station Information
-    /// panel to fade the Song Title row out independently of the
-    /// other PSD fields once `PSD_STALE_AFTER` elapses with no
-    /// further updates — stations sometimes drop Genre / Album
-    /// between songs while still pushing Title / Artist, and we
-    /// don't want the stale field to keep claiming to be current.
-    /// `None` whenever no value has been observed since the last
-    /// retune / Stop.
-    pub title_updated: Option<Instant>,
-    /// Per-field freshness for `artist`. See [`Self::title_updated`].
-    pub artist_updated: Option<Instant>,
-    /// Per-field freshness for `album`. See [`Self::title_updated`].
-    pub album_updated: Option<Instant>,
-    /// Per-field freshness for `genre`. See [`Self::title_updated`].
-    pub genre_updated: Option<Instant>,
+    /// Per-program runtime metadata, indexed 0..=7 (HD1..HD8). Phase
+    /// 3 Chunk 4 moved the PSD (`title` / `artist` / `album` /
+    /// `genre`) and live cover-art path off the top-level `AppState`
+    /// and into here so multi-decoder sessions can keep each
+    /// subchannel's now-playing state independent. The GUI reads
+    /// from `programs[active_idx()]`; the event handlers in
+    /// `app.rs` write into the slot indicated by the originating
+    /// `NrscEvent`'s `program` field.
+    pub programs: [ProgramRuntime; 8],
+    /// HD program currently routed to the speakers, polled every
+    /// frame from `Nrsc5Process::active_speaker()`. `None` when no
+    /// piped session is active. Used by [`Self::active_idx`] to
+    /// pick which `programs[]` slot the Now Playing panel renders.
+    pub active_speaker: Option<u32>,
+    /// Per-subchannel "decoder is running" gate, mirrored from
+    /// `Nrsc5Process::decoded_programs()` every frame. Drives the
+    /// toggle-switch state under each HD button so the GUI shows
+    /// reality, not the user's last click intent (e.g. an
+    /// `add_decoder` that failed because the cap was reached).
+    pub decoded: [bool; 8],
+    /// User setting: when true the HD program selector renders a
+    /// second row exposing HD5..HD8. Default false because most
+    /// stations only advertise up to HD4 and the extra row eats
+    /// vertical space in the dock. Persisted via
+    /// `AppConfig::show_hd5_hd8`.
+    pub show_hd5_hd8: bool,
+    /// User setting: when true the per-frame reconcile loop in
+    /// `App::update` auto-spawns a background decoder for every
+    /// subchannel SIS advertises. Independent of `active_speaker`
+    /// (which one is currently routed to the speakers); the user
+    /// can still flip individual toggles off after the auto-add.
+    /// Persisted via `AppConfig::auto_decode_all_advertised`.
+    pub auto_decode_all_advertised: bool,
+    /// Mirror of `AppConfig::recording_mode` so the dock can disable
+    /// the Record button when set to `Off` without taking a borrow
+    /// on the config. Updated every frame by `App::update`.
+    pub recording_mode: crate::config::RecordingMode,
+    /// Per-subchannel "we already tried to auto-spawn this one"
+    /// guard. Set inside the reconcile loop the first time a slot
+    /// goes from "advertised + not decoded" to an `add_decoder`
+    /// call, regardless of whether the call succeeded. Prevents the
+    /// reconcile loop from hammering `add_decoder` every frame on
+    /// a station that legitimately can't allocate another decoder
+    /// (e.g. MAX_DECODERS already hit). Cleared on Stop / TuneMhz
+    /// so a re-tune gets a fresh shot at every subchannel.
+    pub auto_add_attempted: [bool; 8],
+    /// Phase 4 — lightweight mirror of the live `RecordingSession` (if
+    /// any) for the GUI to read. The session itself lives on `App`
+    /// alongside `nrsc5` because it owns non-clone resources (the
+    /// encoder JoinHandle and the crossbeam sender into the
+    /// `SpeakerRouter`); only the surfaceable fields are mirrored
+    /// here so the dock can render a "● REC HD<N> — 0:34" pill
+    /// without taking a borrow on `App`.
+    pub recording: Option<RecordingStatus>,
     pub mer: f32,
     /// MER on the lower OFDM sideband, in dB. Drives the left half of the
     /// constellation cloud.
@@ -83,8 +190,6 @@ pub struct AppState {
     pub silence_s: f32,
     pub nrsc5_status: String,
     pub last_event: String,
-    /// Full path to the current cover art image file, if any.
-    pub cover_art_path: Option<String>,
     /// Full path to the station logo image file, if any.
     pub station_logo_path: Option<String>,
     /// Full path to the stitched traffic map image, if any.
@@ -143,6 +248,12 @@ pub struct AppState {
     /// (e.g. the DLL is missing in a stripped-down install) the no-SDR
     /// overlay stays hidden — we'd rather show no warning than a wrong one.
     pub sdr_probe_available: bool,
+    /// True iff the Windows `SDRplayAPIService` is installed on this
+    /// machine but isn't currently running. Set from the background
+    /// SDR probe; consumed by the no-SDR overlay to surface a clear
+    /// "start the service" hint instead of the generic "plug in a
+    /// dongle" message. Always `false` on non-Windows platforms.
+    pub sdrplay_service_stopped: bool,
     /// Last time we asked the probe how many SDRs are attached. Used to
     /// throttle the probe to roughly once every two seconds.
     pub sdr_last_probed: Option<Instant>,
@@ -244,14 +355,16 @@ impl AppState {
             .unwrap_or(false)
     }
 
-    /// True if any PSD field has been updated within the
-    /// [`Self::PSD_STALE_AFTER`] window. Used by the Station Information
-    /// panel to decide whether to show the PSD section at all.
+    /// True if any PSD field on the **active program** has been
+    /// updated within the [`Self::PSD_STALE_AFTER`] window. Used by
+    /// the Station Information panel to decide whether to show the
+    /// PSD section at all.
     pub fn psd_is_fresh(&self) -> bool {
-        Self::is_psd_field_fresh(self.title_updated)
-            || Self::is_psd_field_fresh(self.artist_updated)
-            || Self::is_psd_field_fresh(self.album_updated)
-            || Self::is_psd_field_fresh(self.genre_updated)
+        let p = &self.programs[self.active_idx()];
+        Self::is_psd_field_fresh(p.title_updated)
+            || Self::is_psd_field_fresh(p.artist_updated)
+            || Self::is_psd_field_fresh(p.album_updated)
+            || Self::is_psd_field_fresh(p.genre_updated)
     }
 
     /// True iff a per-field PSD timestamp is within
@@ -260,19 +373,56 @@ impl AppState {
         ts.map(|t| t.elapsed() < Self::PSD_STALE_AFTER).unwrap_or(false)
     }
 
-    /// Most recent PSD update across all four fields, used for the
-    /// "PSD updated Xs ago" footer. `None` whenever no PSD has been
-    /// observed since the last retune / Stop.
+    /// Most recent PSD update across all four fields of the **active
+    /// program**, used for the "PSD updated Xs ago" footer. `None`
+    /// whenever no PSD has been observed since the last retune /
+    /// Stop on the active subchannel.
     pub fn psd_latest_updated(&self) -> Option<Instant> {
+        let p = &self.programs[self.active_idx()];
         [
-            self.title_updated,
-            self.artist_updated,
-            self.album_updated,
-            self.genre_updated,
+            p.title_updated,
+            p.artist_updated,
+            p.album_updated,
+            p.genre_updated,
         ]
         .into_iter()
         .flatten()
         .max()
+    }
+
+    /// Index into [`Self::programs`] whose metadata the GUI should
+    /// render. Follows the active speaker while a piped session is
+    /// running; falls back to `selected_program` otherwise so the
+    /// Now Playing panel still shows whatever the user last tuned
+    /// to (even with empty PSD slots) instead of always defaulting
+    /// to HD1.
+    pub fn active_idx(&self) -> usize {
+        let idx = self.active_speaker.unwrap_or(self.selected_program) as usize;
+        idx.min(self.programs.len() - 1)
+    }
+
+    /// Mutable reference to the per-program runtime metadata for
+    /// the currently-active subchannel. Convenience for the small
+    /// number of call sites that need to update the displayed PSD
+    /// without first computing `active_idx()`.
+    pub fn active_program_mut(&mut self) -> &mut ProgramRuntime {
+        let idx = self.active_idx();
+        &mut self.programs[idx]
+    }
+
+    /// Read-only counterpart to [`Self::active_program_mut`].
+    pub fn active_program(&self) -> &ProgramRuntime {
+        &self.programs[self.active_idx()]
+    }
+
+    /// Clear every per-program slot (PSD + cover art). Called on
+    /// retune / Stop / LostDevice — the entire station's metadata is
+    /// invalid when the underlying SDR pipeline restarts, regardless
+    /// of which subchannels are decoded.
+    pub fn clear_all_programs(&mut self) {
+        for p in &mut self.programs {
+            p.clear();
+        }
     }
 
     /// Derived `[bool; 8]` indicating which HD subchannels should be

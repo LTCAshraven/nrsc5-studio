@@ -18,6 +18,7 @@ mod icon;
 mod maps;
 mod paths;
 mod play_log;
+mod recorder;
 mod sdr;
 mod sdr_detect;
 mod station_info;

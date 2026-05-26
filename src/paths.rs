@@ -190,6 +190,32 @@ pub fn aas_temp_dir() -> PathBuf {
     std::env::temp_dir().join(AAS_DIR_NAME)
 }
 
+/// Default base directory for Opus recordings.
+///
+/// We always default to `<exe_dir>/recordings` regardless of portable
+/// vs. installed mode, because recordings are user-facing media the
+/// user wants to find next to the app — not buried under
+/// `data/recordings/` in portable mode or under `~/Documents/` in
+/// installed mode. This keeps the design portable-first: a USB-stick
+/// install owns its own captures end-to-end, and an installed-mode
+/// run that points at a writable exe directory (which is the common
+/// case for unprivileged installs / dev runs from `target/...`)
+/// likewise keeps everything in one place.
+///
+/// If `<exe_dir>` isn't writable (e.g. an admin install to
+/// `Program Files`), the user can override the path in
+/// Settings → Recording. The recorder thread surfaces a clear "could
+/// not create file" status if the chosen dir is read-only.
+///
+/// Falls back to Documents only if the OS refuses to tell us where
+/// the executable lives (extremely rare).
+pub fn default_recording_dir() -> Option<PathBuf> {
+    if let Some(dir) = exe_dir() {
+        return Some(dir.join("recordings"));
+    }
+    Some(dirs::document_dir()?.join(APP_DIRNAME).join("recordings"))
+}
+
 /// Starting directory for the CSV-export Save-As dialog. Documents in
 /// both modes — CSV is a user-facing export, not part of portable data.
 pub fn documents_dir() -> Option<PathBuf> {

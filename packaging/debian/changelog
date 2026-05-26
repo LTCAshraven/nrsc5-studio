@@ -1,3 +1,21 @@
+nrsc5-studio (0.3.9-1) unstable; urgency=medium
+
+  * Opus 96 kbps session recording with per-subchannel files, Vorbis
+    tags (title/artist/station), and time-based rotation.
+  * Recordings now default to a portable folder next to the
+    executable instead of ~/Documents/nrsc5-studio/recordings/.
+  * Theme-aware accent color: light mode now passes WCAG-AA contrast
+    (RGB 28,100,210 ~5.5:1 on white) without darkening the dark-mode
+    accent.
+  * Fixed: constellation scope no longer loses lock when switching
+    subchannels (was inferring sync state from transient status text;
+    now reads the authoritative sync bool).
+  * Updated cargo-deb / cargo-generate-rpm metadata to install the
+    .desktop launcher, AppStream metainfo, manpage, and hicolor
+    icons (16/32/48/64/128/256px) into standard XDG paths.
+
+ -- LTCAshraven <ltcashraven@users.noreply.github.com>  Tue, 26 May 2026 14:00:00 +0000
+
 nrsc5-studio (0.3.7-1) unstable; urgency=medium
 
   * Linux packaging debut. .deb and .rpm now built from the same Rust

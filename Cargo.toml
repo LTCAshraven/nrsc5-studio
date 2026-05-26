@@ -1,10 +1,10 @@
 [package]
 name = "nrsc5-studio"
-version = "0.3.8"
+version = "0.3.9"
 edition = "2021"
 authors = ["LTCAshraven"]
 license = "MIT"
-description = "A native Windows desktop app for listening to HD Radio broadcasts with an RTL-SDR or SDRplay dongle, built on nrsc5 and SoapySDR."
+description = "Native desktop receiver for HD Radio (NRSC-5) broadcasts with an RTL-SDR or SDRplay dongle. Runs on Windows and Linux, built on nrsc5 and SoapySDR."
 repository = "https://github.com/LTCAshraven/nrsc5-studio"
 readme = "README.md"
 
@@ -34,6 +34,15 @@ libloading = "0.8"
 # offset adjustment) and fall back to CS16 for devices that don't
 # advertise CS8 natively (SDRplay).
 num-complex = { version = "0.4", default-features = false }
+# v0.4.0 (Phase 4 recording): `opus` is a thin Rust binding around
+# libopus (MSYS2 mingw64 `mingw-w64-x86_64-opus`). We encode the
+# 44.1 kHz s16 stereo PCM coming off `Nrsc5Process` at 96 kbps VBR
+# after a 44.1 \u2192 48 kHz rubato resample (libopus's documented input
+# rates are 8/12/16/24/48 kHz; 44.1 is *not* one of them). The `ogg`
+# crate provides the pure-Rust Ogg container muxer that wraps the
+# Opus packets into a streamable .opus file.
+opus = "0.3"
+ogg = "0.9"
 ron = "0.8"
 # v0.3.1: rubato gives us a high-quality fractional resampler for the
 # SDRplay path. SDRplay's lowest supported sample rates are
@@ -97,3 +106,100 @@ panic = "abort"      # No unwinding (smaller binary; fine for a GUI app)
 # the user into release mode for every smoke test.
 [profile.dev.package."*"]
 opt-level = 3
+
+# ---------------------------------------------------------------------------
+# Linux packaging (cargo-deb, cargo-generate-rpm)
+# ---------------------------------------------------------------------------
+# Both tools run *on a Linux host* after `cargo build --release` produces
+# `target/release/nrsc5-studio`. The .deb is built via:
+#   cargo install cargo-deb
+#   cargo deb --no-build
+# The .rpm is built via:
+#   cargo install cargo-generate-rpm
+#   cargo generate-rpm
+# See `scripts/build-linux-release.sh` for the full pipeline.
+#
+# Runtime dependencies the package declares:
+#   - libsoapysdr0.8 / SoapySDR: required, the `soapysdr` crate links it
+#   - librtlsdr0 / rtl-sdr: required, SoapyRTLSDR module loads it
+#   - libasound2 / alsa-lib: required, cpal speaks to PulseAudio/PipeWire
+#     through ALSA's PCM abstraction on Linux
+#   - nrsc5 helper: declared as Recommends/Suggests (not Requires) because
+#     Fedora doesn't ship it in the default repos; the binary itself
+#     surfaces a clear "nrsc5 not found on PATH" status if the user
+#     hasn't installed it yet.
+# ---------------------------------------------------------------------------
+
+[package.metadata.deb]
+maintainer = "LTCAshraven <ltcashraven@users.noreply.github.com>"
+copyright = "2025-2026, LTCAshraven. MIT licensed."
+license-file = ["LICENSE", "0"]
+extended-description = """\
+NRSC5 Studio is a native desktop receiver for HD Radio (NRSC-5) broadcasts.
+It pairs with an RTL-SDR or SDRplay dongle and the `nrsc5` decoder library
+to deliver per-subchannel audio, station metadata, album art, traffic and
+weather data, and 96 kbps Opus session recording. The app uses egui for
+its UI and SoapySDR for unified SDR backend access."""
+section = "sound"
+priority = "optional"
+# `$auto` resolves libc / libstdc++ / libgcc-s / libgl / libxkbcommon /
+# libwayland / libX11 / dbus etc. from the ELF NEEDED entries.
+depends = "$auto, libsoapysdr0.8, librtlsdr0, libasound2"
+recommends = "nrsc5"
+# Debian-format changelog. cargo-deb gzips and installs as changelog.Debian.gz.
+changelog = "packaging/debian/changelog"
+assets = [
+    ["target/release/nrsc5-studio", "usr/bin/", "755"],
+    ["README.md", "usr/share/doc/nrsc5-studio/README.md", "644"],
+    ["LICENSE", "usr/share/doc/nrsc5-studio/copyright", "644"],
+    ["THIRD_PARTY_NOTICES.md", "usr/share/doc/nrsc5-studio/THIRD_PARTY_NOTICES.md", "644"],
+    ["docs/linux-install.md", "usr/share/doc/nrsc5-studio/linux-install.md", "644"],
+    # Desktop integration
+    ["packaging/linux/nrsc5-studio.desktop", "usr/share/applications/nrsc5-studio.desktop", "644"],
+    ["packaging/linux/io.github.ltcashraven.Nrsc5Studio.metainfo.xml", "usr/share/metainfo/io.github.ltcashraven.Nrsc5Studio.metainfo.xml", "644"],
+    ["packaging/linux/nrsc5-studio.1", "usr/share/man/man1/nrsc5-studio.1", "644"],
+    # Hicolor icon theme (6 sizes)
+    ["packaging/linux/icons/hicolor/16x16/apps/nrsc5-studio.png", "usr/share/icons/hicolor/16x16/apps/nrsc5-studio.png", "644"],
+    ["packaging/linux/icons/hicolor/32x32/apps/nrsc5-studio.png", "usr/share/icons/hicolor/32x32/apps/nrsc5-studio.png", "644"],
+    ["packaging/linux/icons/hicolor/48x48/apps/nrsc5-studio.png", "usr/share/icons/hicolor/48x48/apps/nrsc5-studio.png", "644"],
+    ["packaging/linux/icons/hicolor/64x64/apps/nrsc5-studio.png", "usr/share/icons/hicolor/64x64/apps/nrsc5-studio.png", "644"],
+    ["packaging/linux/icons/hicolor/128x128/apps/nrsc5-studio.png", "usr/share/icons/hicolor/128x128/apps/nrsc5-studio.png", "644"],
+    ["packaging/linux/icons/hicolor/256x256/apps/nrsc5-studio.png", "usr/share/icons/hicolor/256x256/apps/nrsc5-studio.png", "644"],
+    # Bundled nrsc5 helper installer (user runs it once post-install)
+    ["scripts/install-nrsc5-helper.sh", "usr/share/nrsc5-studio/install-nrsc5-helper.sh", "755"],
+]
+
+[package.metadata.generate-rpm]
+license = "MIT"
+summary = "Native desktop receiver for HD Radio (NRSC-5) broadcasts"
+assets = [
+    { source = "target/release/nrsc5-studio", dest = "/usr/bin/nrsc5-studio", mode = "755" },
+    { source = "README.md", dest = "/usr/share/doc/nrsc5-studio/README.md", mode = "644", doc = true },
+    { source = "CHANGELOG.md", dest = "/usr/share/doc/nrsc5-studio/CHANGELOG.md", mode = "644", doc = true },
+    { source = "LICENSE", dest = "/usr/share/doc/nrsc5-studio/LICENSE", mode = "644", doc = true },
+    { source = "THIRD_PARTY_NOTICES.md", dest = "/usr/share/doc/nrsc5-studio/THIRD_PARTY_NOTICES.md", mode = "644", doc = true },
+    { source = "docs/linux-install.md", dest = "/usr/share/doc/nrsc5-studio/linux-install.md", mode = "644", doc = true },
+    # Desktop integration
+    { source = "packaging/linux/nrsc5-studio.desktop", dest = "/usr/share/applications/nrsc5-studio.desktop", mode = "644" },
+    { source = "packaging/linux/io.github.ltcashraven.Nrsc5Studio.metainfo.xml", dest = "/usr/share/metainfo/io.github.ltcashraven.Nrsc5Studio.metainfo.xml", mode = "644" },
+    { source = "packaging/linux/nrsc5-studio.1", dest = "/usr/share/man/man1/nrsc5-studio.1", mode = "644" },
+    # Hicolor icon theme (6 sizes)
+    { source = "packaging/linux/icons/hicolor/16x16/apps/nrsc5-studio.png", dest = "/usr/share/icons/hicolor/16x16/apps/nrsc5-studio.png", mode = "644" },
+    { source = "packaging/linux/icons/hicolor/32x32/apps/nrsc5-studio.png", dest = "/usr/share/icons/hicolor/32x32/apps/nrsc5-studio.png", mode = "644" },
+    { source = "packaging/linux/icons/hicolor/48x48/apps/nrsc5-studio.png", dest = "/usr/share/icons/hicolor/48x48/apps/nrsc5-studio.png", mode = "644" },
+    { source = "packaging/linux/icons/hicolor/64x64/apps/nrsc5-studio.png", dest = "/usr/share/icons/hicolor/64x64/apps/nrsc5-studio.png", mode = "644" },
+    { source = "packaging/linux/icons/hicolor/128x128/apps/nrsc5-studio.png", dest = "/usr/share/icons/hicolor/128x128/apps/nrsc5-studio.png", mode = "644" },
+    { source = "packaging/linux/icons/hicolor/256x256/apps/nrsc5-studio.png", dest = "/usr/share/icons/hicolor/256x256/apps/nrsc5-studio.png", mode = "644" },
+    # Bundled nrsc5 helper installer
+    { source = "scripts/install-nrsc5-helper.sh", dest = "/usr/share/nrsc5-studio/install-nrsc5-helper.sh", mode = "755" },
+]
+
+# Fedora package names: SoapySDR (capitalized), rtl-sdr (provides
+# librtlsdr.so.0), alsa-lib. nrsc5 is intentionally NOT listed; Fedora's
+# default repos don't ship it. RPMFusion / users building from source
+# can install it themselves.
+[package.metadata.generate-rpm.requires]
+SoapySDR = "*"
+rtl-sdr = "*"
+"alsa-lib" = "*"
+

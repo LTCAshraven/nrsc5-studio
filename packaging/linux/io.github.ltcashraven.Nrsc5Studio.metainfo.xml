@@ -81,6 +81,25 @@
   <content_rating type="oars-1.1" />
 
   <releases>
+    <release version="0.3.9" date="2026-05-26">
+      <description>
+        <p>Recording and packaging release. New 96 kbps Opus session
+        recorder writes per-subchannel Ogg Opus files with Vorbis tags
+        (artist, title, station). Supports time-based rotation. Default
+        output folder is portable — next to the executable — and can
+        be overridden. Linux .deb and .rpm packages return with proper
+        desktop integration (hicolor icons, .desktop launcher,
+        AppStream metainfo, manpage). Constellation lock no longer
+        drops when switching subchannels. Theme accent color is now
+        WCAG-AA contrast-compliant in light mode.</p>
+      </description>
+    </release>
+    <release version="0.3.8" date="2026-05-25">
+      <description>
+        <p>Light-theme polish and audio path cleanup leading into the
+        recorder work.</p>
+      </description>
+    </release>
     <release version="0.3.7" date="2026-05-24">
       <description>
         <p>Linux packaging debut. NRSC5 Studio is now distributed as

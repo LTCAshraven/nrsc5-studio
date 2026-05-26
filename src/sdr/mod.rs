@@ -14,9 +14,11 @@
 pub mod soapy;
 pub mod profile;
 pub mod resampler;
+pub mod iq_bus;
 
 pub use soapy::{DeviceInfo, SoapySdr};
 pub use profile::{DeviceProfile, R820T_GAINS_TENTHS};
+pub use iq_bus::IqBus;
 
 use thiserror::Error;
 

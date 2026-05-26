@@ -12,6 +12,19 @@ pub enum UiCommand {
     Stop,
     TuneMhz(f32),
     SelectProgram(u32),
+    /// Toggle background decoding for an HD subchannel. Drives
+    /// `Nrsc5Process::add_decoder` / `remove_decoder` from the
+    /// iOS-style switches under the HD program buttons. No-op when
+    /// no session is running — the switches render disabled in that
+    /// state so the command shouldn't even arrive then.
+    SetDecoderEnabled(u32, bool),
+    /// Show / hide the HD5..HD8 row of the program selector.
+    /// Persisted via `AppConfig::show_hd5_hd8`.
+    SetShowHd5Hd8(bool),
+    /// Enable / disable the "auto-spawn a decoder for every
+    /// advertised subchannel" reconcile loop. Persisted via
+    /// `AppConfig::auto_decode_all_advertised`.
+    SetAutoDecodeAllAdvertised(bool),
     SavePreset(usize),
     RecallPreset(usize),
     /// Commit a full preset edit (name, frequency, subchannel) for a slot.
@@ -82,6 +95,32 @@ pub enum UiCommand {
     ShowAbout,
     /// Hide the About dialog.
     HideAbout,
+    /// Phase 4 — start an Opus recording locked to the currently
+    /// selected program (i.e. `app_state.selected_program`). The
+    /// recording target stays on that subchannel even if the user
+    /// later swaps the active speaker, so they can listen to HD2 talk
+    /// while recording HD1 music or vice versa. No-op when a
+    /// recording is already in progress — the dock disables the
+    /// button in that case.
+    StartRecording,
+    /// Phase 4 — stop the active recording, flush + close the .opus
+    /// file, and surface the saved path in the status line. Idempotent
+    /// when no recording is active.
+    StopRecording,
+    /// Switch the recording mode (Off / PerSong / Continuous).
+    /// Persisted via `AppConfig::recording_mode`. Doesn't stop an
+    /// in-progress recording — the new mode applies to the next
+    /// StartRecording.
+    SetRecordingMode(crate::config::RecordingMode),
+    /// Set the per-file rotation cap in minutes. Snapped server-side
+    /// to [1, 240]. Persisted; applies to the next file rotation.
+    SetRecordingMaxMinutes(u32),
+    /// Toggle the "per-station subfolder" layout for new recordings.
+    /// Persisted; applies to the next StartRecording.
+    SetRecordingSubfolderPerStation(bool),
+    /// Set a custom output directory for new recordings. `None`
+    /// reverts to `paths::default_recording_dir()`. Persisted.
+    SetRecordingDir(Option<String>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -204,41 +243,39 @@ impl DockViewer<'_> {
 
             // Snapshot the "which subchannels has the station advertised"
             // gate up-front so the closure doesn't borrow `self.app_state`
-            // mutably while we're still reading it.
+            // mutably while we're still reading it. Also snapshot the
+            // active-speaker / decoded bitmap so each row of the selector
+            // can render its lit / toggled state without juggling borrow
+            // scopes per cell.
             let available = self.app_state.available_programs();
-            let current = self.app_state.selected_program.min(7);
+            let active_idx = self.app_state.active_idx();
+            let decoded = self.app_state.decoded;
+            let is_streaming = self.app_state.is_streaming;
+            let show_hd5_hd8 = self.app_state.show_hd5_hd8;
+            let rows: u32 = if show_hd5_hd8 { 2 } else { 1 };
 
-            // 2 rows of 4 buttons. The split mirrors the HD Radio
-            // partition layout (HD1-4 on P1+P3, HD5-8 on the P4 that
-            // MP11 adds) and stacks better on narrow dock widths than
-            // a single row of 8. Unlit buttons render with `.weak()`
-            // text but stay clickable — presets tune blind and SIS
-            // takes a second to light up, so blocking clicks on
-            // unadvertised programs would be wrong.
+            // Multi-decoder program selector. Each HD slot owns two
+            // controls stacked vertically:
+            //
+            //   [ HD<N> ]   <-- button: set this subchannel as the
+            //                  active speaker (cheap switch when the
+            //                  decoder is already running; auto-spawns
+            //                  one otherwise via SelectProgram's new
+            //                  multi-decoder-aware handler).
+            //   [ \u{25CF} ]      <-- iOS-style toggle: gate the
+            //                  background decoder for this subchannel.
+            //                  Independent of which one is currently
+            //                  on the speakers, so the user can keep
+            //                  HD1+HD2 decoding while listening to
+            //                  HD2.
+            //
+            // The HD5\u2013HD8 row is hidden by default and revealed via
+            // the "Show HD5\u2013HD8 row" checkbox in the SDR Settings
+            // modal \u2014 most stations only advertise up to HD4 and the
+            // second row would otherwise just sit there muted forever.
             ui.vertical(|ui| {
-                for row in 0..2u32 {
-                    ui.horizontal(|ui| {
-                        for col in 0..4u32 {
-                            let i = row * 4 + col;
-                            let lit = available[i as usize];
-                            let mut text = RichText::new(format!("HD{}", i + 1));
-                            if !lit {
-                                text = text.weak();
-                            }
-                            let mut resp =
-                                ui.selectable_label(current == i, text);
-                            if !lit {
-                                resp = resp.on_hover_text(
-                                    "Not advertised by this station. \
-                                     Click to tune anyway.",
-                                );
-                            }
-                            if resp.clicked() && current != i {
-                                self.commands
-                                    .push(UiCommand::SelectProgram(i));
-                            }
-                        }
-                    });
+                for row in 0..rows {
+                    self.render_program_row(ui, row, &available, active_idx, &decoded, is_streaming);
                 }
             });
         });
@@ -304,6 +341,68 @@ impl DockViewer<'_> {
             if stop_btn.clicked() {
                 self.commands.push(UiCommand::Stop);
             }
+
+            // Phase 4 — Record button. Locked-to-selected-subchannel
+            // model: clicking captures whatever HD is selected right
+            // now, and stays on it until Stop is clicked (independent
+            // of speaker swaps). Disabled when no stream is up or the
+            // user has Recording set to Off in Settings.
+            let is_recording = self.app_state.recording.is_some();
+            let recording_disabled = !self.app_state.is_streaming
+                || matches!(
+                    self.app_state.recording_mode,
+                    crate::config::RecordingMode::Off
+                );
+            let rec_fill = if is_recording {
+                Color32::from_rgb(200, 40, 40) // bright red while live
+            } else {
+                Color32::from_rgb(96, 32, 32) // muted brick when idle
+            };
+            let rec_label = if let Some(status) = self.app_state.recording.as_ref() {
+                let elapsed = status.started_at.elapsed().as_secs();
+                format!(
+                    "● REC HD{} {}:{:02}",
+                    status.program + 1,
+                    elapsed / 60,
+                    elapsed % 60,
+                )
+            } else {
+                "● Rec".to_string()
+            };
+            let rec_btn = ui.add_enabled(
+                !recording_disabled,
+                egui::Button::new(
+                    RichText::new(rec_label).color(btn_text).strong(),
+                )
+                .fill(rec_fill)
+                .min_size(egui::vec2(120.0, 26.0)),
+            );
+            let rec_btn = rec_btn.on_hover_text(if is_recording {
+                self.app_state
+                    .recording
+                    .as_ref()
+                    .map(|s| s.output_path.as_str())
+                    .unwrap_or("")
+                    .to_string()
+            } else if recording_disabled {
+                if !self.app_state.is_streaming {
+                    "Start a stream before recording".to_string()
+                } else {
+                    "Enable a recording mode in SDR Settings first".to_string()
+                }
+            } else {
+                format!(
+                    "Record HD{} (locked at start; stays put across speaker swaps)",
+                    self.app_state.selected_program + 1,
+                )
+            });
+            if rec_btn.clicked() {
+                if is_recording {
+                    self.commands.push(UiCommand::StopRecording);
+                } else {
+                    self.commands.push(UiCommand::StartRecording);
+                }
+            }
         });
 
         // Preset buttons
@@ -312,7 +411,7 @@ impl DockViewer<'_> {
         ui.add_space(2.0);
         ui.label(RichText::new("Presets").strong().small());
         ui.horizontal_wrapped(|ui| {
-            let accent = Color32::from_rgb(100, 160, 255);
+            let accent = crate::gui::accent_color(self.app_state.dark_mode);
             let dim = Color32::from_gray(120);
             for i in 0..6 {
                 let preset = self.presets.get(i);
@@ -498,23 +597,128 @@ impl DockViewer<'_> {
         }
     }
 
+    /// Render one HD-N row of the multi-decoder program selector: a
+    /// horizontal strip of four `HD<N>` buttons over a second strip
+    /// of four iOS-style toggle switches. The two strips are aligned
+    /// so each toggle sits directly under "its" button.
+    ///
+    /// `row` is 0 (HD1\u2013HD4) or 1 (HD5\u2013HD8). `active_idx` is the
+    /// program currently on the speakers (or `selected_program` when
+    /// no session is running) \u2014 used to highlight the matching button.
+    /// `decoded[i]` is the live "is this subchannel's background
+    /// decoder running" gate, polled per-frame from
+    /// `Nrsc5Process::decoded_programs()`; drives the toggle's bool
+    /// and disables the switch when no session is running.
+    fn render_program_row(
+        &mut self,
+        ui: &mut Ui,
+        row: u32,
+        available: &[bool; 8],
+        active_idx: usize,
+        decoded: &[bool; 8],
+        is_streaming: bool,
+    ) {
+        use crate::gui::widgets::{toggle_switch, toggle_switch_size};
+
+        // First strip: HD buttons. Allocate inside a horizontal so
+        // egui packs them in a single line; capture each button's
+        // x-center so the toggle row underneath can be positioned to
+        // match. Width is measured by reading back the rect of each
+        // returned response.
+        let mut button_centers_x: Vec<f32> = Vec::with_capacity(4);
+        ui.horizontal(|ui| {
+            for col in 0..4u32 {
+                let i = row * 4 + col;
+                let lit = available[i as usize];
+                let mut text = RichText::new(format!("HD{}", i + 1));
+                if !lit {
+                    text = text.weak();
+                }
+                let selected = active_idx as u32 == i;
+                let mut resp = ui.selectable_label(selected, text);
+                if !lit {
+                    resp = resp.on_hover_text(
+                        "Not advertised by this station. \
+                         Click to tune anyway.",
+                    );
+                }
+                button_centers_x.push(resp.rect.center().x);
+                if resp.clicked() && active_idx as u32 != i {
+                    self.commands.push(UiCommand::SelectProgram(i));
+                }
+            }
+        });
+
+        // Second strip: toggle switches. We allocate the same row
+        // height as the buttons (so the next row of buttons, if any,
+        // lines up underneath) and paint each switch centered on the
+        // matching button's x-center. `ui.put` lets us place a
+        // widget at an explicit rect inside the row's horizontal
+        // strip without breaking egui's auto-layout for everything
+        // else.
+        let switch_size = toggle_switch_size(ui);
+        let (row_rect, _) =
+            ui.allocate_exact_size(Vec2::new(ui.available_width(), switch_size.y), egui::Sense::hover());
+        let center_y = row_rect.center().y;
+        for col in 0..4u32 {
+            let i = (row * 4 + col) as usize;
+            let cx = button_centers_x
+                .get(col as usize)
+                .copied()
+                .unwrap_or(row_rect.left() + switch_size.x * 0.5);
+            let rect = egui::Rect::from_center_size(
+                egui::pos2(cx, center_y),
+                switch_size,
+            );
+            let mut child_ui = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(rect)
+                    .layout(egui::Layout::centered_and_justified(
+                        egui::Direction::TopDown,
+                    )),
+            );
+            // Disable the switch when no piped session is running \u2014
+            // there's no decoder pipeline to wire into and the user's
+            // click would silently no-op otherwise.
+            child_ui.set_enabled(is_streaming);
+            let mut on = decoded[i];
+            let resp = toggle_switch(&mut child_ui, &mut on).on_hover_text(
+                if is_streaming {
+                    "Start / stop the background decoder for this subchannel."
+                } else {
+                    "Press Start to enable per-subchannel decoders."
+                },
+            );
+            if resp.changed() {
+                self.commands
+                    .push(UiCommand::SetDecoderEnabled(i as u32, on));
+            }
+        }
+        ui.add_space(2.0);
+    }
+
     fn now_playing_ui(&mut self, ui: &mut Ui) {
-        let accent = Color32::from_rgb(100, 160, 255);
+        let accent = crate::gui::accent_color(self.app_state.dark_mode);
         let dim = Color32::from_gray(160);
 
+        // Pull the active subchannel's slot so artist/title/cover follow
+        // the speaker switch instead of being stuck on whichever decoder
+        // emitted Metadata most recently.
+        let slot = self.app_state.active_program();
+
         // Line 1: Artist (long station name OR song artist — changes with broadcast).
-        if !self.app_state.artist.is_empty() {
+        if !slot.artist.is_empty() {
             ui.label(
-                RichText::new(&self.app_state.artist)
+                RichText::new(&slot.artist)
                     .heading()
                     .color(accent),
             );
         }
 
         // Line 2: Title (slogan OR song title).
-        if !self.app_state.title.is_empty() {
+        if !slot.title.is_empty() {
             ui.label(
-                RichText::new(&self.app_state.title)
+                RichText::new(&slot.title)
                     .size(15.0)
                     .color(dim),
             );
@@ -526,7 +730,7 @@ impl DockViewer<'_> {
         ui.add_space(6.0);
 
         // Album art
-        if let Some(ref path) = self.app_state.cover_art_path {
+        if let Some(ref path) = slot.cover_art_path {
             let uri = format!("file:///{}", path.replace('\\', "/"));
             let available = ui.available_size();
             let max_side = available.x.min(available.y).min(300.0);
@@ -560,19 +764,20 @@ impl DockViewer<'_> {
     /// The panel shows a single "Waiting for station data\u2026" placeholder
     /// when neither section currently has anything to show.
     fn station_info_ui(&mut self, ui: &mut Ui) {
-        let accent = Color32::from_rgb(100, 160, 255);
+        let accent = crate::gui::accent_color(self.app_state.dark_mode);
         let dim = Color32::from_gray(160);
         let muted = Color32::from_gray(120);
         let alert_red = Color32::from_rgb(220, 80, 80);
 
-        let title_fresh = !self.app_state.title.is_empty()
-            && AppState::is_psd_field_fresh(self.app_state.title_updated);
-        let artist_fresh = !self.app_state.artist.is_empty()
-            && AppState::is_psd_field_fresh(self.app_state.artist_updated);
-        let album_fresh = !self.app_state.album.is_empty()
-            && AppState::is_psd_field_fresh(self.app_state.album_updated);
-        let genre_fresh = !self.app_state.genre.is_empty()
-            && AppState::is_psd_field_fresh(self.app_state.genre_updated);
+        let slot = self.app_state.active_program();
+        let title_fresh = !slot.title.is_empty()
+            && AppState::is_psd_field_fresh(slot.title_updated);
+        let artist_fresh = !slot.artist.is_empty()
+            && AppState::is_psd_field_fresh(slot.artist_updated);
+        let album_fresh = !slot.album.is_empty()
+            && AppState::is_psd_field_fresh(slot.album_updated);
+        let genre_fresh = !slot.genre.is_empty()
+            && AppState::is_psd_field_fresh(slot.genre_updated);
         let psd_has_any = title_fresh || artist_fresh || album_fresh || genre_fresh;
         let sis_has_any = self.app_state.station_info.has_any_data();
 
@@ -639,35 +844,36 @@ impl DockViewer<'_> {
             .num_columns(2)
             .spacing([12.0, 3.0])
             .show(ui, |ui| {
+                let slot = self.app_state.active_program();
                 Self::psd_row(
                     ui,
                     "Song Title",
-                    &self.app_state.title,
-                    self.app_state.title_updated,
+                    &slot.title,
+                    slot.title_updated,
                     muted,
                     dim,
                 );
                 Self::psd_row(
                     ui,
                     "Artist",
-                    &self.app_state.artist,
-                    self.app_state.artist_updated,
+                    &slot.artist,
+                    slot.artist_updated,
                     muted,
                     dim,
                 );
                 Self::psd_row(
                     ui,
                     "Album",
-                    &self.app_state.album,
-                    self.app_state.album_updated,
+                    &slot.album,
+                    slot.album_updated,
                     muted,
                     dim,
                 );
                 Self::psd_row(
                     ui,
                     "Genre",
-                    &self.app_state.genre,
-                    self.app_state.genre_updated,
+                    &slot.genre,
+                    slot.genre_updated,
                     muted,
                     dim,
                 );
@@ -808,7 +1014,7 @@ impl DockViewer<'_> {
             ui.add_space(4.0);
             ui.label(RichText::new("Subchannels").color(muted).small());
             egui::Grid::new("station_info_programs_grid")
-                .num_columns(5)
+                .num_columns(4)
                 .spacing([10.0, 2.0])
                 .show(ui, |ui| {
                     for (i, slot) in info.programs.iter().enumerate() {
@@ -824,16 +1030,40 @@ impl DockViewer<'_> {
                             prog.short_name.clone()
                         };
                         ui.label(RichText::new(name_txt));
-                        ui.label(
-                            RichText::new(prog.program_type.as_deref().unwrap_or("\u{2014}"))
-                                .color(dim),
-                        );
-                        ui.label(
-                            RichText::new(
-                                prog.sound_experience.as_deref().unwrap_or("\u{2014}"),
-                            )
-                            .color(dim),
-                        );
+
+                        // Per-program Now Playing cell, in place of
+                        // the program_type / sound_experience pair
+                        // we used to render here \u2014 those rarely
+                        // populated, and the live artist/title from
+                        // the active decoder for this subchannel is
+                        // way more useful for the user. Pulled from
+                        // the runtime slot populated by
+                        // `NrscEvent::Metadata { program, .. }`, so
+                        // every decoded subchannel surfaces its own
+                        // current song independently of which one is
+                        // on the speakers. Empty (placeholder em-dash)
+                        // when nothing has been observed yet \u2014
+                        // either the decoder isn't running, or PSD
+                        // hasn't arrived yet.
+                        let np_txt = self
+                            .app_state
+                            .programs
+                            .get(i)
+                            .map(|p| {
+                                let art = p.artist.trim();
+                                let titl = p.title.trim();
+                                match (art.is_empty(), titl.is_empty()) {
+                                    (false, false) => {
+                                        format!("{} \u{2014} {}", art, titl)
+                                    }
+                                    (false, true) => art.to_string(),
+                                    (true, false) => titl.to_string(),
+                                    (true, true) => "\u{2014}".to_string(),
+                                }
+                            })
+                            .unwrap_or_else(|| "\u{2014}".to_string());
+                        ui.label(RichText::new(np_txt).color(dim).italics());
+
                         let bitrate_txt = prog
                             .bit_rate_kbps
                             .map(|k| format!("{:.0} kbps", k))
@@ -1540,11 +1770,11 @@ impl DockViewer<'_> {
     fn constellation_ui(&mut self, ui: &mut Ui) {
         let dim = Color32::from_gray(140);
         // "Locked" iff nrsc5 has signaled sync and we're actively streaming.
-        // Without a lock we render very wide noise so the panel makes it
-        // obvious nothing is being received.
-        let synced = self.app_state.is_streaming
-            && (self.app_state.nrsc5_status == "synced"
-                || self.app_state.nrsc5_status.starts_with("audio started"));
+        // Use the dedicated `currently_synced` flag (set by NrscEvent::Sync /
+        // LostSync) rather than parsing the transient `nrsc5_status` string,
+        // which gets clobbered to e.g. "switched to HD2" on subchannel
+        // changes even though the underlying demod is still locked.
+        let synced = self.app_state.is_streaming && self.app_state.currently_synced;
         let lock_color = if synced {
             Color32::from_rgb(60, 170, 90)
         } else {
@@ -1958,7 +2188,7 @@ impl DockViewer<'_> {
                 ui.label(
                     RichText::new(status)
                         .small()
-                        .color(Color32::from_rgb(120, 180, 240)),
+                        .color(crate::gui::accent_color(self.app_state.dark_mode)),
                 );
             }
         });
