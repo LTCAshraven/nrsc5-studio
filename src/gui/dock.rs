@@ -83,6 +83,15 @@ pub enum UiCommand {
     /// Persisted; applied mid-stream when possible (RTL-SDR supports
     /// runtime PPM; SDRplay does not — the call no-ops there).
     SetSdrFreqCorrectionPpm(f64),
+    /// Pick which antenna input the SDR uses. The payload is the
+    /// Soapy antenna name as returned by `Sdr::antennas()` (e.g.
+    /// `"Tuner 1 50ohm"` on RSPduo). Persisted into
+    /// `AppConfig.sdr.antenna`; takes effect by restarting the
+    /// active stream (antenna switching is not hot-swappable on
+    /// every driver, and a clean restart is the simplest path that
+    /// works across the supported set). When no stream is running
+    /// the change just lands in config and applies on the next Start.
+    SetSdrAntenna(String),
     /// Reset everything in the `[sdr]` config section back to default
     /// (`driver=rtlsdr`, empty args, 0 PPM, no gain overrides). The SDR
     /// Settings modal's "Reset to defaults" button.
@@ -1743,6 +1752,44 @@ impl DockViewer<'_> {
             );
         }
         ui.add_space(6.0);
+
+        // ----- Antenna selector -----------------------------------------
+        // Only renders when the live SDR reports more than one
+        // antenna input. Single-input devices (RTL-SDR Blog V3,
+        // HackRF One, RSP1A) collapse this entire block to nothing.
+        // Picking a new entry pushes `SetSdrAntenna` which restarts
+        // the stream so the next `configure()` applies the choice
+        // \u2014 brief audio gap (~250 ms), no decoder gymnastics.
+        if self.app_state.sdr_antennas.len() > 1 {
+            ui.separator();
+            ui.label(RichText::new("Antenna").small().strong().color(dim));
+            let active = self
+                .app_state
+                .active_antenna
+                .clone()
+                .unwrap_or_else(|| "<default>".to_string());
+            let mut new_antenna: Option<String> = None;
+            egui::ComboBox::from_id_salt("sdr_antenna_combo")
+                .selected_text(active.clone())
+                .width(180.0)
+                .show_ui(ui, |ui| {
+                    for name in &self.app_state.sdr_antennas {
+                        if ui
+                            .selectable_label(*name == active, name)
+                            .on_hover_text(
+                                "Switching antennas briefly restarts the stream.",
+                            )
+                            .clicked()
+                        {
+                            new_antenna = Some(name.clone());
+                        }
+                    }
+                });
+            if let Some(name) = new_antenna {
+                self.commands.push(UiCommand::SetSdrAntenna(name));
+            }
+            ui.add_space(6.0);
+        }
 
         ui.separator();
         ui.label(

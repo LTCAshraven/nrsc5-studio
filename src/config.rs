@@ -185,6 +185,14 @@ pub struct SdrConfigSection {
     pub freq_correction_ppm: f64,
     #[serde(default)]
     pub gains: BTreeMap<String, f64>,
+    /// Selected antenna input name (Soapy element). `None` =
+    /// "let the device profile's `default_antenna` decide, or fall
+    /// back to whatever the driver enumerates first". Persisted so
+    /// users with multi-input SDRplay RSPs don't have to re-pick the
+    /// antenna on every launch. The Tuner panel only surfaces the
+    /// dropdown when the live SDR reports more than one antenna.
+    #[serde(default)]
+    pub antenna: Option<String>,
 }
 
 fn default_sdr_driver() -> String {
@@ -198,6 +206,7 @@ impl Default for SdrConfigSection {
             device_args: String::new(),
             freq_correction_ppm: 0.0,
             gains: BTreeMap::new(),
+            antenna: None,
         }
     }
 }

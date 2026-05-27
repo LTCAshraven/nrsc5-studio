@@ -94,7 +94,7 @@ pub struct GainElement {
 /// One-shot configuration applied at the start of a stream. Values are
 /// pulled from the existing tuning UI; the defaults below match what
 /// `nrsc5` itself uses for FM HD Radio.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct SdrConfig {
     /// Center frequency in Hz (e.g. 97_100_000 for 97.1 MHz).
     pub center_freq_hz: u32,
@@ -112,6 +112,12 @@ pub struct SdrConfig {
     /// once they've inspected the gain table). When `Some`, the backend
     /// also forces manual gain mode.
     pub initial_gain_tenths: Option<i32>,
+    /// Antenna input to select on the device. `None` leaves whatever
+    /// the driver picks by default. Devices with a single antenna
+    /// (RTL-SDR, RSP1A) ignore this. Multi-input devices (RSP Duo,
+    /// RSPdx) honor it. Backends call `set_antenna()` from
+    /// [`Sdr::configure`] when this is `Some`.
+    pub antenna: Option<String>,
 }
 
 impl Default for SdrConfig {
@@ -122,6 +128,7 @@ impl Default for SdrConfig {
             ppm_correction: 0,
             direct_sampling: 0,
             initial_gain_tenths: None,
+            antenna: None,
         }
     }
 }
@@ -219,4 +226,39 @@ pub trait Sdr: Send + Sync {
     /// `RTLSDR` profile so its AGC behavior is identical to Soapy's
     /// SoapyRTLSDR.
     fn driver(&self) -> &str;
+
+    /// Names of every antenna input this device exposes (in driver
+    /// enumeration order). Single-antenna devices (RTL-SDR, RSP1A)
+    /// return a one-element vec or empty; multi-input devices (RSP
+    /// Duo, RSPdx) return one entry per physical input. Used by the
+    /// Tuner panel to decide whether to render an antenna dropdown
+    /// (visible only when `len() > 1`).
+    ///
+    /// Default impl returns `vec![]` so backends that don't care
+    /// don't have to implement.
+    fn antennas(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// Currently selected antenna name (whatever the driver last
+    /// applied). `None` for devices that don't expose antenna
+    /// selection, or for backends that don't implement this.
+    fn antenna(&self) -> Option<String> {
+        None
+    }
+
+    /// Select one of the antenna inputs returned by [`antennas`].
+    /// Implementations should also re-read the device's gain range
+    /// and re-clamp any in-flight gain setpoint — the gain range
+    /// shifts with antenna selection on SDRplay HiZ. The caller
+    /// (config-change-restart flow) typically tears down the SDR
+    /// session anyway, so the in-flight clamp is belt-and-suspenders.
+    ///
+    /// Default impl is a silent no-op so single-antenna backends
+    /// don't need to implement.
+    ///
+    /// [`antennas`]: Sdr::antennas
+    fn set_antenna(&self, _name: &str) -> Result<(), SdrError> {
+        Ok(())
+    }
 }

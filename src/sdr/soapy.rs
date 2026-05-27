@@ -441,6 +441,16 @@ impl SoapySdr {
         let rfnotch_ctrl = read_or("rfnotch_ctrl");
         let dabnotch_ctrl = read_or("dabnotch_ctrl");
 
+        // Active antenna readback. Empty string on devices that don't
+        // expose antenna selection is the Soapy convention; we render
+        // it as `<unnamed>` so the line is never blank.
+        let active_antenna = self
+            .device
+            .antenna(RX, CH)
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "<unnamed>".to_string());
+
         // Resample plan recap -- mirrors what `run_stream` will do.
         let resample_str = match self.resample_rates.lock().ok().and_then(|g| *g) {
             Some((src, dst)) => format!("{src} -> {dst} Hz (sinc 128-tap)"),
@@ -449,9 +459,10 @@ impl SoapySdr {
 
         let block = format!(
             "\n[configure {driver} @ {ts:?}]\n  \
-             requested: rate={req_rate} Hz, freq={req_freq} Hz, ppm={ppm}, gain_tenths={gain:?}\n  \
+             requested: rate={req_rate} Hz, freq={req_freq} Hz, ppm={ppm}, gain_tenths={gain:?}, antenna={ant:?}\n  \
              device:    rate={actual_rate} Hz, freq={actual_freq} Hz, bandwidth={actual_bw} Hz\n  \
              gain:      mode={actual_mode}, value={actual_gain} dB\n  \
+             antenna:   active={active_antenna}\n  \
              sdrplay:   rfgain_sel={rfgain_sel}, rfnotch_ctrl={rfnotch_ctrl}, dabnotch_ctrl={dabnotch_ctrl}\n  \
              resample:  {resample_str}\n",
             driver = self.driver,
@@ -460,6 +471,7 @@ impl SoapySdr {
             req_freq = cfg.center_freq_hz,
             ppm = cfg.ppm_correction,
             gain = cfg.initial_gain_tenths,
+            ant = cfg.antenna,
         );
 
         if let Some(path) = crate::paths::sdr_diagnostics_file() {
@@ -538,6 +550,26 @@ impl Sdr for SoapySdr {
         // set_freq_correction_ppm).
         if cfg.ppm_correction != 0 {
             self.set_freq_correction_ppm(cfg.ppm_correction as f64)?;
+        }
+
+        // Antenna selection. The caller (`start_piped`) resolves the
+        // user's persisted choice against the device profile's
+        // `default_antenna` and passes the result here. `None` means
+        // "leave whatever the driver picked at open time" — fine for
+        // single-input devices (RTL-SDR, HackRF, RSP1A). Multi-input
+        // devices (RSPduo, RSPdx) get an explicit pick. Best-effort:
+        // a driver that doesn't recognize the name falls back to its
+        // default; we log via the diagnostics dump rather than
+        // erroring out (matches the rfgain_sel / notch_ctrl pattern
+        // below).
+        //
+        // Must run BEFORE the SDRplay-specific writes below because
+        // some keys (`rfgain_sel`) and the device's reported gain
+        // range are antenna-dependent on RSPdx HiZ.
+        if let Some(name) = cfg.antenna.as_deref() {
+            if let Err(e) = self.device.set_antenna(RX, CH, name) {
+                eprintln!("[soapy] set_antenna({name}) failed: {e}");
+            }
         }
 
         // Direct sampling mode is RTL-SDR-specific. Other drivers
@@ -821,6 +853,41 @@ impl Sdr for SoapySdr {
 
     fn driver(&self) -> &str {
         SoapySdr::driver(self)
+    }
+
+    fn antennas(&self) -> Vec<String> {
+        // Soapy returns the antenna list for the current RX channel.
+        // Best-effort: drivers without antenna selection report a
+        // single unnamed entry, which we filter out below so the UI
+        // doesn't show a one-item dropdown. An error from the driver
+        // (rare; mostly older HackRF builds) collapses to an empty
+        // list, which also hides the dropdown — correct UX since
+        // there is nothing useful for the user to pick anyway.
+        let raw = self.device.antennas(RX, CH).unwrap_or_default();
+        raw.into_iter()
+            .filter(|s| !s.is_empty())
+            .collect()
+    }
+
+    fn antenna(&self) -> Option<String> {
+        self.device
+            .antenna(RX, CH)
+            .ok()
+            .filter(|s| !s.is_empty())
+    }
+
+    fn set_antenna(&self, name: &str) -> Result<(), SdrError> {
+        // The caller (the UI's antenna dropdown) expects this to fully
+        // restart the session for a clean re-application of gain
+        // setpoints, sample rate, etc. — so we just write the new
+        // antenna here without trying to re-clamp in-flight gain. The
+        // restart pass through `configure` does the rest.
+        self.device
+            .set_antenna(RX, CH, name)
+            .map_err(|e| SdrError::SoapyCall {
+                func: "set_antenna",
+                detail: format!("{name}: {e}"),
+            })
     }
 
     fn run_stream(

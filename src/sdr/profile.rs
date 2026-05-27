@@ -87,6 +87,13 @@ pub struct DeviceProfile {
     /// "HD Radio notes" disclosure. Cite specific HD Radio-relevant
     /// quirks (Low-IF vs Zero-IF, antenna bias-tee, etc.).
     pub hd_radio_notes: &'static str,
+    /// Default antenna name applied at stream start when the user
+    /// hasn't picked one (`SdrConfigSection::antenna == None`).
+    /// `None` means "let the driver pick" — fine for RTL-SDR and
+    /// single-input SDRplay devices. Multi-input devices set this to
+    /// the input that's right for HD Radio out-of-the-box (e.g.
+    /// `"Tuner 1 50ohm"` on the RSPduo / RSPdx).
+    pub default_antenna: Option<&'static str>,
     /// `true` once a contributor has confirmed HD Radio lock + AGC
     /// convergence on real hardware. Used to drive the "Not
     /// bench-validated" banner in the SDR Settings modal.
@@ -144,6 +151,10 @@ pub const RTLSDR: DeviceProfile = DeviceProfile {
         bias-tee LNA + outdoor antenna. The R820T2 silently snaps gain \
         to its 29 discrete steps; the app's gain slider matches that \
         same table.",
+    // RTL-SDR has a single antenna input; SoapyRTLSDR enumerates one
+    // unnamed antenna. Leave `None` so the backend skips the
+    // (no-op) set_antenna call.
+    default_antenna: None,
     bench_validated: true,
 };
 
@@ -207,6 +218,14 @@ pub const SDRPLAY: DeviceProfile = DeviceProfile {
         forced OFF at stream start (they kill the 200 kHz HD \
         sidebands). Requires the SDRplay API service from \
         sdrplay.com (free; can't be bundled).",
+    // RSPduo / RSPdx expose multiple inputs; "Tuner 1 50ohm" is the
+    // standard 50-ohm FM-band input on both. RSP1A enumerates the
+    // same name (its only input), so we can apply this default
+    // unconditionally — Soapy silently accepts it on every member of
+    // the family. The Tuner-panel dropdown only renders when the
+    // device reports more than one antenna, so RSP1A users never see
+    // a useless single-entry picker.
+    default_antenna: Some("Tuner 1 50ohm"),
     bench_validated: true,
 };
 
@@ -254,6 +273,8 @@ pub const HACKRF: DeviceProfile = DeviceProfile {
         HD Radio (it pulls broadcast FM out of the ADC headroom). \
         Start with LNA=24, VGA=24, AMP off and adjust from there. \
         Profile is NOT bench-validated; confirm before relying on it.",
+    // HackRF has a single SMA input; no antenna selection needed.
+    default_antenna: None,
     bench_validated: false,
 };
 

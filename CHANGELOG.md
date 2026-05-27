@@ -4,6 +4,56 @@ All notable changes to NRSC5 Studio are documented here. The format roughly
 follows [Keep a Changelog](https://keepachangelog.com/), and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.3.10] - 2026-05-27
+
+Tuner ergonomics release. Two long-standing rough edges in the SDR
+path are addressed: the **manual gain slider now applies live**
+instead of requiring a stream restart, and **multi-input SDRplay
+RSPs (RSPduo, RSPdx) get a real antenna picker** in the Tuner panel.
+Both changes use the same `apply_agc_action` / `set_antenna` paths
+already exercised by the closed-loop AGC, so there is no new
+hot-path code — just UI wiring that should have existed since 0.3.0.
+
+### Added
+
+- **Antenna selector in the Tuner panel.** Multi-input SDRplay
+  devices (RSPduo, RSPdx) now show a dropdown listing every antenna
+  the driver enumerates. Picking a new entry persists the choice
+  and briefly restarts the stream so the next `configure()` applies
+  the new input cleanly. Single-input devices (RTL-SDR Blog V3,
+  HackRF One, RSP1A) collapse the dropdown to nothing — the dropdown
+  only renders when `Sdr::antennas().len() > 1` so there is no
+  useless one-item picker. SDRplay devices get `"Tuner 1 50ohm"` as
+  the default on first launch via the new
+  `DeviceProfile.default_antenna` field.
+- **Persisted antenna choice.** `[sdr] antenna = "<name>"` in
+  `config.toml` survives across launches. Empty / missing falls back
+  to the device profile's default.
+
+### Changed
+
+- **Manual gain slider now hot-applies.** Dragging the slider in
+  Manual mode while a stream is running pushes the new gain through
+  the same `apply_agc_action` path the closed-loop AGC uses — same
+  brief distortion blip, no audio gap, no restart. Outside Manual
+  mode the slider isn't visible. The "(restart stream to apply)"
+  hint that previously appeared on every drag is gone.
+
+### Internal
+
+- `Sdr` trait gained `antennas() -> Vec<String>`, `antenna() ->
+  Option<String>`, and `set_antenna(&str) -> Result<(), SdrError>`
+  with no-op defaults so non-Soapy backends don't have to implement.
+- `SdrConfig` (the runtime per-stream config) gained
+  `antenna: Option<String>`; `Copy` derive was dropped (was unused).
+- `Nrsc5Handle::start_piped()` signature gained a 7th `antenna:
+  Option<String>` parameter; `retune()` forwards `last_antenna`
+  across stop/start cycles so the antenna survives frequency hops.
+- `Nrsc5Handle::set_manual_gain_tenths()` synthesizes an `AgcAction`
+  and routes through `apply_agc_action()` — the existing
+  SDRplay-IFGR-sign-flip + case-insensitive element matching apply
+  uniformly to manual mode now.
+
 ## [0.3.9] - 2026-05-26
 
 Recording release, plus the first Linux packages. Opus 96 kbps session

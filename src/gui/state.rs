@@ -321,6 +321,16 @@ pub struct AppState {
     /// throttle automatic refreshes and to show "Last refreshed Xs ago"
     /// in the modal.
     pub sdr_devices_last_refreshed: Option<Instant>,
+    /// Antenna names enumerated from the live SDR. Empty when no
+    /// stream is running OR the device only has a single (unnamed)
+    /// input. The Tuner-panel antenna dropdown only renders when
+    /// `len() > 1` so single-input dongles don't get a useless picker.
+    pub sdr_antennas: Vec<String>,
+    /// Currently-active antenna name on the live SDR (`Sdr::antenna`).
+    /// Pre-selects the right entry in the Tuner-panel dropdown. `None`
+    /// when no stream is running or the device doesn't expose antenna
+    /// selection.
+    pub active_antenna: Option<String>,
 }
 
 impl AppState {

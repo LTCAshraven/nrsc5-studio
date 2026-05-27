@@ -878,6 +878,14 @@ impl Nrsc5App {
             self.nrsc5.as_ref().and_then(|n| n.active_gain_mode());
         self.app_state.active_manual_gain_tenths =
             self.nrsc5.as_ref().and_then(|n| n.active_manual_gain_tenths());
+        // Refresh antenna state for the Tuner-panel dropdown. Both
+        // are best-effort: a live SDR with no multi-antenna concept
+        // returns an empty `Vec` and `None`, which collapses the
+        // dropdown to nothing (intended).
+        self.app_state.sdr_antennas =
+            self.nrsc5.as_ref().map(|n| n.sdr_antennas()).unwrap_or_default();
+        self.app_state.active_antenna =
+            self.nrsc5.as_ref().and_then(|n| n.active_antenna());
     }
 
     /// Push the current `app_state.volume` into the audio player. Wait-
@@ -2126,6 +2134,16 @@ impl Nrsc5App {
                 // config.rs logs a one-shot warning at load time when a
                 // user's existing config still has `use_rtl_tcp = true`.
                 let sdr_args = self.config.sdr.to_args_string();
+                // Resolve the antenna: persisted user choice wins; on
+                // fresh installs we fall through to the device profile's
+                // recommended default (`Some("Tuner 1 50ohm")` for
+                // SDRplay, `None` for RTL-SDR / HackRF). Resolved here
+                // so a future profile change automatically lights up
+                // for users who never customized.
+                let antenna = self.config.sdr.antenna.clone().or_else(|| {
+                    crate::sdr::profile::lookup(&self.config.sdr.driver)
+                        .and_then(|p| p.default_antenna.map(String::from))
+                });
                 let result = nrsc5.start_piped(
                     mhz,
                     program,
@@ -2133,6 +2151,7 @@ impl Nrsc5App {
                     self.config.sdr.freq_correction_ppm,
                     self.config.gain_mode,
                     self.config.manual_gain_tenths,
+                    antenna,
                 );
 
                 if let Err(err) = result {
@@ -2567,6 +2586,20 @@ impl Nrsc5App {
                 self.config.manual_gain_tenths = snapped;
                 self.app_state.manual_gain_tenths = snapped;
                 save_config(&self.config);
+                // Hot-apply if streaming in Manual mode \u2014 same
+                // infrastructure the closed-loop AGC uses, so the
+                // slider drag feels identical to AGC probing (brief
+                // distortion blip, no audio gap). Outside Manual
+                // mode the slider isn't visible anyway, but we still
+                // guard so a programmatic SetManualGainTenths during
+                // Auto doesn't fight the AGC.
+                if self.config.gain_mode == crate::config::GainMode::Manual {
+                    if let Some(nrsc5) = self.nrsc5.as_mut() {
+                        if let Err(e) = nrsc5.set_manual_gain_tenths(snapped) {
+                            eprintln!("[gain] hot-apply failed: {e}");
+                        }
+                    }
+                }
             }
             UiCommand::ExportLogCsv => {
                 // Native Save-As dialog defaults to Documents with a
@@ -2665,6 +2698,30 @@ impl Nrsc5App {
                 save_config(&self.config);
                 if let Some(nrsc5) = self.nrsc5.as_ref() {
                     let _ = nrsc5.set_sdr_freq_correction_ppm(ppm);
+                }
+            }
+            UiCommand::SetSdrAntenna(name) => {
+                // Empty string from the dropdown means "use device
+                // default" \u2014 normalize to `None` so the persisted
+                // form matches the resolved-on-start logic.
+                let new_antenna = if name.is_empty() { None } else { Some(name) };
+                if self.config.sdr.antenna == new_antenna {
+                    return;
+                }
+                self.config.sdr.antenna = new_antenna;
+                save_config(&self.config);
+                // Antenna selection isn't hot-swappable on every
+                // driver (SDRplay reports a fresh gain range per
+                // input; some Soapy modules refuse `setAntenna`
+                // outside `configure`), and the user explicitly
+                // accepted a brief restart in the antenna-dropdown
+                // tooltip. Restart by dispatching Stop+Start so
+                // the next `configure()` picks up the new value
+                // via the same resolve-then-pass path used at
+                // Start.
+                if self.app_state.is_streaming {
+                    self.handle_command(UiCommand::Stop);
+                    self.handle_command(UiCommand::Start);
                 }
             }
             UiCommand::ResetSdrConfig => {

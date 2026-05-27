@@ -1,3 +1,19 @@
+nrsc5-studio (0.3.10-1) unstable; urgency=medium
+
+  * Antenna selector in the Tuner panel for multi-input SDRplay RSPs
+    (RSPduo, RSPdx). Single-input devices unaffected (dropdown only
+    renders when the live SDR reports more than one antenna). The
+    chosen antenna persists into config.toml under [sdr] antenna.
+  * Manual gain slider now hot-applies mid-stream instead of
+    requiring a restart. Routes through the same apply_agc_action
+    path the closed-loop AGC uses, so the slider drag feels
+    identical to AGC probing.
+  * No DSP / decoder / packaging-script behavior change versus
+    0.3.9 — the new code is UI wiring on top of existing trait
+    methods.
+
+ -- LTCAshraven <ltcashraven@users.noreply.github.com>  Wed, 27 May 2026 14:00:00 +0000
+
 nrsc5-studio (0.3.9-1) unstable; urgency=medium
 
   * Opus 96 kbps session recording with per-subchannel files, Vorbis

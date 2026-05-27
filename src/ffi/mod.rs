@@ -311,6 +311,11 @@ pub struct Nrsc5Process {
     /// PPM correction applied to the current/last piped stream's SDR.
     /// Same lifecycle as `last_sdr_args`.
     last_ppm: Option<f64>,
+    /// Antenna name resolved (user choice or profile default) for the
+    /// current/last piped stream. Preserved across `stop()` for the
+    /// same reason as `last_sdr_args` so [`retune`](Self::retune) can
+    /// reuse it. `None` until the first piped Start.
+    last_antenna: Option<String>,
     tx: Sender<NrscEvent>,
     rx: Receiver<NrscEvent>,
     exe_path: PathBuf,
@@ -441,6 +446,7 @@ impl Nrsc5Process {
             last_manual_gain_tenths: None,
             last_sdr_args: None,
             last_ppm: None,
+            last_antenna: None,
             tx,
             rx,
             exe_path,
@@ -821,6 +827,42 @@ impl Nrsc5Process {
         }
     }
 
+    /// Hot-apply a manual gain (tenths of dB) to the live SDR. Uses
+    /// the same per-device gain-mapping path as the closed-loop AGC
+    /// (`apply_agc_action`) so the value gets routed through the
+    /// device profile's sign-flip / offset and clamped to the
+    /// element's actual range. No-op when no piped stream is
+    /// running — callers can still safely poke this on Manual-mode
+    /// slider drags while idle; the value will be picked up at the
+    /// next Start via the persisted `manual_gain_tenths`.
+    ///
+    /// Also updates `last_manual_gain_tenths` so the Tuner panel's
+    /// "(restart stream to apply)" hint stays in sync — without this,
+    /// dragging the slider while streaming would leave the hint stuck
+    /// on even after the value matches the live device.
+    pub fn set_manual_gain_tenths(&mut self, tenths: i32) -> Result<(), SdrError> {
+        let sdr = match self.sdr.as_ref() {
+            Some(s) => s,
+            None => {
+                // No live SDR; just record the desired value so the
+                // next start_piped sees the updated mirror.
+                self.last_manual_gain_tenths = Some(tenths);
+                return Ok(());
+            }
+        };
+        let profile = crate::sdr::profile::lookup(sdr.driver())
+            .copied()
+            .unwrap_or(crate::sdr::profile::RTLSDR);
+        let action = crate::dsp::AgcAction {
+            new_idx: 0,
+            new_tenths: tenths,
+            reason: "manual slider".to_string(),
+        };
+        let _ = apply_agc_action(sdr, &profile, &action);
+        self.last_manual_gain_tenths = Some(tenths);
+        Ok(())
+    }
+
     /// Apply a frequency-correction PPM nudge to the live SDR. Same
     /// no-op-when-idle semantics as `set_sdr_gain_element`. Some
     /// backends (SDRplay) silently ignore this — see their `Sdr`
@@ -841,6 +883,32 @@ impl Nrsc5Process {
             .as_ref()
             .map(|s| s.gain_elements())
             .unwrap_or_default()
+    }
+
+    /// Names of every antenna input the live SDR exposes. Empty when
+    /// no stream is running, or when the live device only has a single
+    /// (unnamed) input — the Tuner panel uses `len() > 1` as the gate
+    /// for showing its antenna dropdown.
+    pub fn sdr_antennas(&self) -> Vec<String> {
+        self.sdr
+            .as_ref()
+            .map(|s| s.antennas())
+            .unwrap_or_default()
+    }
+
+    /// Currently selected antenna name on the live SDR. `None` when
+    /// no stream is running or the device doesn't expose antenna
+    /// selection. The Tuner panel uses this to pre-select the right
+    /// entry in its dropdown.
+    pub fn active_antenna(&self) -> Option<String> {
+        // Prefer the live device's reported value; fall back to the
+        // last-resolved antenna so the UI still shows something
+        // sensible during the brief window between `start_piped`
+        // returning and the user clicking Stop.
+        self.sdr
+            .as_ref()
+            .and_then(|s| s.antenna())
+            .or_else(|| self.last_antenna.clone())
     }
 
     pub fn version(&self) -> String {
@@ -976,6 +1044,7 @@ impl Nrsc5Process {
         ppm_correction: f64,
         gain_mode: GainMode,
         manual_gain_tenths: i32,
+        antenna: Option<String>,
     ) -> Result<(), Nrsc5Error> {
         self.stop();
         while self.rx.try_recv().is_ok() {}
@@ -1010,6 +1079,7 @@ impl Nrsc5Process {
             ppm_correction: 0,
             direct_sampling: 0,
             initial_gain_tenths,
+            antenna: antenna.clone(),
         })?;
         let sdr: Arc<dyn Sdr> = Arc::new(soapy);
 
@@ -1324,6 +1394,7 @@ impl Nrsc5Process {
         self.last_manual_gain_tenths = Some(manual_gain_tenths);
         self.last_sdr_args = Some(sdr_args.to_string());
         self.last_ppm = Some(ppm_correction);
+        self.last_antenna = antenna;
 
         // ----- AGC driver thread (only when AGC is active) ----------
         // Ticks the controller every ~500 ms and applies any gain
@@ -1531,7 +1602,8 @@ impl Nrsc5Process {
                     .clone()
                     .unwrap_or_else(|| "driver=rtlsdr".to_string());
                 let ppm = self.last_ppm.unwrap_or(0.0);
-                self.start_piped(frequency_mhz, program, &args, ppm, gain_mode, manual)
+                let antenna = self.last_antenna.clone();
+                self.start_piped(frequency_mhz, program, &args, ppm, gain_mode, manual, antenna)
             }
             Some(LastStartMode::RtlTcp { host, port }) => {
                 self.start_rtltcp(frequency_mhz, program, &host, port)

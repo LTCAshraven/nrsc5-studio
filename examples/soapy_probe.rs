@@ -87,6 +87,7 @@ fn main() {
         ppm_correction: 0,
         direct_sampling: 0,
         initial_gain_tenths: Some(args.gain_tenths),
+        antenna: None,
     };
     println!(
         "Configuring: freq={:.3} MHz, rate={} sps, gain={:.1} dB",
