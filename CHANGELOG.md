@@ -4,6 +4,121 @@ All notable changes to NRSC5 Studio are documented here. The format roughly
 follows [Keep a Changelog](https://keepachangelog.com/), and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.4.0] - 2026-05-28
+
+Closed-loop AGC overhaul. The host-side gain controller is rewritten
+around a **Coarse-then-Fine** search instead of the flat hill-climb
+that v0.3.x used. The Coarse phase samples a small set of widely-spaced
+gain points to locate the basin of attraction, then the Fine phase
+hill-climbs ±1 around the best-seen index until the peak is bracketed.
+The new controller is far less likely to settle on a sub-optimal local
+shoulder, and a new **persistent gain cache** with a 7-day TTL lets
+the AGC skip the cold search entirely on stations you visit regularly
+(typical re-tune is now one verification probe instead of a full sweep).
+
+The settle gate also moves from raw elapsed time to **sample-driven**:
+the controller now waits for 8 MER reports (≈2 s at nrsc5's 4 Hz
+cadence) at each gain before making a decision. The first sample after
+a gain change is contaminated by SDR sync-recovery transients, and
+averaging across more samples drops the first sample's weight in the
+EMA from 22 % to under 3 %. The net effect is that the Fine phase
+actually finds the true peak instead of being misled by a single bad
+reading on the first probe of a new gain.
+
+Finally, an **`agc-trace.log` file** is written next to the other app
+data and overwritten at the start of every tune. It contains one line
+per probe — phase, gain in dB, table index, best-seen so far, and a
+reason string — plus the cache HIT/MISS edge and the final
+SETTLED/BAILED outcome. The README has a new "AGC trace log" section
+explaining where it lives and how to tail it.
+
+### Added
+
+- **Coarse-then-Fine AGC search.** New `SearchPhase::{Coarse, Fine,
+  Done}` enum in `AgcController`. The Coarse phase visits a small set
+  of widely-spaced gain points from the device profile
+  (`DeviceProfile.coarse_probe_tenths`) to bracket the global peak,
+  then the Fine phase ±1 hill-climbs around the winner until both
+  adjacent neighbours are explored. R820T2 ships with a 5-point coarse
+  set; SDRplay ships with a 5-point set tuned for its mid-table sweet
+  spot. Empty coarse set falls back to legacy Fine-only behaviour
+  (used by the test suite for determinism).
+- **Persistent per-station gain cache.** Successful settles write
+  `gain-cache.ron` (RON format, schema v1) under the same data
+  directory as the other app state. Re-tuning the same frequency on
+  the same driver/antenna combination within 7 days seeds the
+  controller directly into the Fine phase at the cached gain with
+  `mer_target_db = cached_mer - 3 dB` (the "trust but verify" floor),
+  so typical re-tune cost drops to a single verification probe. Cache
+  is keyed on `(driver, antenna, freq_khz)`; entries older than 7 days
+  are dropped on read. Writes are atomic (`.tmp` + rename) so a crash
+  mid-write can't corrupt the file.
+- **`agc-trace.log` observability file.** Every tune writes a
+  human-readable trace of the AGC's reasoning to a single file —
+  truncated at the start of each new tune so it never grows
+  unbounded. Contains a header (frequency, driver, antenna, PPM),
+  cache HIT/MISS, one line per probe with phase + gain + best-so-far
+  + reason, and a final SETTLED/BAILED line with the chosen gain and
+  best observed MER. Lives at `data\agc-trace.log` in portable mode
+  and `%LOCALAPPDATA%\nrsc5-studio\agc-trace.log` installed.
+- **`AgcSnapshot.best_tenths` field.** Exposes the gain in tenths-dB
+  at the controller's `best_gain_idx` so the UI and trace log can
+  display the actual best-seen gain instead of the current probe
+  gain (which used to be a confusing mislabel).
+- **`paths::agc_trace_path()` and `paths::gain_cache_path()`**
+  helpers, both honoring portable mode automatically.
+
+### Changed
+
+- **Sample-driven settle gate.** Default
+  `min_mer_samples_post_change` raised from 4 to **8** (≈2 s at
+  4 Hz). At the EMA's α=0.4, the first sample's weight in the final
+  EMA drops from 22 % (at 4 samples) to 2.8 % (at 8 samples) — large
+  enough to keep transient sync-loss readings on the first sample
+  after a gain change from contaminating the decision. Empirically
+  this is the difference between Fine settling at the actual peak vs.
+  bailing one step off it. Time cost: ~1 s per probe, ~6–8 s per
+  cold tune.
+- **`probe_period` soft ceiling** raised from 3000 ms to **4000 ms** to
+  outlast the nominal 8-sample window at 4 Hz plus jitter, while
+  still bailing in reasonable time on no-sync stations.
+- **`mer_target_db` raised** from 10 dB to **18 dB**. The settle
+  threshold is now meaningful on strong stations (lights up the
+  Settled badge when MER actually clears the HD3/HD4 threshold) and
+  the explored-set stability shortcut still handles marginal stations
+  cleanly via Fine convergence.
+- **AGC driver thread (in `ffi/mod.rs`)** now mirrors every per-probe
+  log line, cache decision, and settle/bail edge to both stderr and
+  `agc-trace.log`. Release builds use `windows_subsystem = "windows"`
+  which detaches stdio, so the file mirror is the channel that
+  actually reaches end users.
+
+### Fixed
+
+- **Fine-phase oscillation when the peak sits at the Coarse winner.**
+  The previous Fine logic walked unexplored gains starting from
+  `gain_idx`, which after a few direction flips would step *past* the
+  contiguous explored block around `best_gain_idx` and probe extreme
+  high/low gains for no good reason. The walk now anchors on
+  `best_gain_idx` and only ever probes the immediate ±1 neighbours;
+  if both neighbours are already explored, the controller settles
+  (if MER is acceptable) or bails (if not). Regression test:
+  `dsp::agc::tests::no_oscillation_revisits`.
+
+### Internal
+
+- `AgcConfig` gained `coarse_probe_tenths: &'static [i32]` and
+  `seeded_from_cache: bool`. Both have safe defaults so existing
+  call sites and tests keep working.
+- `DeviceProfile` gained `coarse_probe_tenths: &'static [i32]` so
+  the AGC's coarse set is profile-driven; new profiles can opt in by
+  populating the field, opt out by leaving it empty.
+- Test suite expanded to 12 AGC unit tests covering Coarse → Fine
+  transitions, cache-hit phase entry, the trust-but-verify settle
+  threshold, peak-bracketed early termination, and the oscillation
+  regression. All tests use a deterministic `cfg_fast()` that zeroes
+  the sample/timing gates so single-tick decisions are exercisable.
+
 ## [0.3.10] - 2026-05-27
 
 Tuner ergonomics release. Two long-standing rough edges in the SDR

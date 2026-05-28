@@ -104,6 +104,13 @@ pub enum UiCommand {
     ShowAbout,
     /// Hide the About dialog.
     HideAbout,
+    /// Phase 3 of the v0.4.0 AGC overhaul — wipe the persisted
+    /// per-frequency gain cache. Fired by the Tools/hamburger menu's
+    /// "Clear gain cache…" entry. The handler shows no confirmation
+    /// dialog (cache is regenerated automatically by future tunes);
+    /// the menu entry text itself already calls out the consequence
+    /// ("…" suffix per the agent-UI convention).
+    ClearGainCache,
     /// Phase 4 — start an Opus recording locked to the currently
     /// selected program (i.e. `app_state.selected_program`). The
     /// recording target stays on that subchannel even if the user
@@ -1603,22 +1610,41 @@ impl DockViewer<'_> {
         // status row below in that case.
         if let Some(snap) = self.app_state.agc_snapshot.as_ref() {
             use crate::dsp::AgcStatus;
+            use crate::dsp::SearchPhase;
             // Status icons are drawn from blocks egui's default font
             // covers (General Punctuation, Latin-1) — the Geometric
             // Shapes block (● ○ ◐) renders as tofu. Color is still the
             // primary cue; the glyph is decoration that disambiguates
             // for anyone color-blind.
+            //
+            // While PROBING, append the search sub-phase ("coarse" or
+            // "fine") so users can see whether the controller is
+            // mid-sweep or mid-hill-climb. Saves a config.toml dive
+            // for anyone diagnosing convergence behavior.
             let (status_text, status_color) = match snap.status {
-                AgcStatus::Probing => (
-                    "\u{2026} PROBING",      // U+2026 HORIZONTAL ELLIPSIS — "in motion"
-                    Color32::from_rgb(200, 160, 50),
-                ),
-                AgcStatus::Settled => (
-                    "\u{2022} SETTLED",      // U+2022 BULLET — "locked in"
-                    Color32::from_rgb(60, 170, 90),
-                ),
+                AgcStatus::Probing => {
+                    let phase_suffix = match snap.phase {
+                        SearchPhase::Coarse => " (coarse)",
+                        SearchPhase::Fine => " (fine)",
+                        SearchPhase::Done => "",
+                    };
+                    (
+                        format!("\u{2026} PROBING{}", phase_suffix), // U+2026 HORIZONTAL ELLIPSIS — "in motion"
+                        Color32::from_rgb(200, 160, 50),
+                    )
+                }
+                AgcStatus::Settled => {
+                    // Phase 3: surface cache-driven settle so users
+                    // can correlate near-instant lock with a warm
+                    // gain-cache entry vs a fresh coarse search.
+                    let suffix = if snap.from_cache { " (cached)" } else { "" };
+                    (
+                        format!("\u{2022} SETTLED{}", suffix), // U+2022 BULLET — "locked in"
+                        Color32::from_rgb(60, 170, 90),
+                    )
+                }
                 AgcStatus::Bailed => (
-                    "\u{00D7} BAILED",       // U+00D7 MULTIPLICATION SIGN — "gave up"
+                    "\u{00D7} BAILED".to_string(), // U+00D7 MULTIPLICATION SIGN — "gave up"
                     Color32::from_rgb(200, 70, 70),
                 ),
             };

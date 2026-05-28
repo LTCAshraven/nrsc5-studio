@@ -94,6 +94,21 @@ pub struct DeviceProfile {
     /// the input that's right for HD Radio out-of-the-box (e.g.
     /// `"Tuner 1 50ohm"` on the RSPduo / RSPdx).
     pub default_antenna: Option<&'static str>,
+    /// Tenths-of-dB points the AGC controller probes during its
+    /// **coarse search phase** before falling into ±1 fine hill-climb.
+    /// Snapped to nearest entries in `agc_tenths_table` at controller
+    /// construction. Each entry produces one probe, in the order
+    /// listed. Empty slice = skip coarse and go straight to the
+    /// legacy direction-walker (Fine phase).
+    ///
+    /// Pick a small set (3–5 points) **biased toward the family's HD
+    /// sweet spot** rather than spanning the whole table — the
+    /// dead zone at the bottom of the R820T2 / SDRplay tables never
+    /// produces a working over-the-air signal, so probing it just
+    /// wastes ~5s per probe. The coarse winner becomes the centre
+    /// of the Fine phase's ±1 walk, so the right answer almost
+    /// always sits within one step of a coarse point.
+    pub coarse_probe_tenths: &'static [i32],
     /// `true` once a contributor has confirmed HD Radio lock + AGC
     /// convergence on real hardware. Used to drive the "Not
     /// bench-validated" banner in the SDR Settings modal.
@@ -155,6 +170,13 @@ pub const RTLSDR: DeviceProfile = DeviceProfile {
     // unnamed antenna. Leave `None` so the backend skips the
     // (no-op) set_antenna call.
     default_antenna: None,
+    // R820T2 coarse set: 7.7 / 13.7 / 19.7 / 25.7 / 32.8 dB.
+    // Five middle-biased points skipping the dead 0–7 dB range no
+    // real over-the-air antenna ever needs; 19.7 dB is the same
+    // historical sweet-spot the legacy direction walker started at,
+    // so a strong-signal first tick still settles immediately via
+    // the target-MER shortcut without a coarse sweep.
+    coarse_probe_tenths: &[77, 137, 197, 257, 328],
     bench_validated: true,
 };
 
@@ -226,6 +248,13 @@ pub const SDRPLAY: DeviceProfile = DeviceProfile {
     // device reports more than one antenna, so RSP1A users never see
     // a useless single-entry picker.
     default_antenna: Some("Tuner 1 50ohm"),
+    // SDRplay coarse set: 26 / 32 / 38 / 43 / 47 dB. Biased into the
+    // upper half of the 20–48 dB aggregate-Gain table where the
+    // HD-lock sweet spot lives (RSP1A typically 38–44 dB, RSP duo
+    // similar). Skips the noisy bottom of the table — under
+    // realistic antenna conditions, < 26 dB only helps in the
+    // pathological strong-station-over-an-active-LNA case.
+    coarse_probe_tenths: &[260, 320, 380, 430, 470],
     bench_validated: true,
 };
 
@@ -275,6 +304,11 @@ pub const HACKRF: DeviceProfile = DeviceProfile {
         Profile is NOT bench-validated; confirm before relying on it.",
     // HackRF has a single SMA input; no antenna selection needed.
     default_antenna: None,
+    // HackRF coarse set: 16 / 24 / 32 dB. The LNA table only has
+    // six 8 dB steps total, so a 3-point coarse covers most of it;
+    // the ±1 Fine phase fills in the remaining gaps. 24 dB is the
+    // documented HD-Radio starting point per the notes above.
+    coarse_probe_tenths: &[160, 240, 320],
     bench_validated: false,
 };
 

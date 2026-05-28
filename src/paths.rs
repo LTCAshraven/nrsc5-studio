@@ -157,6 +157,30 @@ pub fn play_log_path() -> Option<PathBuf> {
     Some(data_root()?.join("play-log.ron"))
 }
 
+/// Path to the per-frequency gain cache (Phase 3 of the v0.4.0 AGC
+/// overhaul). Same data-root as the play log; the schema-versioned RON
+/// file holds one entry per `(freq, driver, antenna, ppm)` tuple. See
+/// [`crate::sdr::gain_cache`].
+///
+/// Portable mode: `<exe_dir>\data\gain-cache.ron`.
+/// Installed mode: `%LOCALAPPDATA%\nrsc5-studio\gain-cache.ron`.
+pub fn gain_cache_path() -> Option<PathBuf> {
+    Some(data_root()?.join("gain-cache.ron"))
+}
+
+/// Path to the AGC search trace log (Phase 2c). The piped-mode AGC
+/// driver thread writes one human-readable line per gain change plus
+/// SETTLED/BAILED transitions. Truncated at the start of every
+/// `start_piped` call so the file reflects the current tune's run
+/// only — old runs are not preserved (the gain cache captures the
+/// converged outcome, the trace is purely diagnostic).
+///
+/// Portable mode: `<exe_dir>\data\agc-trace.log`.
+/// Installed mode: `%LOCALAPPDATA%\nrsc5-studio\agc-trace.log`.
+pub fn agc_trace_path() -> Option<PathBuf> {
+    Some(data_root()?.join("agc-trace.log"))
+}
+
 /// Path to the SDR diagnostics snapshot written every time
 /// `SoapySdr::enumerate_devices()` runs. Captures env vars + per-driver
 /// enumeration outcomes so a "no devices detected" report can be

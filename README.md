@@ -77,9 +77,9 @@ Users without an SDRplay device can ignore this entirely — the bundled module 
 
 HackRF support ships in v0.3.0 but is **not yet bench-validated**. The device profile (`LNA`, `VGA`, `AMP` gain stages) is conservative but may need tuning for HD Radio. If you have a HackRF and try it, opening an issue with your findings would be hugely appreciated.
 
-### Deferred for v0.4.0: rtl_tcp / networked SDRs
+### Deferred to v0.5.0: rtl_tcp / networked SDRs
 
-The v0.2.x **rtl_tcp networked input** path is **deferred to v0.4.0** with full restoration via [SoapyRemote](https://github.com/pothosware/SoapyRemote). If your existing `config.toml` has `use_rtl_tcp = true`, v0.3.0 logs a one-shot warning on launch and falls back to local USB RTL-SDR for the session. Your `rtl_tcp_host` / `rtl_tcp_port` settings are preserved untouched and will be re-honored automatically when 0.4.0 ships.
+The v0.2.x **rtl_tcp networked input** path is **deferred to v0.5.0** with full restoration planned via [SoapyRemote](https://github.com/pothosware/SoapyRemote) alongside native `rtl_tcp` compatibility. If your existing `config.toml` has `use_rtl_tcp = true`, NRSC5 Studio logs a one-shot warning on launch and falls back to local USB RTL-SDR for the session. Your `rtl_tcp_host` / `rtl_tcp_port` settings are preserved untouched and will be re-honored automatically when v0.5.0 ships.
 
 ---
 
@@ -113,6 +113,38 @@ Tips:
 - **Tabs are draggable.** Pull a tab title bar off into its own floating sub-window, split panes, or close panes you don't need.
 - **Album-art collage** starts empty and grows as the station plays songs. After a couple of hours on a busy station you'll see real heat-map structure form.
 - **Weather radar** can take several minutes to receive a full frame even on a strong signal — that's a property of the broadcast, not the app. Will take several more minutes until enough of the frames change to show the animation.
+
+---
+
+## AGC trace log (power users)
+
+Every tune writes a short, human-readable trace of the closed-loop AGC's reasoning to a single file, overwritten at the start of each new tune so it always reflects the most recent attempt. If you're curious *why* the AGC picked a particular gain, or want to confirm the cache is being honored, this is the file to look at.
+
+Location:
+
+- **Portable** (default for the released zip): `data\agc-trace.log` beside `nrsc5-studio.exe`.
+- **Installed** (no `portable.txt` marker): `%LOCALAPPDATA%\nrsc5-studio\agc-trace.log`.
+
+Tail it live from PowerShell while tuning:
+
+```powershell
+# Portable layout (run from the unzipped folder):
+Get-Content -Wait .\data\agc-trace.log
+
+# Installed layout:
+Get-Content -Wait $env:LOCALAPPDATA\nrsc5-studio\agc-trace.log
+```
+
+What you'll see:
+
+- A header naming the frequency, driver, antenna, and PPM correction.
+- A **cache HIT** or **cache MISS** line indicating whether a cached gain was reused.
+- One line per probe: current phase (`Coarse` / `Fine` / `Done`), probe number, current gain in dB and table index, the best-seen gain so far, and the reason the controller is moving (or holding).
+- A closing **SETTLED** or **BAILED** line with the final gain and best observed MER.
+
+The gain cache itself lives next door at `gain-cache.ron` (same directory) and has a 7-day TTL. Delete it to force a full cold search on every station.
+
+Logging silently no-ops if the data directory is read-only, so this can't break a normal run.
 
 ---
 

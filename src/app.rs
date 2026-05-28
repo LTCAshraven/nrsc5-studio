@@ -514,6 +514,30 @@ impl eframe::App for Nrsc5App {
                     self.dock_state = default_dock_state();
                     ui.close_menu();
                 }
+                // Phase 3 (v0.4.0): expose the gain cache as a
+                // wipeable resource. Entry shows the current entry
+                // count as a parenthetical so the user can tell at a
+                // glance whether the action would do anything. The
+                // count comes from the live Nrsc5Process; when the
+                // backend isn't initialized yet we hide the entry
+                // entirely rather than show "(0 entries)".
+                if let Some(count) = self
+                    .nrsc5
+                    .as_ref()
+                    .map(|p| p.gain_cache_len())
+                {
+                    if count > 0 {
+                        let label = format!(
+                            "\u{1F5D1}  Clear gain cache\u{2026}  ({} {})",
+                            count,
+                            if count == 1 { "entry" } else { "entries" },
+                        );
+                        if ui.button(label).clicked() {
+                            menu_commands.push(UiCommand::ClearGainCache);
+                            ui.close_menu();
+                        }
+                    }
+                }
                 ui.separator();
                 if ui.button("\u{2139}  About NRSC5 Studio...").clicked() {
                     menu_commands.push(UiCommand::ShowAbout);
@@ -2668,6 +2692,21 @@ impl Nrsc5App {
             }
             UiCommand::HideAbout => {
                 self.app_state.show_about = false;
+            }
+            UiCommand::ClearGainCache => {
+                // Phase 3 (v0.4.0): drop every persisted entry. Next
+                // tune to any frequency runs a fresh coarse-then-fine
+                // search and re-seeds the cache on SETTLED. No
+                // confirmation dialog — the cost of an accidental
+                // wipe is one slow AGC cycle, not data loss.
+                if let Some(nrsc5) = self.nrsc5.as_ref() {
+                    let dropped = nrsc5.clear_gain_cache();
+                    eprintln!(
+                        "[ui] cleared gain cache ({} entr{} dropped)",
+                        dropped,
+                        if dropped == 1 { "y" } else { "ies" },
+                    );
+                }
             }
             UiCommand::RefreshSdrDevices => {
                 self.refresh_sdr_devices();

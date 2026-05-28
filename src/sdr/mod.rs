@@ -15,10 +15,12 @@ pub mod soapy;
 pub mod profile;
 pub mod resampler;
 pub mod iq_bus;
+pub mod gain_cache;
 
 pub use soapy::{DeviceInfo, SoapySdr};
 pub use profile::{DeviceProfile, R820T_GAINS_TENTHS};
 pub use iq_bus::IqBus;
+pub use gain_cache::{GainCache, GainCacheEntry, GainCacheKey};
 
 use thiserror::Error;
 

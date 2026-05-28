@@ -8,9 +8,9 @@ use std::thread::JoinHandle;
 use thiserror::Error;
 
 use crate::config::GainMode;
-use crate::dsp::{AgcConfig, AgcController, AgcSnapshot};
+use crate::dsp::{AgcConfig, AgcController, AgcSnapshot, AgcStatus};
 use crate::sdr::profile::DeviceProfile;
-use crate::sdr::{IqBus, Sdr, SdrConfig, SdrError, StreamControl};
+use crate::sdr::{GainCache, GainCacheEntry, GainCacheKey, IqBus, Sdr, SdrConfig, SdrError, StreamControl};
 
 mod decoder;
 use decoder::DecoderInstance;
@@ -316,10 +316,61 @@ pub struct Nrsc5Process {
     /// same reason as `last_sdr_args` so [`retune`](Self::retune) can
     /// reuse it. `None` until the first piped Start.
     last_antenna: Option<String>,
+    /// Per-frequency gain cache (Phase 3 of the v0.4.0 AGC overhaul).
+    /// Loaded once at `Nrsc5Process::new` from
+    /// [`crate::paths::gain_cache_path`]; survives across
+    /// `start_piped` / `stop` / `retune` so warm tunes can short-circuit
+    /// the AGC coarse search. Shared with the AGC driver thread via
+    /// `Arc<Mutex<_>>` so it can record a fresh entry whenever AGC
+    /// transitions to `Settled`. Wrapped in `Arc` so the field clone in
+    /// thread-spawn paths is cheap.
+    gain_cache: Arc<Mutex<GainCache>>,
     tx: Sender<NrscEvent>,
     rx: Receiver<NrscEvent>,
     exe_path: PathBuf,
     aas_dir: PathBuf,
+}
+
+/// Append one line to the AGC trace log (Phase 2c). Best-effort:
+/// open failure or write failure is silently ignored so the AGC
+/// driver thread never blocks or panics on a disk hiccup. The file
+/// is created on first call if missing; truncation happens via
+/// [`agc_log_start`] at the top of each `start_piped` so each tune's
+/// trace stands alone.
+fn agc_log_append(line: &str) {
+    let Some(path) = crate::paths::agc_trace_path() else {
+        return;
+    };
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = writeln!(f, "{}", line);
+    }
+}
+
+/// Truncate the AGC trace log and write a header for a new tune.
+/// Called once at the top of `start_piped` (after gain cache lookup)
+/// so the file always reflects the current run only — old runs are
+/// overwritten by design. Best-effort: silently ignored on failure.
+fn agc_log_start(header: &str) {
+    let Some(path) = crate::paths::agc_trace_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&path)
+    {
+        let _ = writeln!(f, "{}", header);
+    }
 }
 
 /// Translate one closed-loop AGC controller decision into the
@@ -348,8 +399,7 @@ fn apply_agc_action(
     profile: &DeviceProfile,
     action: &crate::dsp::AgcAction,
 ) -> Option<f64> {
-    let target = profile.agc_element;
-    let desired_db = profile.agc_tenths_to_element_db(action.new_tenths);
+    let target = profile.agc_element;    let desired_db = profile.agc_tenths_to_element_db(action.new_tenths);
 
     // Look up the element's actual range. We deliberately re-query
     // every action rather than caching: it's a cheap Soapy call (no
@@ -429,6 +479,13 @@ impl Nrsc5Process {
         let (tx, rx) = unbounded();
         let aas_dir = crate::paths::aas_temp_dir();
         let _ = std::fs::create_dir_all(&aas_dir);
+        // Best-effort cache load. Missing / unreadable file yields an
+        // empty cache; misbehavior is strictly a performance issue
+        // (cold AGC search on next tune), never a correctness bug.
+        let gain_cache = match crate::paths::gain_cache_path() {
+            Some(p) => GainCache::load(&p),
+            None => GainCache::new(),
+        };
         Ok(Self {
             decoders: Vec::new(),
             iq_thread: None,
@@ -447,6 +504,7 @@ impl Nrsc5Process {
             last_sdr_args: None,
             last_ppm: None,
             last_antenna: None,
+            gain_cache: Arc::new(Mutex::new(gain_cache)),
             tx,
             rx,
             exe_path,
@@ -789,6 +847,31 @@ impl Nrsc5Process {
     /// Cheap to call every frame.
     pub fn agc_snapshot(&self) -> Option<AgcSnapshot> {
         self.agc.as_ref().and_then(|h| h.lock().ok().map(|g| g.snapshot()))
+    }
+
+    /// Wipe the on-disk per-frequency gain cache (Phase 3 of the
+    /// v0.4.0 AGC overhaul). Used by the Tools menu "Clear gain
+    /// cache\u2026" entry. Failure to persist is non-fatal \u2014 the in-memory
+    /// cache is already cleared and the next save will overwrite the
+    /// stale file. Returns the number of entries that were dropped so
+    /// the UI can show a confirmation snackbar.
+    pub fn clear_gain_cache(&self) -> usize {
+        let mut dropped = 0;
+        if let Ok(mut cache) = self.gain_cache.lock() {
+            dropped = cache.len();
+            cache.clear();
+            if let Some(path) = crate::paths::gain_cache_path() {
+                cache.save(&path);
+            }
+        }
+        dropped
+    }
+
+    /// Number of entries currently in the gain cache (fresh + stale).
+    /// Surfaces in the Tools menu as a parenthetical so the user can
+    /// see whether "Clear gain cache…" would do anything.
+    pub fn gain_cache_len(&self) -> usize {
+        self.gain_cache.lock().map(|c| c.len()).unwrap_or(0)
     }
 
     /// Gain mode in effect for the currently-running (or most recent)
@@ -1153,7 +1236,7 @@ impl Nrsc5Process {
         let profile = crate::sdr::profile::lookup(sdr.driver())
             .copied()
             .unwrap_or(crate::sdr::profile::RTLSDR);
-        let (agc, agc_stderr_handle) = if gain_mode == GainMode::Auto {
+        let (agc, agc_stderr_handle, cache_hit_logged) = if gain_mode == GainMode::Auto {
             // Build the controller with the profile's per-driver start
             // gain. The global `AgcConfig::default()` aims at the RTL-SDR
             // sweet spot (19.7 dB); SDRplay and HackRF override it via
@@ -1162,9 +1245,74 @@ impl Nrsc5Process {
             // picks the initial search direction — RTL-SDR walks
             // DOWN from 19.7 dB (over-clip caution), SDRplay walks UP
             // from 39 dB (HD sweet spot is above the start, not below).
+            // v0.4.0 also wires the profile's coarse probe set into
+            // the controller so the Coarse phase visits each family's
+            // middle-biased sweet-spot points before falling into ±1
+            // Fine hill-climb around the winner.
             let mut agc_cfg = AgcConfig::default();
             agc_cfg.initial_tenths = profile.default_agc_initial_tenths;
             agc_cfg.initial_direction = profile.default_agc_initial_direction;
+            agc_cfg.coarse_probe_tenths = profile.coarse_probe_tenths;
+            // Phase 3 gain-cache lookup. The key is built from the
+            // about-to-be-tuned freq + driver + active antenna + the
+            // PPM correction in use. A hit overrides the profile's
+            // default initial gain with the previously-settled value
+            // and flips the controller into Fine-from-start so the
+            // coarse search is skipped entirely (~3 s warm tune vs
+            // ~10–15 s cold). The trust-but-verify floor is set 3 dB
+            // below the previously-observed MER so a marginal
+            // station doesn't get held to the production 18 dB
+            // target it could never reach again.
+            let cache_key = GainCacheKey::new(
+                (frequency_mhz * 1_000_000.0) as u32,
+                sdr.driver(),
+                antenna.clone(),
+                ppm_correction as f32,
+            );
+            // Phase 2c: open a fresh trace log for this tune so the
+            // user can tail %LOCALAPPDATA%\nrsc5-studio\agc-trace.log
+            // and watch the controller live regardless of how the exe
+            // is launched (the GUI subsystem detaches stdio).
+            agc_log_start(&format!(
+                "[agc] === new tune: {:.1} MHz driver={:?} antenna={:?} ppm={:.2} ===",
+                frequency_mhz, cache_key.driver, antenna, ppm_correction,
+            ));
+            let cache_hit_logged = match self.gain_cache.lock() {
+                Ok(cache) => match cache.lookup(&cache_key) {
+                    Some(entry) => {
+                        agc_cfg.initial_tenths = entry.gain_tenths;
+                        // Floor at 5 dB so a deeply-marginal cached
+                        // entry doesn't make the verify pass settle
+                        // on garbage.
+                        agc_cfg.mer_target_db = (entry.best_mer_db - 3.0).max(5.0);
+                        agc_cfg.seeded_from_cache = true;
+                        let msg = format!(
+                            "[agc] cache HIT for {:.1} MHz on {:?}: \
+                             starting at {:.1} dB (cached MER {:.1}, \
+                             verify floor {:.1})",
+                            frequency_mhz,
+                            cache_key.driver,
+                            entry.gain_tenths as f32 / 10.0,
+                            entry.best_mer_db,
+                            agc_cfg.mer_target_db,
+                        );
+                        eprintln!("{}", msg);
+                        agc_log_append(&msg);
+                        true
+                    }
+                    None => {
+                        let msg = format!(
+                            "[agc] cache MISS for {:.1} MHz on {:?}: \
+                             running fresh coarse-then-fine search",
+                            frequency_mhz, cache_key.driver,
+                        );
+                        eprintln!("{}", msg);
+                        agc_log_append(&msg);
+                        false
+                    }
+                },
+                Err(_) => false, // poisoned mutex — treat as cache miss
+            };
             let agc_ctrl = AgcController::new(
                 profile.agc_tenths_table,
                 agc_cfg,
@@ -1182,7 +1330,7 @@ impl Nrsc5Process {
                     reason: initial.reason,
                 });
             let stderr_handle = Arc::clone(&agc);
-            (Some(agc), Some(stderr_handle))
+            (Some(agc), Some(stderr_handle), cache_hit_logged)
         } else {
             // Surface the chosen mode on the status line so the user
             // can see what's running without checking config.toml.
@@ -1198,8 +1346,9 @@ impl Nrsc5Process {
                 tenths: manual_gain_tenths,
                 reason: label,
             });
-            (None, None)
+            (None, None, false)
         };
+        let _ = cache_hit_logged; // diagnostic side effect already emitted
 
         let stderr_tx = self.tx.clone();
         let stderr_thread = std::thread::spawn(move || {
@@ -1416,6 +1565,19 @@ impl Nrsc5Process {
             // baked into this copy.
             let agc_profile = profile;
             let tick_ms = profile.agc_tick_ms;
+            // Phase 3: cache write-back. The driver thread watches for
+            // the Probing -> Settled transition and records the
+            // settled gain to disk under the same key that was looked
+            // up in `start_piped` above. Clone everything the closure
+            // needs by value so it stays `'static`.
+            let cache_for_driver = Arc::clone(&self.gain_cache);
+            let cache_key_for_driver = GainCacheKey::new(
+                (frequency_mhz * 1_000_000.0) as u32,
+                sdr_for_agc.driver(),
+                self.last_antenna.clone(),
+                ppm_correction as f32,
+            );
+            let cache_path_for_driver = crate::paths::gain_cache_path();
             let agc_thread = std::thread::spawn(move || {
                 // SDRplay is sensitive right after stream activation;
                 // avoid immediate AGC writes in the first moment.
@@ -1427,26 +1589,117 @@ impl Nrsc5Process {
                 if startup_grace_ms > 0 {
                     std::thread::sleep(std::time::Duration::from_millis(startup_grace_ms));
                 }
+                // Track the previous-tick AGC status so we can detect
+                // the exact moment the controller flips from Probing
+                // (or any non-Settled) into Settled. Recording on the
+                // transition (not every tick while Settled) means the
+                // cache file gets written once per converged tune.
+                let mut prev_status = AgcStatus::Probing;
                 while !agc_stop_for_driver.load(Ordering::Relaxed) {
                     std::thread::sleep(std::time::Duration::from_millis(tick_ms));
                     if agc_stop_for_driver.load(Ordering::Relaxed) {
                         break;
                     }
-                    // Lock briefly to extract any pending action;
-                    // release the lock BEFORE the FFI call so the
-                    // stderr-parser thread can keep feeding events
-                    // without contention.
-                    let action = match agc_for_driver.lock() {
-                        Ok(mut ctrl) => ctrl.tick(),
+                    // Lock briefly to extract any pending action +
+                    // current status; release the lock BEFORE the
+                    // FFI call so the stderr-parser thread can keep
+                    // feeding events without contention.
+                    let (action, snap) = match agc_for_driver.lock() {
+                        Ok(mut ctrl) => {
+                            let action = ctrl.tick();
+                            let snap = ctrl.snapshot();
+                            (action, snap)
+                        }
                         Err(_) => break, // mutex poisoned — give up gracefully
                     };
                     if let Some(action) = action {
+                        // Phase 2c: per-action trace. Mirrored to
+                        // stderr (for the rare case the user got
+                        // stdio attached) and to the AGC log file
+                        // (the reliable channel — read with
+                        // `Get-Content -Wait %LOCALAPPDATA%\nrsc5-studio\agc-trace.log`).
+                        let best_str = snap
+                            .best_mer
+                            .map(|m| format!("{:.2}", m))
+                            .unwrap_or_else(|| "n/a".to_string());
+                        let line = format!(
+                            "[agc] phase={:?} status={:?} probes={} \
+                             gain={:.1}dB(idx {}) best={:.1}dB(idx {}, mer {}) \
+                             :: {}",
+                            snap.phase,
+                            snap.status,
+                            snap.probes_done,
+                            action.new_tenths as f32 / 10.0,
+                            action.new_idx,
+                            snap.best_tenths as f32 / 10.0,
+                            snap.best_idx,
+                            best_str,
+                            action.reason
+                        );
+                        eprintln!("{}", line);
+                        agc_log_append(&line);
                         let _ = apply_agc_action(&sdr_for_agc, &agc_profile, &action);
                         let _ = agc_tx.send(NrscEvent::AgcDecision {
                             tenths: action.new_tenths,
                             reason: action.reason,
                         });
                     }
+                    // Detect the Probing -> Settled edge and write
+                    // the converged gain back to the cache. Skipped
+                    // when the controller bailed (the entry from a
+                    // previous successful tune stays valid). We
+                    // require a finite `best_mer` so a controller
+                    // that settled via the stability shortcut with
+                    // no MER observation never poisons the cache.
+                    if prev_status != AgcStatus::Settled
+                        && snap.status == AgcStatus::Settled
+                    {
+                        if let Some(mer) = snap.best_mer {
+                            let entry = GainCacheEntry {
+                                gain_tenths: snap.current_tenths,
+                                best_mer_db: mer,
+                                recorded_at: std::time::SystemTime::now(),
+                            };
+                            if let Ok(mut cache) = cache_for_driver.lock() {
+                                cache.record(cache_key_for_driver.clone(), entry);
+                                if let Some(ref p) = cache_path_for_driver {
+                                    cache.save(p);
+                                }
+                            }
+                            let msg = format!(
+                                "[agc] SETTLED at {:.1} dB (idx {}, best MER {:.2}); \
+                                 cache write-back complete",
+                                snap.current_tenths as f32 / 10.0,
+                                snap.current_idx,
+                                mer,
+                            );
+                            eprintln!("{}", msg);
+                            agc_log_append(&msg);
+                        } else {
+                            let msg = format!(
+                                "[agc] SETTLED at {:.1} dB (idx {}); no MER reading, \
+                                 cache NOT written",
+                                snap.current_tenths as f32 / 10.0,
+                                snap.current_idx,
+                            );
+                            eprintln!("{}", msg);
+                            agc_log_append(&msg);
+                        }
+                    } else if prev_status == AgcStatus::Probing
+                        && snap.status == AgcStatus::Bailed
+                    {
+                        let msg = format!(
+                            "[agc] BAILED — gain restored to {:.1} dB (idx {}, best MER {})",
+                            snap.current_tenths as f32 / 10.0,
+                            snap.current_idx,
+                            snap.best_mer
+                                .map(|m| format!("{:.2}", m))
+                                .unwrap_or_else(|| "n/a".to_string())
+                        );
+                        eprintln!("{}", msg);
+                        agc_log_append(&msg);
+                    }
+                    prev_status = snap.status;
                 }
             });
 

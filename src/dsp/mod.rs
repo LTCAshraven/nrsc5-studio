@@ -6,5 +6,5 @@
 pub mod agc;
 pub mod spectrum;
 
-pub use agc::{AgcAction, AgcConfig, AgcController, AgcSnapshot, AgcStatus};
+pub use agc::{AgcAction, AgcConfig, AgcController, AgcSnapshot, AgcStatus, SearchPhase};
 pub use spectrum::{SpectrumSnapshot, SpectrumTap, FFT_SIZE, WATERFALL_ROWS};
