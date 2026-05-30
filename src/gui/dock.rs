@@ -1,4 +1,4 @@
-use crate::config::{GainMode, Preset};
+use crate::config::{GainMode, Preset, SdrTransport};
 use crate::gui::state::{AppState, LogViewMode};
 use crate::play_log::PlayLog;
 use egui::{Color32, DragValue, RichText, Ui, Vec2, WidgetText};
@@ -25,6 +25,10 @@ pub enum UiCommand {
     /// advertised subchannel" reconcile loop. Persisted via
     /// `AppConfig::auto_decode_all_advertised`.
     SetAutoDecodeAllAdvertised(bool),
+    /// Set how many preset slots the Tuner panel renders. Clamped
+    /// to 1..=48 at apply time. Persisted via
+    /// `AppConfig::preset_slot_count`.
+    SetPresetSlotCount(u32),
     SavePreset(usize),
     RecallPreset(usize),
     /// Commit a full preset edit (name, frequency, subchannel) for a slot.
@@ -96,6 +100,21 @@ pub enum UiCommand {
     /// (`driver=rtlsdr`, empty args, 0 PPM, no gain overrides). The SDR
     /// Settings modal's "Reset to defaults" button.
     ResetSdrConfig,
+    /// Switch which transport feeds the in-process piped pipeline.
+    /// Picks local SoapySDR, SoapyRemote, or a native rtl_tcp client.
+    /// Persisted to `AppConfig.sdr.transport`; applied on next Start.
+    SelectSdrTransport(SdrTransport),
+    /// Update the host string used by `SoapyRemote` / `RtlTcpRemote`
+    /// transports. Trimmed and persisted; ignored when transport is
+    /// `LocalSoapy`.
+    SetSdrRemoteHost(String),
+    /// Update the port used by `SoapyRemote` / `RtlTcpRemote`
+    /// transports. Persisted; ignored when transport is `LocalSoapy`.
+    SetSdrRemotePort(u16),
+    /// Update the trailing args string appended to `SoapyRemote`
+    /// connections (power-user override). Empty string clears the
+    /// field. Ignored for non-SoapyRemote transports.
+    SetSdrRemoteExtraArgs(String),
     /// Show the SDR Settings modal.
     ShowSdrSettings,
     /// Hide the SDR Settings modal.
@@ -361,14 +380,10 @@ impl DockViewer<'_> {
             // Phase 4 — Record button. Locked-to-selected-subchannel
             // model: clicking captures whatever HD is selected right
             // now, and stays on it until Stop is clicked (independent
-            // of speaker swaps). Disabled when no stream is up or the
-            // user has Recording set to Off in Settings.
+            // of speaker swaps). Enabled as soon as a stream is up;
+            // there's no separate "mode" toggle anymore.
             let is_recording = self.app_state.recording.is_some();
-            let recording_disabled = !self.app_state.is_streaming
-                || matches!(
-                    self.app_state.recording_mode,
-                    crate::config::RecordingMode::Off
-                );
+            let recording_disabled = !self.app_state.is_streaming;
             let rec_fill = if is_recording {
                 Color32::from_rgb(200, 40, 40) // bright red while live
             } else {
@@ -385,13 +400,21 @@ impl DockViewer<'_> {
             } else {
                 "● Rec".to_string()
             };
+            // Compact button when idle, full-width pill when armed —
+            // the subchannel + timer readout needs the extra room and
+            // also signals "this is now important" to the user.
+            let rec_min_size = if is_recording {
+                egui::vec2(120.0, 26.0)
+            } else {
+                egui::vec2(60.0, 26.0)
+            };
             let rec_btn = ui.add_enabled(
                 !recording_disabled,
                 egui::Button::new(
                     RichText::new(rec_label).color(btn_text).strong(),
                 )
                 .fill(rec_fill)
-                .min_size(egui::vec2(120.0, 26.0)),
+                .min_size(rec_min_size),
             );
             let rec_btn = rec_btn.on_hover_text(if is_recording {
                 self.app_state
@@ -401,11 +424,7 @@ impl DockViewer<'_> {
                     .unwrap_or("")
                     .to_string()
             } else if recording_disabled {
-                if !self.app_state.is_streaming {
-                    "Start a stream before recording".to_string()
-                } else {
-                    "Enable a recording mode in SDR Settings first".to_string()
-                }
+                "Start a stream before recording".to_string()
             } else {
                 format!(
                     "Record HD{} (locked at start; stays put across speaker swaps)",
@@ -429,7 +448,11 @@ impl DockViewer<'_> {
         ui.horizontal_wrapped(|ui| {
             let accent = crate::gui::accent_color(self.app_state.dark_mode);
             let dim = Color32::from_gray(120);
-            for i in 0..6 {
+            // User-configurable slot count (clamped to 1..=48 at
+            // apply time in `App::handle_command`). 0 would mean
+            // "no preset row at all" which we don't expose.
+            let slot_count = self.app_state.preset_slot_count.clamp(1, 48) as usize;
+            for i in 0..slot_count {
                 let preset = self.presets.get(i);
                 let label = if let Some(p) = preset {
                     if p.name.is_empty() {

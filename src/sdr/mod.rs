@@ -16,11 +16,13 @@ pub mod profile;
 pub mod resampler;
 pub mod iq_bus;
 pub mod gain_cache;
+pub mod rtltcp;
 
 pub use soapy::{DeviceInfo, SoapySdr};
 pub use profile::{DeviceProfile, R820T_GAINS_TENTHS};
 pub use iq_bus::IqBus;
 pub use gain_cache::{GainCache, GainCacheEntry, GainCacheKey};
+pub use rtltcp::RtlTcpSdr;
 
 use thiserror::Error;
 
@@ -51,6 +53,13 @@ pub enum SdrError {
         func: &'static str,
         detail: String,
     },
+    // === rtl_tcp backend (v0.5.0) ===
+    #[error("rtl_tcp connect to {addr} failed: {reason}")]
+    RtlTcpConnect { addr: String, reason: String },
+    #[error("rtl_tcp I/O on {addr}: {reason}")]
+    RtlTcpIo { addr: String, reason: String },
+    #[error("rtl_tcp magic header mismatch from {addr} (got {got:?}, expected `RTL0`)")]
+    RtlTcpBadMagic { addr: String, got: [u8; 4] },
 }
 
 /// Return value of the per-frame callback in [`Sdr::run_stream`]. Returning

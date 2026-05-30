@@ -4,15 +4,112 @@ All notable changes to NRSC5 Studio are documented here. The format roughly
 follows [Keep a Changelog](https://keepachangelog.com/), and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+## [0.4.1] - 2026-05-30
+
+SDR transport cleanup and Settings modal redesign. The `[sdr]` section
+now models the data source as an explicit `transport` choice —
+**LocalSoapy** (in-process SoapySDR, default and unchanged),
+**SoapyRemote** (Soapy-over-TCP via a `SoapySDRServer` instance), or
+**rtl_tcp** (native rtl_tcp client implemented end-to-end in Rust, no
+Soapy on the wire). Both remote transports feed the same in-process
+piped IQ → spectrum → AGC → nrsc5 pipeline that the local path uses,
+so every downstream feature (persistent gain cache, AGC trace log,
+per-element gain sliders where applicable) works identically across
+all three. The SDR Settings modal grew a Transport row at the top
+with per-transport host / port (and, for SoapyRemote, an extra-args)
+form.
+
+The 0.2.x runtime fallbacks that were deferred forward have been
+removed: `Nrsc5Process::start` (USB-direct) and
+`Nrsc5Process::start_rtltcp` (legacy rtl_tcp process launch) are
+gone, along with their `LastStartMode` variants. Old `config.toml`
+files with `use_rtl_tcp = true` (or `rtl_device_index`,
+`rtl_tcp_host`, `rtl_tcp_port`) are migrated transparently to the
+new `transport = "rtl_tcp_remote"` shape on first load; the legacy
+keys are then dropped on save.
+
+Alongside the transport work, the Settings modal got a full
+left-rail / 4-tab redesign (Connection / Gain / Display / Recording),
+the top-bar SDR chip and Settings header now reflect the active
+transport instead of the cached local driver, the top bar wraps to a
+second line on narrow windows so panel toggles stay reachable, and
+the bundled default dock layout was recaptured to fit comfortably on
+a 1920×1080 monitor with the Windows taskbar visible.
+
+### Added
+
+- **`SdrTransport` enum** in `src/config.rs` with
+  `LocalSoapy` / `SoapyRemote` / `RtlTcpRemote` variants and matching
+  `[sdr]` fields (`remote_host`, `remote_port`,
+  `remote_extra_args`).
+- **Native rtl_tcp backend** at `src/sdr/rtltcp.rs` implementing the
+  `Sdr` trait: 12-byte dongle-info header parse (`RTL0` magic),
+  5-byte BE command frames for set-freq / set-sample-rate /
+  set-gain-mode / set-tuner-gain / set-PPM / set-AGC, blocking CU8
+  read loop wired into the same callback the SoapySDR path uses.
+- **Transport-aware open** in `Nrsc5Process::start_piped` — branches
+  on the configured `SdrTransport` and constructs the right backend
+  (`SoapySdr::open` for Local / SoapyRemote, `RtlTcpSdr::open` for
+  RtlTcpRemote). `retune` rebuilds via the same cached transport
+  choice.
+- **Transport picker** in the SDR Settings modal with per-transport
+  Host / Port (and SoapyRemote "Extra args") inputs and contextual
+  help text describing which server must run on the remote machine.
+- **Redesigned Settings modal** with a left-rail tab nav (Connection,
+  Gain, Display, Recording), proper egui panel hierarchy capped at
+  95%/85% of the screen, radio-button device list, configurable
+  preset slot count (1..=48, default 6), and a transport-aware
+  connection-string display in the header.
+- **`SdrConfigSection::chip_label()`** and
+  **`SdrConfigSection::display_connection_string()`** helpers driving
+  the top-bar SDR chip and the Settings modal header so both reflect
+  the active transport instead of the cached local driver.
+- **`Nrsc5Process::exe_path()`** accessor + hover tooltip on the
+  top-bar status label so the bound `nrsc5.exe` path is one mouse-over
+  away without consuming horizontal space in the menu strip.
+- **Eight unit tests** for the config migration / `to_args_string()`
+  composition and **five unit tests** for the rtl_tcp command-frame
+  encoder and dongle-info parser.
+
+### Removed
+
+- `Nrsc5Process::start` (USB-direct, 0.2.x).
+- `Nrsc5Process::start_rtltcp` (legacy rtl_tcp process launch, 0.2.x).
+- `LastStartMode::Usb` and `LastStartMode::RtlTcp` variants — only
+  `Piped` remains.
+- The "Deferred to v0.5.0: rtl_tcp / networked SDRs" README block.
+- The "Recording Mode" dropdown in the Settings modal — the Rec
+  button alone is the on/off control now.
+
+### Changed
+
+- `Nrsc5Process::retune` signature simplified: the dropped
+  `device_index` parameter is no longer threaded through `UiCommand`.
+- `[sdr]` config no longer serializes `use_rtl_tcp`,
+  `rtl_device_index`, `rtl_tcp_host`, `rtl_tcp_port`, or
+  `use_piped_sdr` — they're read for migration and then dropped on
+  the next save.
+- Top-bar row switched from `ui.horizontal` to `ui.horizontal_wrapped`
+  so the panel-toggle buttons flow onto a second line at narrow widths
+  instead of clipping off the right edge of the OS window.
+- Default dock layout (`DEFAULT_DOCK_RON`) recaptured at ~1560×880
+  with a minimal panel set (Tuner + StationInfo, NowPlaying, Weather
+  + Traffic) so fresh installs fit on a 1920×1080 monitor.
+- `Nrsc5Process::version()` shortened to just `"nrsc5 process"`
+  (full binary path moved to a hover tooltip).
+
 ## [0.4.0] - 2026-05-28
 
 Closed-loop AGC overhaul. The host-side gain controller is rewritten
 around a **Coarse-then-Fine** search instead of the flat hill-climb
 that v0.3.x used. The Coarse phase samples a small set of widely-spaced
-gain points to locate the basin of attraction, then the Fine phase
+gain points to locate the general area, then the Fine phase
 hill-climbs ±1 around the best-seen index until the peak is bracketed.
 The new controller is far less likely to settle on a sub-optimal local
-shoulder, and a new **persistent gain cache** with a 7-day TTL lets
+shoulder, but it's not perfect.
+And a new **persistent gain cache** with a 7-day TTL lets
 the AGC skip the cold search entirely on stations you visit regularly
 (typical re-tune is now one verification probe instead of a full sweep).
 

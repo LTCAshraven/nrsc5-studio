@@ -1,3 +1,28 @@
+nrsc5-studio (0.4.1-1) unstable; urgency=medium
+
+  * SDR transport refactor. The [sdr] config models the data source
+    as an explicit `transport` field (LocalSoapy / SoapyRemote /
+    rtl_tcp). The pre-0.3.0 USB-direct and pre-0.5.0 `nrsc5 -H`
+    start paths are gone — every Start goes through the in-process
+    piped IQ → spectrum → AGC → nrsc5 pipeline regardless of
+    transport. Legacy `use_rtl_tcp` / `rtl_device_index` /
+    `rtl_tcp_host` / `rtl_tcp_port` config keys migrate transparently
+    to the new shape on first load.
+  * Native rtl_tcp client implemented end-to-end in Rust (no Soapy
+    on the wire) at src/sdr/rtltcp.rs: 12-byte dongle-info header
+    parse, 5-byte BE command frames, blocking CU8 read loop reusing
+    the same callback the SoapySDR path uses.
+  * Settings modal redesign: 4-tab layout (Connection / Gain /
+    Display / Recording) with a transport picker, radio device list,
+    configurable preset slot count, and a transport-aware
+    connection-string display.
+  * Top-bar SDR chip now reflects the active transport instead of
+    the cached local driver.
+  * 1080p-friendly default dock layout. The top bar wraps to a
+    second line on narrow windows so panel toggles stay reachable.
+
+ -- LTCAshraven <ltcashraven@users.noreply.github.com>  Sat, 30 May 2026 17:30:00 +0000
+
 nrsc5-studio (0.3.10-1) unstable; urgency=medium
 
   * Antenna selector in the Tuner panel for multi-input SDRplay RSPs

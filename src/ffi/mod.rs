@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use thiserror::Error;
 
-use crate::config::GainMode;
+use crate::config::{GainMode, SdrTransport};
 use crate::dsp::{AgcConfig, AgcController, AgcSnapshot, AgcStatus};
 use crate::sdr::profile::DeviceProfile;
 use crate::sdr::{GainCache, GainCacheEntry, GainCacheKey, IqBus, Sdr, SdrConfig, SdrError, StreamControl};
@@ -207,14 +207,16 @@ pub enum Nrsc5Error {
 
 // -- Process Backend --------------------------------------------------
 
-/// Which `start*` path was used last. Remembered so [`Nrsc5Process::retune`]
-/// can restart the same backend without the caller having to plumb its
-/// mode selection through every retune call site.
+/// Marker for whether the most recent start drove the piped pipeline.
+/// Kept as an `Option<LastStartMode>` field on [`Nrsc5Process`] so a
+/// fresh process (or one that's only been stopped) can be retuned via
+/// [`Nrsc5Process::retune`] without the caller having to track state.
+/// The pre-0.5.0 `Usb` and `RtlTcp` variants were removed when the
+/// legacy start paths were retired — the in-process piped pipeline is
+/// now the only way Start runs.
 #[derive(Debug, Clone)]
 enum LastStartMode {
-    Usb,
     Piped,
-    RtlTcp { host: String, port: u16 },
 }
 
 pub struct Nrsc5Process {
@@ -316,6 +318,17 @@ pub struct Nrsc5Process {
     /// same reason as `last_sdr_args` so [`retune`](Self::retune) can
     /// reuse it. `None` until the first piped Start.
     last_antenna: Option<String>,
+    /// Transport selection (local Soapy, SoapyRemote, native rtl_tcp)
+    /// active for the current/last piped stream. Preserved across
+    /// `stop()` so [`retune`](Self::retune) can re-open the same kind
+    /// of backend. Defaults to `LocalSoapy` until the first piped
+    /// Start has set it.
+    last_transport: SdrTransport,
+    /// Remote host:port for the current/last piped stream, when
+    /// `last_transport` is a remote variant. `None` for `LocalSoapy`.
+    /// Used by retune to rebuild the rtl_tcp / SoapyRemote connection
+    /// without the caller having to re-supply the connection details.
+    last_remote: Option<(String, u16)>,
     /// Per-frequency gain cache (Phase 3 of the v0.4.0 AGC overhaul).
     /// Loaded once at `Nrsc5Process::new` from
     /// [`crate::paths::gain_cache_path`]; survives across
@@ -504,6 +517,8 @@ impl Nrsc5Process {
             last_sdr_args: None,
             last_ppm: None,
             last_antenna: None,
+            last_transport: SdrTransport::LocalSoapy,
+            last_remote: None,
             gain_cache: Arc::new(Mutex::new(gain_cache)),
             tx,
             rx,
@@ -994,8 +1009,18 @@ impl Nrsc5Process {
             .or_else(|| self.last_antenna.clone())
     }
 
+    /// Short status label for the top bar. The bound `nrsc5.exe`
+    /// path is exposed separately via [`exe_path`] so callers can
+    /// stash it on a hover tooltip rather than blow out the menu
+    /// strip with a full path.
     pub fn version(&self) -> String {
-        format!("nrsc5 process ({})", self.exe_path.display())
+        "nrsc5 process".to_string()
+    }
+
+    /// Full filesystem path to the bound `nrsc5.exe` binary. Useful
+    /// for hover tooltips, About dialogs, and bug reports.
+    pub fn exe_path(&self) -> &std::path::Path {
+        &self.exe_path
     }
 
     pub fn aas_dir(&self) -> &std::path::Path {
@@ -1013,117 +1038,22 @@ impl Nrsc5Process {
         self.decoders.first().map(|d| d.child.id())
     }
 
-    /// Start the nrsc5 process.
-    ///
-    /// `frequency_mhz` -- FM frequency (e.g. 101.1)
-    /// `program`        -- 0-indexed HD program number (0 = HD1)
-    /// `device_index`   -- RTL-SDR device index (usually 0)
-    pub fn start(
-        &mut self,
-        frequency_mhz: f32,
-        program: u32,
-        device_index: u32,
-    ) -> Result<(), Nrsc5Error> {
-        self.stop();
-        while self.rx.try_recv().is_ok() {}
-
-        let mut cmd = Command::new(&self.exe_path);
-        cmd.arg("-d").arg(device_index.to_string());
-        cmd.arg("--dump-aas-files").arg(&self.aas_dir);
-        cmd.arg(format!("{:.1}", frequency_mhz));
-        cmd.arg(program.to_string());
-
-        cmd.stdin(Stdio::null());
-        cmd.stdout(Stdio::null());
-        cmd.stderr(Stdio::piped());
-
-        #[cfg(target_os = "windows")]
-        {
-            use std::os::windows::process::CommandExt;
-            cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
-        }
-
-        let mut child = cmd.spawn().map_err(Nrsc5Error::Spawn)?;
-        let stderr = child.stderr.take().expect("stderr was piped");
-        let tx = self.tx.clone();
-        let stderr_thread = std::thread::spawn(move || {
-            parse_stderr(stderr, tx, program, None);
-        });
-
-        self.decoders.push(DecoderInstance {
-            program,
-            child,
-            stderr_thread,
-            stdin_thread: None,
-            pcm_thread: None,
-            pcm_ring: None,
-        });
-        self.last_mode = Some(LastStartMode::Usb);
-        Ok(())
-    }
-
-    /// Start via rtl_tcp.
-    pub fn start_rtltcp(
-        &mut self,
-        frequency_mhz: f32,
-        program: u32,
-        host: &str,
-        port: u16,
-    ) -> Result<(), Nrsc5Error> {
-        self.stop();
-        while self.rx.try_recv().is_ok() {}
-
-        let mut cmd = Command::new(&self.exe_path);
-        cmd.arg("-H").arg(format!("{}:{}", host, port));
-        cmd.arg("--dump-aas-files").arg(&self.aas_dir);
-        cmd.arg(format!("{:.1}", frequency_mhz));
-        cmd.arg(program.to_string());
-
-        cmd.stdin(Stdio::null());
-        cmd.stdout(Stdio::null());
-        cmd.stderr(Stdio::piped());
-
-        #[cfg(target_os = "windows")]
-        {
-            use std::os::windows::process::CommandExt;
-            cmd.creation_flags(0x08000000);
-        }
-
-        let mut child = cmd.spawn().map_err(Nrsc5Error::Spawn)?;
-        let stderr = child.stderr.take().expect("stderr was piped");
-        let tx = self.tx.clone();
-        let stderr_thread = std::thread::spawn(move || {
-            parse_stderr(stderr, tx, program, None);
-        });
-
-        self.decoders.push(DecoderInstance {
-            program,
-            child,
-            stderr_thread,
-            stdin_thread: None,
-            pcm_thread: None,
-            pcm_ring: None,
-        });
-        self.last_mode = Some(LastStartMode::RtlTcp {
-            host: host.to_string(),
-            port,
-        });
-        Ok(())
-    }
-
     /// Start with the SDR driven in-process: open the device, retune,
     /// and spawn `nrsc5.exe -r -` with our I/Q pump feeding its stdin.
     ///
     /// This is the v0.2.0 "piped" path that unblocks the waterfall and
-    /// the in-process AGC. Selected by `config.use_piped_sdr` in
-    /// `config.toml`. The SDR is opened fresh on each Start and closed
-    /// fully on each Stop (the modern librtlsdr.dll handles this
-    /// cleanly).
+    /// the in-process AGC. It is now the **only** Start path; the
+    /// pre-0.3.0 USB-direct and pre-0.5.0 `nrsc5 -H` paths were retired
+    /// when the explicit `sdr.transport` field landed in config. The
+    /// SDR is opened fresh on each Start and closed fully on each Stop
+    /// (the modern librtlsdr.dll handles this cleanly).
     pub fn start_piped(
         &mut self,
         frequency_mhz: f32,
         program: u32,
+        transport: SdrTransport,
         sdr_args: &str,
+        remote: Option<(&str, u16)>,
         ppm_correction: f64,
         gain_mode: GainMode,
         manual_gain_tenths: i32,
@@ -1147,24 +1077,54 @@ impl Nrsc5Process {
             GainMode::Manual => Some(manual_gain_tenths),
             GainMode::HardwareAgc => None,
         };
-        // Open the SDR via SoapySDR. The args string already encodes
-        // `driver=` plus any per-device disambiguators (serial /
-        // device index / soapy_remote URL etc.). One open path,
-        // every supported device — the legacy `RtlSdr::open(idx)`
-        // call that lived here in 0.2.x is gone.
-        let soapy = crate::sdr::SoapySdr::open(sdr_args)?;
-        // Apply config-driven PPM correction. Zero is the common case;
-        // backends that don't expose runtime PPM return Ok(()) silently.
-        let _ = soapy.set_frequency_correction_ppm(ppm_correction);
-        soapy.configure(&SdrConfig {
-            center_freq_hz: (frequency_mhz * 1_000_000.0) as u32,
-            sample_rate_sps: 1_488_375,
-            ppm_correction: 0,
-            direct_sampling: 0,
-            initial_gain_tenths,
-            antenna: antenna.clone(),
-        })?;
-        let sdr: Arc<dyn Sdr> = Arc::new(soapy);
+        // Pick the backend based on transport:
+        //   * LocalSoapy / SoapyRemote → open via SoapySDR using the
+        //     composed args string. For SoapyRemote the args already
+        //     encode `driver=remote,remote=<host>:<port>`.
+        //   * RtlTcpRemote → open a native TCP connection to an
+        //     `rtl_tcp` server. Bypasses SoapySDR entirely so the
+        //     remote machine doesn't need a SoapyRemote server.
+        let sdr: Arc<dyn Sdr> = match transport {
+            SdrTransport::LocalSoapy | SdrTransport::SoapyRemote => {
+                let soapy = crate::sdr::SoapySdr::open(sdr_args)?;
+                // Apply config-driven PPM correction. Zero is the common
+                // case; backends that don't expose runtime PPM return
+                // Ok(()) silently.
+                let _ = soapy.set_frequency_correction_ppm(ppm_correction);
+                soapy.configure(&SdrConfig {
+                    center_freq_hz: (frequency_mhz * 1_000_000.0) as u32,
+                    sample_rate_sps: 1_488_375,
+                    ppm_correction: 0,
+                    direct_sampling: 0,
+                    initial_gain_tenths,
+                    antenna: antenna.clone(),
+                })?;
+                Arc::new(soapy)
+            }
+            SdrTransport::RtlTcpRemote => {
+                let (host, port) = remote.ok_or_else(|| {
+                    Nrsc5Error::Sdr(crate::sdr::SdrError::RtlTcpConnect {
+                        addr: "<unset>".to_string(),
+                        reason: "transport=rtl_tcp_remote but no host/port supplied"
+                            .to_string(),
+                    })
+                })?;
+                let rtl = crate::sdr::RtlTcpSdr::open(host, port)?;
+                rtl.configure(&SdrConfig {
+                    center_freq_hz: (frequency_mhz * 1_000_000.0) as u32,
+                    sample_rate_sps: 1_488_375,
+                    // PPM is rounded to an integer inside the rtl_tcp
+                    // backend; pass it via the field rather than a
+                    // separate call so configure() handles the no-op
+                    // case at zero.
+                    ppm_correction: ppm_correction.round() as i32,
+                    direct_sampling: 0,
+                    initial_gain_tenths,
+                    antenna: None,
+                })?;
+                Arc::new(rtl)
+            }
+        };
 
         let mut cmd = Command::new(&self.exe_path);
         // -r -  : read raw I/Q from stdin.
@@ -1544,6 +1504,8 @@ impl Nrsc5Process {
         self.last_sdr_args = Some(sdr_args.to_string());
         self.last_ppm = Some(ppm_correction);
         self.last_antenna = antenna;
+        self.last_transport = transport;
+        self.last_remote = remote.map(|(h, p)| (h.to_string(), p));
 
         // ----- AGC driver thread (only when AGC is active) ----------
         // Ticks the controller every ~500 ms and applies any gain
@@ -1824,13 +1786,21 @@ impl Nrsc5Process {
         self.agc_stop = None;
     }
 
-    /// Retune: stop the active stream and restart in the same mode
-    /// with the new frequency / program.
+    /// Retune: stop the active stream and restart the piped pipeline
+    /// at the new frequency / program. Reuses the gain mode, SDR args,
+    /// PPM, and antenna captured by the previous `start_piped` call so
+    /// the caller doesn't have to re-plumb config through every retune
+    /// site.
+    ///
+    /// If `start_piped` has never been called (no `last_mode`), this is
+    /// a no-op that returns `Ok(())` — historically the caller would
+    /// fall back to a USB-direct start here, but that legacy path was
+    /// removed in the 0.5.0 transport cleanup. The GUI guarantees a
+    /// `start_piped` precedes any retune.
     pub fn retune(
         &mut self,
         frequency_mhz: f32,
         program: u32,
-        device_index: u32,
     ) -> Result<(), Nrsc5Error> {
         // Capture the mode before `stop()` clears live state. The
         // `LastStartMode` is preserved across stop() so the caller
@@ -1856,14 +1826,21 @@ impl Nrsc5Process {
                     .unwrap_or_else(|| "driver=rtlsdr".to_string());
                 let ppm = self.last_ppm.unwrap_or(0.0);
                 let antenna = self.last_antenna.clone();
-                self.start_piped(frequency_mhz, program, &args, ppm, gain_mode, manual, antenna)
+                let transport = self.last_transport;
+                let remote = self.last_remote.clone();
+                self.start_piped(
+                    frequency_mhz,
+                    program,
+                    transport,
+                    &args,
+                    remote.as_ref().map(|(h, p)| (h.as_str(), *p)),
+                    ppm,
+                    gain_mode,
+                    manual,
+                    antenna,
+                )
             }
-            Some(LastStartMode::RtlTcp { host, port }) => {
-                self.start_rtltcp(frequency_mhz, program, &host, port)
-            }
-            Some(LastStartMode::Usb) | None => {
-                self.start(frequency_mhz, program, device_index)
-            }
+            None => Ok(()),
         }
     }
 }

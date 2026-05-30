@@ -156,6 +156,10 @@ pub struct AppState {
     /// can still flip individual toggles off after the auto-add.
     /// Persisted via `AppConfig::auto_decode_all_advertised`.
     pub auto_decode_all_advertised: bool,
+    /// Number of preset slots the Tuner panel renders. Range 1..=48
+    /// clamped at apply time. Mirror of `AppConfig::preset_slot_count`
+    /// so the dock doesn't take a borrow on config every frame.
+    pub preset_slot_count: u32,
     /// Mirror of `AppConfig::recording_mode` so the dock can disable
     /// the Record button when set to `Off` without taking a borrow
     /// on the config. Updated every frame by `App::update`.
@@ -305,6 +309,12 @@ pub struct AppState {
     /// The modal is rendered as long as this is true; closed by the
     /// modal's own dismiss button or Esc key.
     pub show_sdr_settings: bool,
+    /// Which left-rail tab is currently active in the Settings modal.
+    /// Persisted across opens (in-process only) so the user lands back
+    /// where they left off — e.g. if they were tweaking gain and
+    /// reopened to bump it further, they don't have to re-navigate to
+    /// the Gain tab.
+    pub settings_tab: SettingsTab,
     /// Set when "About" is clicked from the hamburger menu.
     pub show_about: bool,
     /// Snapshot of enumerated SoapySDR devices, refreshed on
@@ -331,6 +341,25 @@ pub struct AppState {
     /// when no stream is running or the device doesn't expose antenna
     /// selection.
     pub active_antenna: Option<String>,
+    /// Live edit buffer for the SDR Settings "Host" field. Must
+    /// persist across frames so partial input isn't lost between
+    /// keystrokes — egui's `TextEdit` only writes back the user's
+    /// current keystroke to the backing string, so binding it to a
+    /// per-frame `let` would discard everything on the next repaint.
+    /// Seeded from `config.sdr.remote_host` on first modal open and
+    /// whenever the user switches transport.
+    pub sdr_remote_host_buf: String,
+    /// Live edit buffer for the SDR Settings "Port" field. Same
+    /// lifetime story as `sdr_remote_host_buf`.
+    pub sdr_remote_port_buf: u16,
+    /// Live edit buffer for the SDR Settings SoapyRemote "Extra args"
+    /// field. Same lifetime story as `sdr_remote_host_buf`.
+    pub sdr_remote_extra_buf: String,
+    /// Tracks whether the remote-input buffers above have been seeded
+    /// from `config.sdr` yet. `None` means they're still at their
+    /// `Default::default()` values and need a one-shot seed from the
+    /// loaded config before the modal first renders.
+    pub sdr_remote_buf_seeded: bool,
 }
 
 impl AppState {
@@ -477,4 +506,41 @@ pub enum LogViewMode {
     #[default]
     Timeline,
     TopPlayed,
+}
+
+/// Which left-rail tab is currently active in the Settings modal.
+/// Defaults to `Connection` so a freshly-opened modal shows the
+/// transport / host / port form first — the most common reason to
+/// open the modal on first run.
+///
+/// Device picker + profile notes live inside the Connection tab
+/// (below the transport selector) because they're conceptually part
+/// of "where does the IQ come from" — splitting them across two tabs
+/// fragmented the mental model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SettingsTab {
+    #[default]
+    Connection,
+    Gain,
+    Display,
+    Recording,
+}
+
+impl SettingsTab {
+    /// Short label shown in the left-rail nav. Includes a leading
+    /// emoji glyph for quick visual scanning; matches the iconography
+    /// used in the dock tab titles.
+    pub fn label(self) -> &'static str {
+        match self {
+            SettingsTab::Connection => "\u{1F50C}  Connection",
+            // The egui bundled NotoEmoji subset doesn't include
+            // "level slider" (U+1F39A) or "classical building"
+            // (U+1F3DB) — both rendered as tofu. U+1F509 (speaker
+            // low volume) IS in the subset and reads naturally as
+            // "audio level / gain".
+            SettingsTab::Gain => "\u{1F509}  Gain",
+            SettingsTab::Display => "\u{1F5A5}  Display",
+            SettingsTab::Recording => "\u{1F534}  Recording",
+        }
+    }
 }

@@ -298,6 +298,7 @@ impl Nrsc5App {
                 manual_gain_tenths: config.manual_gain_tenths,
                 show_hd5_hd8: config.show_hd5_hd8,
                 auto_decode_all_advertised: config.auto_decode_all_advertised,
+                preset_slot_count: config.preset_slot_count.clamp(1, 48),
                 recording_mode: config.recording_mode,
                 // Default to "present" + "probe available" so the no-SDR
                 // overlay only appears once we've actually probed and seen
@@ -482,7 +483,11 @@ impl eframe::App for Nrsc5App {
         // dispatch loop as commands emitted by the dock panels. Declared
         // here so the closure below can push into it.
         let mut commands_from_top_bar: Vec<UiCommand> = Vec::new();
-        ui.horizontal(|ui| {
+        // `horizontal_wrapped` so the strip can flow onto a second
+        // line when the window is narrower than ~1600px instead of
+        // clipping panel buttons off the right edge (which would
+        // strand the user with no way to reopen closed panels).
+        ui.horizontal_wrapped(|ui| {
             // Theme toggle stays at the very left as the most-used
             // single-purpose button.
             let mut menu_commands: Vec<UiCommand> = Vec::new();
@@ -505,7 +510,7 @@ impl eframe::App for Nrsc5App {
             // same screen position regardless of window width.
             ui.menu_button(egui::RichText::new("☰").size(18.0), |ui| {
                 ui.set_min_width(200.0);
-                if ui.button("\u{1F4E1}  SDR Settings...").clicked() {
+                if ui.button("\u{2699}  Settings...").clicked() {
                     menu_commands.push(UiCommand::ShowSdrSettings);
                     ui.close_menu();
                 }
@@ -560,10 +565,11 @@ impl eframe::App for Nrsc5App {
             // Active SDR device chip — clickable shortcut to the SDR
             // Settings modal. Shows just the driver key in the top bar
             // to keep the space tight; full label is in the modal.
-            let sdr_chip_text = format!("\u{1F4E1} {}", self.config.sdr.driver);
+            let sdr_chip_text =
+                format!("\u{1F4E1} {}", self.config.sdr.chip_label());
             if ui
                 .button(egui::RichText::new(sdr_chip_text).monospace())
-                .on_hover_text("Open SDR Settings (driver + device + gains)")
+                .on_hover_text("Open Settings (transport • device • gain • display • recording)")
                 .clicked()
             {
                 menu_commands.push(UiCommand::ShowSdrSettings);
@@ -574,7 +580,12 @@ impl eframe::App for Nrsc5App {
             } else {
                 egui::Color32::from_gray(140)
             };
-            ui.label(egui::RichText::new(&self.app_state.nrsc5_status).color(status_color));
+            let status_resp = ui.label(
+                egui::RichText::new(&self.app_state.nrsc5_status).color(status_color),
+            );
+            if let Some(path) = self.nrsc5.as_ref().map(|n| n.exe_path().display().to_string()) {
+                status_resp.on_hover_text(path);
+            }
             ui.separator();
 
             // Panel toggle buttons. Selected state indicates the panel is
@@ -594,16 +605,16 @@ impl eframe::App for Nrsc5App {
                 }
             }
 
-            // Reset-layout button, right-aligned by allocating remaining space.
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .button("↺")
-                    .on_hover_text("Reset panel layout to default")
-                    .clicked()
-                {
-                    self.dock_state = default_dock_state();
-                }
-            });
+            // Reset-layout button, inline (no right-alignment
+            // wrapper — that fights with `horizontal_wrapped`
+            // because a wrapping row has no fixed right edge).
+            if ui
+                .button("↺")
+                .on_hover_text("Reset panel layout to default")
+                .clicked()
+            {
+                self.dock_state = default_dock_state();
+            }
 
             // Queue menu commands for processing in the existing dispatch
             // loop below so handler logic stays in one place.
@@ -1350,7 +1361,6 @@ impl Nrsc5App {
     ///
     /// Refuses to start if:
     ///   * no stream is running                                    (Start first)
-    ///   * `recording_mode` is `Off`                                (toggle in Settings first)
     ///   * a recording is already active                            (Stop the current one first)
     ///   * the selected program isn't being decoded                 (caller auto-spawns via SelectProgram, but if that fails we surface it here)
     ///
@@ -1358,8 +1368,6 @@ impl Nrsc5App {
     /// failing silently — the dock's Record button has no other way
     /// to tell the user what's wrong.
     fn start_recording(&mut self) {
-        use crate::config::RecordingMode;
-
         if self.recording_session.is_some() {
             self.app_state.nrsc5_status =
                 "already recording — Stop before starting again".to_string();
@@ -1368,11 +1376,6 @@ impl Nrsc5App {
         if !self.app_state.is_streaming {
             self.app_state.nrsc5_status =
                 "press Start before recording".to_string();
-            return;
-        }
-        if self.config.recording_mode == RecordingMode::Off {
-            self.app_state.nrsc5_status =
-                "recording is Off — pick a mode in SDR Settings first".to_string();
             return;
         }
 
@@ -2150,28 +2153,40 @@ impl Nrsc5App {
                 let mhz = self.app_state.frequency_mhz;
                 let program = self.app_state.selected_program;
 
-                // v0.3.0: every Start path goes through the in-process
-                // SoapySDR backend (`start_piped`). Legacy USB and
-                // rtl_tcp dispatch was removed when the native librtlsdr
-                // backend was deleted; rtl_tcp restoration is tracked
-                // for v0.4.0 via SoapyRemote. `migrate_legacy_sdr` in
-                // config.rs logs a one-shot warning at load time when a
-                // user's existing config still has `use_rtl_tcp = true`.
+                // v0.5.0: every Start path goes through the in-process
+                // SoapySDR or rtl_tcp backend (`start_piped`). The legacy
+                // USB-direct and `nrsc5 -H` dispatchers were removed when
+                // the explicit `sdr.transport` field landed. Remote
+                // transports (SoapyRemote, rtl_tcp) plug into the same
+                // piped pipeline via the transport-aware backend opener.
+                let transport = self.config.sdr.transport;
                 let sdr_args = self.config.sdr.to_args_string();
-                // Resolve the antenna: persisted user choice wins; on
-                // fresh installs we fall through to the device profile's
-                // recommended default (`Some("Tuner 1 50ohm")` for
-                // SDRplay, `None` for RTL-SDR / HackRF). Resolved here
-                // so a future profile change automatically lights up
-                // for users who never customized.
-                let antenna = self.config.sdr.antenna.clone().or_else(|| {
-                    crate::sdr::profile::lookup(&self.config.sdr.driver)
-                        .and_then(|p| p.default_antenna.map(String::from))
-                });
+                let remote_owned = match transport {
+                    crate::config::SdrTransport::RtlTcpRemote
+                    | crate::config::SdrTransport::SoapyRemote => Some((
+                        self.config.sdr.effective_remote_host(),
+                        self.config.sdr.effective_remote_port(),
+                    )),
+                    crate::config::SdrTransport::LocalSoapy => None,
+                };
+                // Antenna picker is meaningless on rtl_tcp (single
+                // input); skip the profile default lookup for that
+                // transport so we don't waste a `set_antenna` call on
+                // a backend that ignores it.
+                let antenna = if matches!(transport, crate::config::SdrTransport::RtlTcpRemote) {
+                    None
+                } else {
+                    self.config.sdr.antenna.clone().or_else(|| {
+                        crate::sdr::profile::lookup(&self.config.sdr.driver)
+                            .and_then(|p| p.default_antenna.map(String::from))
+                    })
+                };
                 let result = nrsc5.start_piped(
                     mhz,
                     program,
+                    transport,
                     &sdr_args,
+                    remote_owned.as_ref().map(|(h, p)| (h.as_str(), *p)),
                     self.config.sdr.freq_correction_ppm,
                     self.config.gain_mode,
                     self.config.manual_gain_tenths,
@@ -2294,12 +2309,9 @@ impl Nrsc5App {
                         self.app_state.is_streaming = false;
 
                         let program = self.app_state.selected_program;
-                        let device_index = self.config.rtl_device_index;
                         let handle = std::thread::spawn(move || {
                             let mut backend = backend;
-                            if let Err(err) =
-                                backend.retune(mhz, program, device_index)
-                            {
+                            if let Err(err) = backend.retune(mhz, program) {
                                 return (backend, Some(format!("{err}")));
                             }
                             (backend, None)
@@ -2443,6 +2455,12 @@ impl Nrsc5App {
             }
             UiCommand::StartRecording => self.start_recording(),
             UiCommand::StopRecording => self.stop_recording(/* fatal = */ false),
+            UiCommand::SetPresetSlotCount(n) => {
+                let clamped = n.clamp(1, 48);
+                self.app_state.preset_slot_count = clamped;
+                self.config.preset_slot_count = clamped;
+                save_config(&self.config);
+            }
             UiCommand::SetRecordingMode(mode) => {
                 self.config.recording_mode = mode;
                 self.app_state.recording_mode = mode;
@@ -2682,6 +2700,29 @@ impl Nrsc5App {
                 if !self.app_state.show_sdr_settings {
                     self.refresh_sdr_devices();
                 }
+                // Seed the remote-input edit buffers from config so
+                // the Host/Port/Extra-args fields show the persisted
+                // values when the modal opens. Skip if the user has
+                // already typed into the buffers in this session
+                // (`sdr_remote_buf_seeded`) so we don't clobber an
+                // in-progress edit on a re-open.
+                if !self.app_state.sdr_remote_buf_seeded {
+                    self.app_state.sdr_remote_host_buf = self
+                        .config
+                        .sdr
+                        .remote_host
+                        .clone()
+                        .unwrap_or_default();
+                    self.app_state.sdr_remote_port_buf =
+                        self.config.sdr.effective_remote_port();
+                    self.app_state.sdr_remote_extra_buf = self
+                        .config
+                        .sdr
+                        .remote_extra_args
+                        .clone()
+                        .unwrap_or_default();
+                    self.app_state.sdr_remote_buf_seeded = true;
+                }
                 self.app_state.show_sdr_settings = true;
             }
             UiCommand::HideSdrSettings => {
@@ -2768,6 +2809,53 @@ impl Nrsc5App {
                 save_config(&self.config);
                 self.refresh_sdr_devices();
             }
+            UiCommand::SelectSdrTransport(transport) => {
+                if self.config.sdr.transport == transport {
+                    return;
+                }
+                self.config.sdr.transport = transport;
+                save_config(&self.config);
+                // Re-seed the port buffer so the default port flips to
+                // match the new transport (1234 for rtl_tcp, 55132 for
+                // SoapyRemote) when the user hasn't pinned an explicit
+                // value.
+                self.app_state.sdr_remote_port_buf =
+                    self.config.sdr.effective_remote_port();
+            }
+            UiCommand::SetSdrRemoteHost(host) => {
+                let trimmed = host.trim();
+                let new_host = if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                };
+                if self.config.sdr.remote_host == new_host {
+                    return;
+                }
+                self.config.sdr.remote_host = new_host;
+                save_config(&self.config);
+            }
+            UiCommand::SetSdrRemotePort(port) => {
+                let new_port = if port == 0 { None } else { Some(port) };
+                if self.config.sdr.remote_port == new_port {
+                    return;
+                }
+                self.config.sdr.remote_port = new_port;
+                save_config(&self.config);
+            }
+            UiCommand::SetSdrRemoteExtraArgs(extra) => {
+                let trimmed = extra.trim();
+                let new_extra = if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                };
+                if self.config.sdr.remote_extra_args == new_extra {
+                    return;
+                }
+                self.config.sdr.remote_extra_args = new_extra;
+                save_config(&self.config);
+            }
         }
     }
 
@@ -2841,95 +2929,374 @@ impl Nrsc5App {
         };
     }
 
-    /// Render the SDR Settings modal: device picker, per-element gain
-    /// sliders for the active device, PPM correction, "Reset to
-    /// defaults" / "Refresh" / "Close" buttons.
+    /// Render the unified Settings modal. Five tabs in a left rail —
+    /// Connection (transport + remote host/port), Device (local SoapySDR
+    /// picker + profile notes), Gain (per-element sliders + PPM), Display
+    /// (HD5\u{2013}HD8 row, auto-decode toggle), Recording (mode, folder,
+    /// rotation, subfolders).
     ///
-    /// The modal layers on top of the dock via egui's Window with
-    /// `collapsible(false) + anchor center`. Closing dispatches a
-    /// `HideSdrSettings` command rather than mutating state directly
-    /// so the next-tick is consistent with other state changes.
+    /// Header strip above the tabs always shows the active device + live
+    /// stream status + effective transport string so the user has
+    /// consistent feedback regardless of which tab they're on.
+    ///
+    /// Closing dispatches `HideSdrSettings` rather than mutating state
+    /// directly so the next-tick is consistent with other state changes.
     fn render_sdr_settings_modal(
         &mut self,
         ctx: &egui::Context,
         commands: &mut Vec<UiCommand>,
     ) {
+        use crate::gui::state::SettingsTab;
         let mut open = true;
-        // Snapshot config + devices into locals so the closure can
-        // read them without holding a &self reference (which would
-        // collide with the &mut self borrow needed for save_config
-        // later if we tried to do it inline).
-        let active_args = self.config.sdr.to_args_string();
+
+        // ---- Snapshot config / state ------------------------------------
+        // Pulled to locals so the closure body doesn't fight the borrow
+        // checker when it also needs `&mut self.app_state` for the live
+        // edit buffers and `commands: &mut Vec<UiCommand>`.
+        let active_args = self.config.sdr.display_connection_string();
         let active_driver = self.config.sdr.driver.clone();
         let current_ppm = self.config.sdr.freq_correction_ppm;
         let show_hd5_hd8 = self.app_state.show_hd5_hd8;
+        let transport = self.config.sdr.transport;
+        let is_streaming = self.app_state.is_streaming;
+        let config_remote_host = self
+            .config
+            .sdr
+            .remote_host
+            .clone()
+            .unwrap_or_default();
+        let config_remote_port = self.config.sdr.effective_remote_port();
+        let config_remote_extra = self
+            .config
+            .sdr
+            .remote_extra_args
+            .clone()
+            .unwrap_or_default();
         let last_refreshed_label = self
             .app_state
             .sdr_devices_last_refreshed
             .map(|t| format!("refreshed {}s ago", t.elapsed().as_secs()))
             .unwrap_or_else(|| "not yet refreshed".to_string());
 
-        egui::Window::new(egui::RichText::new("\u{1F4E1}  SDR Settings").size(18.0))
+        // Short, plain-English summary of the current transport for the
+        // header strip. Mirrors what `to_args_string()` produces but in
+        // a form that's friendly to glance at instead of parse.
+        let transport_summary = match transport {
+            crate::config::SdrTransport::LocalSoapy => {
+                format!("Local \u{2022} {}", active_driver)
+            }
+            crate::config::SdrTransport::SoapyRemote => format!(
+                "SoapyRemote \u{2022} {}:{}",
+                self.config
+                    .sdr
+                    .remote_host
+                    .as_deref()
+                    .unwrap_or("127.0.0.1"),
+                config_remote_port,
+            ),
+            crate::config::SdrTransport::RtlTcpRemote => format!(
+                "rtl_tcp \u{2022} {}:{}",
+                self.config
+                    .sdr
+                    .remote_host
+                    .as_deref()
+                    .unwrap_or("127.0.0.1"),
+                config_remote_port,
+            ),
+        };
+
+        // Bound the window: a max of 80% of the screen prevents it from
+        // running off the bottom on small displays (the prior version
+        // hit a feedback loop where the right-pane ScrollArea kept
+        // claiming more height each frame). The user can still resize
+        // smaller down to (560 \u{00D7} 380).
+        let screen = ctx.screen_rect();
+        let max_w = (screen.width() * 0.95).max(560.0);
+        let max_h = (screen.height() * 0.85).max(380.0);
+
+        egui::Window::new(egui::RichText::new("\u{2699}  Settings").size(18.0))
             .open(&mut open)
             .collapsible(false)
             .resizable(true)
-            .default_width(540.0)
-            .default_height(560.0)
+            .default_width(720.0)
+            .default_height(540.0)
+            .min_width(560.0)
+            .min_height(380.0)
+            .max_width(max_w)
+            .max_height(max_h)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
-                // ---- Device picker -------------------------------------
-                ui.heading("Device");
-                ui.horizontal(|ui| {
-                    ui.label("Active:");
-                    ui.code(&active_args);
-                });
-                ui.add_space(4.0);
+                // Use proper egui panel hierarchy so the window stays
+                // resizable. Mixing horizontal layouts with min_height
+                // constraints (the previous approach) caused vertical
+                // runaway because the ScrollArea, the inner vertical,
+                // and the Window all fed each other's available-height
+                // calculations.
+                //
+                //   top    header strip
+                //   bottom footer buttons
+                //   left   tab nav
+                //   center per-tab content (scrollable)
 
-                if self.app_state.sdr_devices.is_empty() {
-                    ui.colored_label(
-                        egui::Color32::from_rgb(220, 160, 80),
-                        "No SoapySDR devices detected. Check the dongle is \
-                         plugged in (and Zadig-bound for RTL-SDR on Windows), \
-                         then click Refresh.",
-                    );
-                } else {
+                // ---- Footer (declared first so top/left know how much
+                //      vertical space remains for them) --------------
+                egui::TopBottomPanel::bottom("settings_footer")
+                    .resizable(false)
+                    .show_separator_line(true)
+                    .show_inside(ui, |ui| {
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            if ui
+                                .button("Reset SDR config")
+                                .on_hover_text(
+                                    "Restore driver=rtlsdr, empty device args, \
+                                     0 PPM, and clear all per-element gain \
+                                     overrides. Does not touch Display or \
+                                     Recording settings.",
+                                )
+                                .clicked()
+                            {
+                                commands.push(UiCommand::ResetSdrConfig);
+                            }
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui.button("Close").clicked() {
+                                        commands.push(UiCommand::HideSdrSettings);
+                                    }
+                                },
+                            );
+                        });
+                        ui.add_space(2.0);
+                    });
+
+                // ---- Header strip ----------------------------------
+                egui::TopBottomPanel::top("settings_header")
+                    .resizable(false)
+                    .show_separator_line(true)
+                    .show_inside(ui, |ui| {
+                        ui.add_space(2.0);
+                        ui.horizontal(|ui| {
+                            let (status_color, status_label) = if is_streaming {
+                                (egui::Color32::from_rgb(80, 220, 120), "streaming")
+                            } else {
+                                (egui::Color32::from_gray(140), "idle")
+                            };
+                            ui.colored_label(status_color, "\u{25CF}");
+                            ui.label(
+                                egui::RichText::new(status_label)
+                                    .small()
+                                    .color(status_color),
+                            );
+                            ui.separator();
+                            ui.label(
+                                egui::RichText::new(&transport_summary)
+                                    .monospace(),
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.code(&active_args).on_hover_text(
+                                        "Effective Soapy args / connection string",
+                                    );
+                                },
+                            );
+                        });
+                        ui.add_space(2.0);
+                    });
+
+                // ---- Left rail (tab nav) ---------------------------
+                egui::SidePanel::left("settings_nav")
+                    .resizable(false)
+                    .exact_width(150.0)
+                    .show_inside(ui, |ui| {
+                        ui.add_space(4.0);
+                        // `top_down_justified(LEFT)` makes each row
+                        // stretch the full panel width AND aligns the
+                        // label text to the left edge, so the emoji
+                        // glyphs (which have varying advance widths)
+                        // all start at the same x.
+                        ui.with_layout(
+                            egui::Layout::top_down_justified(egui::Align::LEFT),
+                            |ui| {
+                                for tab in [
+                                    SettingsTab::Connection,
+                                    SettingsTab::Gain,
+                                    SettingsTab::Display,
+                                    SettingsTab::Recording,
+                                ] {
+                                    let selected =
+                                        self.app_state.settings_tab == tab;
+                                    let resp = ui.selectable_label(
+                                        selected,
+                                        tab.label(),
+                                    );
+                                    if resp.clicked() && !selected {
+                                        self.app_state.settings_tab = tab;
+                                    }
+                                }
+                            },
+                        );
+                    });
+
+                // ---- Center pane (active tab body) -----------------
+                egui::CentralPanel::default().show_inside(ui, |ui| {
                     egui::ScrollArea::vertical()
-                        .id_source("sdr_devices_list")
-                        .max_height(140.0)
+                        .id_salt("settings_tab_body")
+                        .auto_shrink([false, false])
                         .show(ui, |ui| {
-                            for dev in &self.app_state.sdr_devices {
-                                let is_active = dev.driver == active_driver
-                                    && self.config.sdr.device_args == dev.args_after_driver();
-                                let label = if dev.label.is_empty() {
-                                    format!("[{}]  {}", dev.driver, dev.args_after_driver())
-                                } else {
-                                    format!("[{}]  {}", dev.driver, dev.label)
-                                };
-                                let resp = ui.selectable_label(is_active, label);
-                                if resp.clicked() && !is_active {
-                                    commands.push(UiCommand::SelectSdrDevice {
-                                        driver: dev.driver.clone(),
-                                        device_args: dev.args_after_driver(),
-                                    });
+                            match self.app_state.settings_tab {
+                                SettingsTab::Connection => {
+                                    self.render_settings_connection_tab(
+                                        ui,
+                                        commands,
+                                        transport,
+                                        &active_driver,
+                                        &config_remote_host,
+                                        config_remote_port,
+                                        &config_remote_extra,
+                                        &last_refreshed_label,
+                                    );
+                                }
+                                SettingsTab::Gain => {
+                                    self.render_settings_gain_tab(
+                                        ui,
+                                        commands,
+                                        &active_driver,
+                                        current_ppm,
+                                    );
+                                }
+                                SettingsTab::Display => {
+                                    self.render_settings_display_tab(
+                                        ui,
+                                        commands,
+                                        show_hd5_hd8,
+                                    );
+                                }
+                                SettingsTab::Recording => {
+                                    self.render_settings_recording_tab(
+                                        ui,
+                                        commands,
+                                    );
                                 }
                             }
                         });
-                }
+                });
+            });
 
-                ui.horizontal(|ui| {
-                    if ui.button("\u{21BB}  Refresh").clicked() {
-                        commands.push(UiCommand::RefreshSdrDevices);
-                    }
-                    ui.label(
-                        egui::RichText::new(last_refreshed_label)
-                            .small()
-                            .color(egui::Color32::from_gray(140)),
-                    );
-                    // Reveal the diagnostic dump in Explorer so a user
-                    // reporting "no devices detected" can quickly grab
-                    // the file. Best-effort: silently no-op if the
-                    // file hasn't been written yet (no Refresh clicked)
-                    // or the OS shell hookup fails.
+        if !open {
+            // User dismissed via the "X" on the window title bar.
+            commands.push(UiCommand::HideSdrSettings);
+        }
+    }
+
+    /// Connection tab: transport picker + (for Local) device list +
+    /// (for Remote) host/port form, plus the active-device profile
+    /// notes. The device section was previously its own tab; folding
+    /// it back into Connection keeps "where IQ comes from" in one
+    /// place.
+    fn render_settings_connection_tab(
+        &mut self,
+        ui: &mut egui::Ui,
+        commands: &mut Vec<UiCommand>,
+        transport: crate::config::SdrTransport,
+        active_driver: &str,
+        config_remote_host: &str,
+        config_remote_port: u16,
+        config_remote_extra: &str,
+        last_refreshed_label: &str,
+    ) {
+        // ---- Transport selector ------------------------------------
+        ui.heading("Transport");
+        ui.label(
+            egui::RichText::new(
+                "Transport changes take effect on the next Stop/Start cycle.",
+            )
+            .small()
+            .color(egui::Color32::from_gray(140)),
+        );
+        ui.add_space(2.0);
+
+        ui.horizontal(|ui| {
+            for (variant, label, hover) in [
+                (
+                    crate::config::SdrTransport::LocalSoapy,
+                    "Local SDR",
+                    "Enumerate and open a SoapySDR device attached to this \
+                     machine. Pick the specific dongle from the list below.",
+                ),
+                (
+                    crate::config::SdrTransport::SoapyRemote,
+                    "SoapyRemote",
+                    "Connect to a SoapySDRServer instance on the remote \
+                     host. The remote machine must have SoapyRemote \
+                     installed alongside the device's Soapy module (e.g. \
+                     SoapyRTLSDR, SoapySDRPlay3). Default port 55132.",
+                ),
+                (
+                    crate::config::SdrTransport::RtlTcpRemote,
+                    "rtl_tcp",
+                    "Connect to a native rtl_tcp server on the remote host. \
+                     Only a single tuner-gain control is exposed (no \
+                     per-element sliders, no antenna picker). Default port \
+                     1234.",
+                ),
+            ] {
+                let resp = ui
+                    .selectable_label(transport == variant, label)
+                    .on_hover_text(hover);
+                if resp.clicked() && transport != variant {
+                    commands.push(UiCommand::SelectSdrTransport(variant));
+                }
+            }
+        });
+
+        ui.add_space(12.0);
+        ui.separator();
+        ui.add_space(8.0);
+
+        // ---- Per-transport device section --------------------------
+        match transport {
+            crate::config::SdrTransport::LocalSoapy => {
+                self.render_local_device_section(
+                    ui,
+                    commands,
+                    active_driver,
+                    last_refreshed_label,
+                );
+            }
+            crate::config::SdrTransport::SoapyRemote
+            | crate::config::SdrTransport::RtlTcpRemote => {
+                ui.heading("Remote host");
+                ui.add_space(4.0);
+                self.render_remote_form(
+                    ui,
+                    commands,
+                    transport,
+                    config_remote_host,
+                    config_remote_port,
+                    config_remote_extra,
+                );
+            }
+        }
+    }
+
+    /// Local-device picker + profile notes. Extracted so the Connection
+    /// tab's match arm doesn't balloon.
+    fn render_local_device_section(
+        &mut self,
+        ui: &mut egui::Ui,
+        commands: &mut Vec<UiCommand>,
+        active_driver: &str,
+        last_refreshed_label: &str,
+    ) {
+        // Toolbar: heading on the left, Refresh + timestamp +
+        // diagnostics on the right.
+        ui.horizontal(|ui| {
+            ui.heading("Local devices");
+            ui.with_layout(
+                egui::Layout::right_to_left(egui::Align::Center),
+                |ui| {
                     if ui
                         .small_button("Open diagnostics\u{2026}")
                         .on_hover_text(
@@ -2940,77 +3307,244 @@ impl Nrsc5App {
                         .clicked()
                     {
                         if let Some(p) = crate::paths::sdr_diagnostics_file() {
-                            // `start` shells out to whatever default
-                            // handler is registered for .txt — Notepad
-                            // on a stock Windows install. Discard the
-                            // command's output / errors; if it fails
-                            // the user can just navigate to data\.
                             let _ = std::process::Command::new("cmd")
-                                .args(["/C", "start", "", p.to_string_lossy().as_ref()])
+                                .args([
+                                    "/C",
+                                    "start",
+                                    "",
+                                    p.to_string_lossy().as_ref(),
+                                ])
                                 .spawn();
                         }
                     }
-                });
-
-                ui.add_space(8.0);
-                ui.separator();
-
-                // ---- Profile notes -------------------------------------
-                if let Some(profile) =
-                    crate::sdr::profile::lookup(&active_driver)
-                {
-                    ui.heading(format!("{} ({})", profile.display_name, profile.driver));
-                    if !profile.bench_validated {
-                        ui.colored_label(
-                            egui::Color32::from_rgb(220, 160, 80),
-                            "\u{26A0}  This device profile is NOT bench-validated. \
-                             AGC behavior may need tuning.",
-                        );
+                    ui.label(
+                        egui::RichText::new(last_refreshed_label)
+                            .small()
+                            .color(egui::Color32::from_gray(140)),
+                    );
+                    if ui.button("\u{21BB}  Refresh").clicked() {
+                        commands.push(UiCommand::RefreshSdrDevices);
                     }
-                    ui.collapsing("HD Radio notes", |ui| {
-                        ui.label(profile.hd_radio_notes);
-                    });
-                } else {
-                    ui.colored_label(
-                        egui::Color32::from_rgb(220, 160, 80),
-                        format!(
-                            "No device profile is configured for driver \"{}\". \
-                             AGC will fall back to the rtlsdr profile; \
-                             results may vary.",
-                            active_driver
-                        ),
+                },
+            );
+        });
+        ui.add_space(4.0);
+
+        if self.app_state.sdr_devices.is_empty() {
+            ui.colored_label(
+                egui::Color32::from_rgb(220, 160, 80),
+                "No SoapySDR devices detected. Check the dongle is plugged \
+                 in (and Zadig-bound for RTL-SDR on Windows), then click \
+                 Refresh.",
+            );
+        } else {
+            // Radio buttons so users immediately recognize this is a
+            // single-select list.
+            egui::ScrollArea::vertical()
+                .id_salt("sdr_devices_list")
+                .max_height(180.0)
+                .show(ui, |ui| {
+                    for dev in &self.app_state.sdr_devices {
+                        let is_active = dev.driver == active_driver
+                            && self.config.sdr.device_args
+                                == dev.args_after_driver();
+                        let label = if dev.label.is_empty() {
+                            format!(
+                                "[{}]  {}",
+                                dev.driver,
+                                dev.args_after_driver()
+                            )
+                        } else {
+                            format!("[{}]  {}", dev.driver, dev.label)
+                        };
+                        let resp = ui.radio(is_active, label);
+                        if resp.clicked() && !is_active {
+                            commands.push(UiCommand::SelectSdrDevice {
+                                driver: dev.driver.clone(),
+                                device_args: dev.args_after_driver(),
+                            });
+                        }
+                    }
+                });
+        }
+
+        // ---- Profile notes -----------------------------------------
+        ui.add_space(10.0);
+        ui.separator();
+        ui.add_space(6.0);
+
+        ui.label(
+            egui::RichText::new("Currently selected device")
+                .small()
+                .color(egui::Color32::from_gray(150)),
+        );
+
+        if let Some(profile) = crate::sdr::profile::lookup(active_driver) {
+            ui.horizontal(|ui| {
+                ui.heading(format!(
+                    "{} ({})",
+                    profile.display_name, profile.driver
+                ));
+                if !profile.bench_validated {
+                    ui.label(
+                        egui::RichText::new("\u{26A0} not bench-validated")
+                            .small()
+                            .color(egui::Color32::from_rgb(220, 160, 80)),
+                    )
+                    .on_hover_text(
+                        "AGC behavior on this device is heuristic. Please \
+                         file a GitHub issue if reception is poor \u{2014} \
+                         bench logs welcome.",
                     );
                 }
+            });
+            ui.collapsing("HD Radio notes", |ui| {
+                ui.label(profile.hd_radio_notes);
+            });
+        } else {
+            ui.colored_label(
+                egui::Color32::from_rgb(220, 160, 80),
+                format!(
+                    "No device profile is configured for driver \"{}\". AGC \
+                     will fall back to the rtlsdr profile; results may vary.",
+                    active_driver
+                ),
+            );
+        }
+    }
 
-                ui.add_space(8.0);
-                ui.separator();
+    /// Remote host/port form for SoapyRemote / rtl_tcp transports.
+    fn render_remote_form(
+        &mut self,
+        ui: &mut egui::Ui,
+        commands: &mut Vec<UiCommand>,
+        transport: crate::config::SdrTransport,
+        config_remote_host: &str,
+        config_remote_port: u16,
+        config_remote_extra: &str,
+    ) {
+        egui::Grid::new("remote_form_grid")
+            .num_columns(2)
+            .spacing([12.0, 6.0])
+            .show(ui, |ui| {
+                ui.label("Host:");
+                let resp = ui.add(
+                    egui::TextEdit::singleline(
+                        &mut self.app_state.sdr_remote_host_buf,
+                    )
+                    .desired_width(220.0)
+                    .hint_text("192.168.0.10"),
+                );
+                if resp.lost_focus()
+                    && self.app_state.sdr_remote_host_buf != config_remote_host
+                {
+                    commands.push(UiCommand::SetSdrRemoteHost(
+                        self.app_state.sdr_remote_host_buf.clone(),
+                    ));
+                }
+                ui.end_row();
 
-                // ---- Per-element gain sliders --------------------------
-                ui.heading("Manual gain");
-                if self.app_state.sdr_gain_elements.is_empty() {
-                    ui.colored_label(
-                        egui::Color32::from_gray(140),
-                        "No gain elements reported. Either the device isn't \
-                         currently attached or the driver doesn't expose any.",
-                    );
-                } else {
-                    ui.label(
-                        egui::RichText::new(
-                            "Sliders are live: changes apply immediately to a \
-                             running stream and are persisted to config.",
+                ui.label("Port:");
+                let resp = ui.add(
+                    egui::DragValue::new(
+                        &mut self.app_state.sdr_remote_port_buf,
+                    )
+                    .range(1..=65535),
+                );
+                if (resp.drag_stopped() || resp.lost_focus())
+                    && self.app_state.sdr_remote_port_buf != config_remote_port
+                {
+                    commands.push(UiCommand::SetSdrRemotePort(
+                        self.app_state.sdr_remote_port_buf,
+                    ));
+                }
+                ui.end_row();
+
+                if transport == crate::config::SdrTransport::SoapyRemote {
+                    ui.label("Extra args:");
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(
+                            &mut self.app_state.sdr_remote_extra_buf,
                         )
-                        .small()
-                        .color(egui::Color32::from_gray(140)),
+                        .desired_width(320.0)
+                        .hint_text("(optional, e.g. remote:driver=rtlsdr)"),
                     );
-                    ui.add_space(2.0);
-                    // Clone the element list out of state so the slider
-                    // closure doesn't need to borrow it while we also
-                    // need a mutable command vec.
-                    let elements = self.app_state.sdr_gain_elements.clone();
+                    if resp.lost_focus()
+                        && self.app_state.sdr_remote_extra_buf
+                            != config_remote_extra
+                    {
+                        commands.push(UiCommand::SetSdrRemoteExtraArgs(
+                            self.app_state.sdr_remote_extra_buf.clone(),
+                        ));
+                    }
+                    ui.end_row();
+                }
+            });
+
+        if transport == crate::config::SdrTransport::RtlTcpRemote {
+            ui.add_space(6.0);
+            ui.label(
+                egui::RichText::new(
+                    "Note: rtl_tcp exposes only a single tuner gain. The \
+                     Gain tab's per-element sliders won't appear, and \
+                     antenna selection isn't available.",
+                )
+                .small()
+                .color(egui::Color32::from_gray(140)),
+            );
+        }
+    }
+
+    /// Gain tab: per-element sliders + PPM correction. Sliders are hidden
+    /// when no elements are reported (e.g. rtl_tcp transport).
+    fn render_settings_gain_tab(
+        &mut self,
+        ui: &mut egui::Ui,
+        commands: &mut Vec<UiCommand>,
+        active_driver: &str,
+        current_ppm: f64,
+    ) {
+        ui.heading("Manual gain");
+        // AGC drives whichever element is canonical for this device.
+        // If AGC mode is active, surface that so the user understands
+        // their manual drag may be overridden on next tune.
+        if self.app_state.gain_mode == crate::config::GainMode::Auto {
+            ui.label(
+                egui::RichText::new(
+                    "AGC is active \u{2014} sliders may be overridden on the \
+                     next tune or AGC settle cycle. Switch to Manual gain \
+                     mode in the Tuner panel to pin a value.",
+                )
+                .small()
+                .color(egui::Color32::from_rgb(220, 160, 80)),
+            );
+            ui.add_space(2.0);
+        }
+
+        if self.app_state.sdr_gain_elements.is_empty() {
+            ui.colored_label(
+                egui::Color32::from_gray(140),
+                "No gain elements reported. Either the device isn't \
+                 currently attached, or the active transport (e.g. rtl_tcp) \
+                 doesn't expose them.",
+            );
+        } else {
+            ui.label(
+                egui::RichText::new(
+                    "Sliders are live: changes apply immediately to a \
+                     running stream and are persisted to config.",
+                )
+                .small()
+                .color(egui::Color32::from_gray(140)),
+            );
+            ui.add_space(4.0);
+
+            let elements = self.app_state.sdr_gain_elements.clone();
+            egui::Grid::new("gain_sliders_grid")
+                .num_columns(2)
+                .spacing([12.0, 4.0])
+                .show(ui, |ui| {
                     for elem in &elements {
-                        // Look up the override value from config; if
-                        // there's no override yet, use the device's
-                        // currently-reported value as the slider start.
                         let mut value = self
                             .config
                             .sdr
@@ -3018,158 +3552,198 @@ impl Nrsc5App {
                             .get(&elem.name)
                             .copied()
                             .unwrap_or(elem.current_db);
-                        // Step granularity: prefer device-reported step,
-                        // fall back to 0.1 dB for "continuous" elements.
-                        let step = if elem.step_db > 0.0 { elem.step_db } else { 0.1 };
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                egui::RichText::new(format!("{:>6}", elem.name))
-                                    .monospace(),
-                            );
-                            let resp = ui.add(
-                                egui::Slider::new(&mut value, elem.min_db..=elem.max_db)
-                                    .step_by(step)
-                                    .suffix(" dB")
-                                    .clamp_to_range(true),
-                            );
-                            if resp.drag_stopped() || resp.lost_focus() || resp.changed() {
-                                // Coalesce: only emit when the snapped
-                                // value differs from what we have in
-                                // config (or no value yet).
-                                let prev = self.config.sdr.gains.get(&elem.name).copied();
-                                if prev.map_or(true, |p| (p - value).abs() > 1e-6) {
-                                    commands.push(UiCommand::SetSdrGainElement {
-                                        element: elem.name.clone(),
-                                        value_db: value,
-                                    });
-                                }
+                        let step = if elem.step_db > 0.0 {
+                            elem.step_db
+                        } else {
+                            0.1
+                        };
+                        ui.label(
+                            egui::RichText::new(format!("{:>6}", elem.name))
+                                .monospace(),
+                        );
+                        let resp = ui.add(
+                            egui::Slider::new(
+                                &mut value,
+                                elem.min_db..=elem.max_db,
+                            )
+                            .step_by(step)
+                            .suffix(" dB")
+                            .clamp_to_range(true),
+                        );
+                        if resp.drag_stopped()
+                            || resp.lost_focus()
+                            || resp.changed()
+                        {
+                            let prev =
+                                self.config.sdr.gains.get(&elem.name).copied();
+                            if prev.map_or(true, |p| (p - value).abs() > 1e-6) {
+                                commands.push(UiCommand::SetSdrGainElement {
+                                    element: elem.name.clone(),
+                                    value_db: value,
+                                });
                             }
-                        });
-                    }
-                }
-
-                ui.add_space(8.0);
-                ui.separator();
-
-                // ---- PPM correction -----------------------------------
-                ui.heading("Frequency correction");
-                let mut ppm = current_ppm;
-                ui.horizontal(|ui| {
-                    ui.label("PPM:");
-                    let resp = ui.add(
-                        egui::DragValue::new(&mut ppm)
-                            .speed(0.1)
-                            .range(-100.0..=100.0)
-                            .suffix(" ppm"),
-                    );
-                    if (resp.drag_stopped() || resp.lost_focus())
-                        && (ppm - current_ppm).abs() > 1e-6
-                    {
-                        commands.push(UiCommand::SetSdrFreqCorrectionPpm(ppm));
+                        }
+                        ui.end_row();
                     }
                 });
-                ui.label(
-                    egui::RichText::new(
-                        "RTL-SDR honors this immediately. SDRplay ignores it \
-                         (uses its internal calibration); HackRF does too.",
-                    )
-                    .small()
-                    .color(egui::Color32::from_gray(140)),
-                );
+        }
 
-                ui.add_space(12.0);
-                ui.separator();
+        // ---- Frequency correction (PPM) ------------------------------
+        // Only RTL-SDR honors a user-supplied PPM; SDRplay and HackRF
+        // use internal calibration. Show the control with a clear note
+        // when it's a no-op so users aren't surprised by the field.
+        ui.add_space(12.0);
+        ui.separator();
+        ui.add_space(6.0);
+        ui.heading("Frequency correction");
 
-                // ---- Display ------------------------------------------
-                // Per-app UI preferences that don't fit the device /
-                // gains / PPM groupings above. Right now this only
-                // hosts the HD5\u2013HD8 row visibility toggle, but it's
-                // the natural spot to grow into a "Settings" section
-                // as we add more user-facing knobs.
-                ui.heading("Display");
-                let mut show_hd5_hd8 = show_hd5_hd8;
-                let resp = ui.checkbox(
-                    &mut show_hd5_hd8,
-                    "Show HD5\u{2013}HD8 row in program selector",
+        let honors_ppm = active_driver == "rtlsdr";
+        let mut ppm = current_ppm;
+        ui.horizontal(|ui| {
+            ui.label("PPM:");
+            ui.add_enabled_ui(honors_ppm, |ui| {
+                let resp = ui.add(
+                    egui::DragValue::new(&mut ppm)
+                        .speed(0.1)
+                        .range(-100.0..=100.0)
+                        .suffix(" ppm"),
                 );
-                ui.label(
-                    egui::RichText::new(
-                        "Most stations only advertise HD1\u{2013}HD4. Enable \
-                         this when tuning to an MP11-partition broadcaster \
-                         with up to 8 audio subchannels.",
-                    )
-                    .small()
-                    .color(egui::Color32::from_gray(140)),
-                );
-                if resp.changed() {
-                    commands.push(UiCommand::SetShowHd5Hd8(show_hd5_hd8));
+                if honors_ppm
+                    && (resp.drag_stopped() || resp.lost_focus())
+                    && (ppm - current_ppm).abs() > 1e-6
+                {
+                    commands.push(UiCommand::SetSdrFreqCorrectionPpm(ppm));
                 }
+            });
+        });
+        ui.label(
+            egui::RichText::new(if honors_ppm {
+                "RTL-SDR honors this immediately."
+            } else {
+                "Disabled \u{2014} this driver uses its internal calibration \
+                 and ignores user-supplied PPM."
+            })
+            .small()
+            .color(egui::Color32::from_gray(140)),
+        );
+    }
 
-                let mut auto_decode = self.app_state.auto_decode_all_advertised;
-                let resp = ui.checkbox(
-                    &mut auto_decode,
-                    "Auto-decode every advertised subchannel",
-                );
-                ui.label(
-                    egui::RichText::new(
-                        "When a station's SIS table advertises HD2–HD4 (or \
-                         more), spawn a background decoder for each as soon \
-                         as it appears. Off by default: each extra decoder \
-                         is roughly one extra CPU core, and most listeners \
-                         only want HD1.",
-                    )
-                    .small()
-                    .color(egui::Color32::from_gray(140)),
-                );
-                if resp.changed() {
-                    commands.push(UiCommand::SetAutoDecodeAllAdvertised(auto_decode));
-                }
+    /// Display tab: UI preferences that aren't tied to the SDR — HD5\u{2013}HD8
+    /// row visibility and the auto-decode-every-subchannel toggle.
+    fn render_settings_display_tab(
+        &mut self,
+        ui: &mut egui::Ui,
+        commands: &mut Vec<UiCommand>,
+        show_hd5_hd8: bool,
+    ) {
+        ui.heading("Program selector");
+        ui.add_space(4.0);
 
-                ui.add_space(12.0);
-                ui.separator();
-                ui.add_space(4.0);
+        let mut show_hd5_hd8 = show_hd5_hd8;
+        let resp = ui.checkbox(
+            &mut show_hd5_hd8,
+            "Show HD5\u{2013}HD8 row in program selector",
+        );
+        ui.label(
+            egui::RichText::new(
+                "Most stations only advertise HD1\u{2013}HD4. Enable this \
+                 when tuning to an MP11-partition broadcaster with up to 8 \
+                 audio subchannels.",
+            )
+            .small()
+            .color(egui::Color32::from_gray(140)),
+        );
+        if resp.changed() {
+            commands.push(UiCommand::SetShowHd5Hd8(show_hd5_hd8));
+        }
 
-                // ---- Recording ----------------------------------------
-                ui.heading("Recording");
-                ui.label(
-                    egui::RichText::new(
-                        "Record any one HD subchannel as a 96 kbps Opus \
-                         file. The recording locks to whichever HD button \
-                         is selected at the moment you press Record \u{2014} \
-                         you can then listen to a different subchannel \
-                         without disturbing it.",
-                    )
-                    .small()
-                    .color(egui::Color32::from_gray(140)),
-                );
-                ui.add_space(4.0);
+        ui.add_space(10.0);
 
-                // Mode dropdown
-                let current_mode = self.config.recording_mode;
-                ui.horizontal(|ui| {
-                    ui.label("Mode:");
-                    egui::ComboBox::from_id_salt("recording_mode_combo")
-                        .selected_text(current_mode.label())
-                        .show_ui(ui, |ui| {
-                            for mode in [
-                                crate::config::RecordingMode::Off,
-                                crate::config::RecordingMode::On,
-                            ] {
-                                if ui
-                                    .selectable_label(
-                                        current_mode == mode,
-                                        mode.label(),
-                                    )
-                                    .clicked()
-                                    && current_mode != mode
-                                {
-                                    commands.push(UiCommand::SetRecordingMode(mode));
-                                }
-                            }
-                        });
-                });
+        let mut auto_decode = self.app_state.auto_decode_all_advertised;
+        let resp = ui.checkbox(
+            &mut auto_decode,
+            "Auto-decode every advertised subchannel",
+        );
+        ui.label(
+            egui::RichText::new(
+                "When a station's SIS table advertises HD2\u{2013}HD4 (or \
+                 more), spawn a background decoder for each as soon as it \
+                 appears. Off by default: each extra decoder is roughly one \
+                 extra CPU core, and most listeners only want HD1.",
+            )
+            .small()
+            .color(egui::Color32::from_gray(140)),
+        );
+        if resp.changed() {
+            commands.push(UiCommand::SetAutoDecodeAllAdvertised(auto_decode));
+        }
 
-                // Folder picker
+        ui.add_space(14.0);
+        ui.separator();
+        ui.add_space(6.0);
+        ui.heading("Presets");
+        ui.add_space(4.0);
+
+        // Plain numeric field. DragValue accepts typed input (click to
+        // type, scroll/drag to nudge), and the `range` plus a final
+        // clamp on the commit path keep the value sane regardless of
+        // how the user gets it there.
+        let mut slot_count = self.app_state.preset_slot_count.clamp(1, 48) as i32;
+        ui.horizontal(|ui| {
+            ui.label("Preset slots on Tuner panel:");
+            let resp = ui.add(
+                egui::DragValue::new(&mut slot_count)
+                    .range(1..=48)
+                    .speed(0.1),
+            );
+            if (resp.drag_stopped() || resp.lost_focus() || resp.changed())
+                && (slot_count as u32) != self.app_state.preset_slot_count
+            {
+                commands.push(UiCommand::SetPresetSlotCount(
+                    slot_count.clamp(1, 48) as u32,
+                ));
+            }
+        });
+        ui.label(
+            egui::RichText::new(
+                "Default 6, range 1\u{2013}48. The Tuner panel wraps preset \
+                 buttons across multiple rows as needed \u{2014} cranking \
+                 this past ~12 will noticeably grow the dock.",
+            )
+            .small()
+            .color(egui::Color32::from_gray(140)),
+        );
+    }
+
+    /// Recording tab: mode, output folder, max minutes per file, per-
+    /// station subfolders.
+    fn render_settings_recording_tab(
+        &mut self,
+        ui: &mut egui::Ui,
+        commands: &mut Vec<UiCommand>,
+    ) {
+        ui.heading("Recording");
+        ui.label(
+            egui::RichText::new(
+                "Record any one HD subchannel as a 96 kbps Opus file. The \
+                 recording locks to whichever HD button is selected at the \
+                 moment you press Record \u{2014} you can then listen to a \
+                 different subchannel without disturbing it.",
+            )
+            .small()
+            .color(egui::Color32::from_gray(140)),
+        );
+        ui.add_space(8.0);
+
+        // ---- Folder + max-minutes -----------------------------------
+        // Recording is always available when a stream is up; there's
+        // no separate "mode" toggle. The Rec button on the Tuner
+        // panel is the single entry point.
+        egui::Grid::new("recording_form_grid")
+            .num_columns(2)
+            .spacing([12.0, 6.0])
+            .show(ui, |ui| {
+                ui.label("Folder:");
                 let current_dir = self
                     .config
                     .recording_dir
@@ -3180,10 +3754,9 @@ impl Nrsc5App {
                             .unwrap_or_else(|| "<unresolved>".to_string())
                     });
                 ui.horizontal(|ui| {
-                    ui.label("Folder:");
                     ui.add(
                         egui::TextEdit::singleline(&mut current_dir.clone())
-                            .desired_width(280.0)
+                            .desired_width(260.0)
                             .interactive(false),
                     );
                     if ui.button("Browse\u{2026}").clicked() {
@@ -3207,71 +3780,51 @@ impl Nrsc5App {
                     if self.config.recording_dir.is_some()
                         && ui
                             .button("Reset")
-                            .on_hover_text("Revert to the default recordings folder")
+                            .on_hover_text(
+                                "Revert to the default recordings folder",
+                            )
                             .clicked()
                     {
                         commands.push(UiCommand::SetRecordingDir(None));
                     }
                 });
+                ui.end_row();
 
-                // Max minutes per file
-                let mut max_minutes = self.config.recording_max_minutes as i32;
-                ui.horizontal(|ui| {
-                    ui.label("Max minutes per file:");
-                    let resp = ui.add(
-                        egui::DragValue::new(&mut max_minutes)
-                            .range(1..=240)
-                            .speed(1.0)
-                            .suffix(" min"),
-                    );
-                    if resp.changed() {
-                        commands.push(UiCommand::SetRecordingMaxMinutes(
-                            max_minutes.clamp(1, 240) as u32,
-                        ));
-                    }
-                });
-                ui.label(
-                    egui::RichText::new(
-                        "Hard cap on a single .opus file. Continuous mode \
-                         rotates to a new file when reached; per-song mode \
-                         splits sooner whenever the song changes.",
-                    )
-                    .small()
-                    .color(egui::Color32::from_gray(140)),
-                );
-
-                // Subfolder per station
-                let mut subfolder = self.config.recording_subfolder_per_station;
-                let resp = ui.checkbox(
-                    &mut subfolder,
-                    "Group files into per-station subfolders",
+                ui.label("Max minutes per file:");
+                let mut max_minutes =
+                    self.config.recording_max_minutes as i32;
+                let resp = ui.add(
+                    egui::DragValue::new(&mut max_minutes)
+                        .range(1..=240)
+                        .speed(1.0)
+                        .suffix(" min"),
                 );
                 if resp.changed() {
-                    commands.push(UiCommand::SetRecordingSubfolderPerStation(subfolder));
+                    commands.push(UiCommand::SetRecordingMaxMinutes(
+                        max_minutes.clamp(1, 240) as u32,
+                    ));
                 }
-
-                ui.add_space(12.0);
-                ui.separator();
-
-                // ---- Footer buttons -----------------------------------
-                ui.horizontal(|ui| {
-                    if ui.button("Reset to defaults").clicked() {
-                        commands.push(UiCommand::ResetSdrConfig);
-                    }
-                    ui.with_layout(
-                        egui::Layout::right_to_left(egui::Align::Center),
-                        |ui| {
-                            if ui.button("Close").clicked() {
-                                commands.push(UiCommand::HideSdrSettings);
-                            }
-                        },
-                    );
-                });
+                ui.end_row();
             });
 
-        if !open {
-            // User dismissed via the "X" on the window title bar.
-            commands.push(UiCommand::HideSdrSettings);
+        ui.label(
+            egui::RichText::new(
+                "Hard cap on a single .opus file. Continuous mode rotates \
+                 to a new file when reached; per-song mode splits sooner \
+                 whenever the song changes.",
+            )
+            .small()
+            .color(egui::Color32::from_gray(140)),
+        );
+
+        ui.add_space(10.0);
+        let mut subfolder = self.config.recording_subfolder_per_station;
+        let resp = ui.checkbox(
+            &mut subfolder,
+            "Group files into per-station subfolders",
+        );
+        if resp.changed() {
+            commands.push(UiCommand::SetRecordingSubfolderPerStation(subfolder));
         }
     }
 
@@ -3412,35 +3965,116 @@ fn extract_call_sign(filename: &str) -> Option<String> {
 
 /// Default dock layout used on a fresh install (when no persisted state
 /// exists). Captured live with the in-app "Dump Layout" helper at a
-/// 1623×1179 inner window size, so the floating sub-windows assume roughly
-/// that much room. Smaller windows still work — the user can drag any
+/// ~1560×880 inner window size so the floating sub-windows fit
+/// comfortably inside a 1920×1080 monitor with the Windows taskbar
+/// visible. Smaller windows still work — the user can drag any
 /// sub-window back into place, and persistence saves their changes.
+///
+/// Only a minimal set of panels is opened by default (Tuner +
+/// StationInfo, NowPlaying, Weather/Traffic). All other panels stay
+/// closed and can be reopened from the top-bar toggles.
 const DEFAULT_DOCK_RON: &str = r#"(
     surfaces: [Main((
         nodes: [],
         focused_node: Some((0)),
         collapsed: false,
         collapsed_leaf_count: 0,
-)), Window((
+)), Empty, Window((
         nodes: [Leaf((
             rect: (
                 min: (
-                    x: 305.0,
-                    y: 55.0,
+                    x: 659.0,
+                    y: 83.0,
                 ),
                 max: (
-                    x: 626.875,
-                    y: 468.09375,
+                    x: 966.1875,
+                    y: 409.8125,
                 ),
             ),
             viewport: (
                 min: (
-                    x: 305.0,
-                    y: 79.0,
+                    x: 659.0,
+                    y: 107.0,
                 ),
                 max: (
-                    x: 626.875,
-                    y: 468.09375,
+                    x: 966.1875,
+                    y: 409.8125,
+                ),
+            ),
+            tabs: [Weather, Traffic],
+            active: (0),
+            scroll: 0.0,
+            collapsed: false,
+        ))],
+        focused_node: Some((0)),
+        collapsed: false,
+        collapsed_leaf_count: 0,
+    ), (
+        screen_rect: None,
+        dragged: false,
+        next_position: None,
+        next_size: None,
+        expanded_height: None,
+        new: false,
+        minimized: false,
+    )), Window((
+        nodes: [Leaf((
+            rect: (
+                min: (
+                    x: 14.34375,
+                    y: 78.34375,
+                ),
+                max: (
+                    x: 276.90625,
+                    y: 520.5,
+                ),
+            ),
+            viewport: (
+                min: (
+                    x: 14.34375,
+                    y: 102.34375,
+                ),
+                max: (
+                    x: 276.90625,
+                    y: 520.5,
+                ),
+            ),
+            tabs: [Tuner, StationInfo],
+            active: (0),
+            scroll: 0.0,
+            collapsed: false,
+        ))],
+        focused_node: Some((0)),
+        collapsed: false,
+        collapsed_leaf_count: 0,
+    ), (
+        screen_rect: None,
+        dragged: false,
+        next_position: None,
+        next_size: None,
+        expanded_height: None,
+        new: false,
+        minimized: false,
+    )), Window((
+        nodes: [Leaf((
+            rect: (
+                min: (
+                    x: 301.65625,
+                    y: 81.0,
+                ),
+                max: (
+                    x: 616.1875,
+                    y: 473.8125,
+                ),
+            ),
+            viewport: (
+                min: (
+                    x: 301.65625,
+                    y: 105.0,
+                ),
+                max: (
+                    x: 616.1875,
+                    y: 473.8125,
                 ),
             ),
             tabs: [NowPlaying],
@@ -3459,200 +4093,8 @@ const DEFAULT_DOCK_RON: &str = r#"(
         expanded_height: None,
         new: false,
         minimized: false,
-    )), Window((
-        nodes: [Leaf((
-            rect: (
-                min: (
-                    x: 652.34375,
-                    y: 54.34375,
-                ),
-                max: (
-                    x: 1594.9688,
-                    y: 466.625,
-                ),
-            ),
-            viewport: (
-                min: (
-                    x: 652.34375,
-                    y: 78.34375,
-                ),
-                max: (
-                    x: 1594.9688,
-                    y: 466.625,
-                ),
-            ),
-            tabs: [Collage],
-            active: (0),
-            scroll: 0.0,
-            collapsed: false,
-        ))],
-        focused_node: None,
-        collapsed: false,
-        collapsed_leaf_count: 0,
-    ), (
-        screen_rect: None,
-        dragged: false,
-        next_position: None,
-        next_size: None,
-        expanded_height: None,
-        new: false,
-        minimized: false,
-    )), Window((
-        nodes: [Vertical((
-            rect: (
-                min: (
-                    x: 24.34375,
-                    y: 55.0,
-                ),
-                max: (
-                    x: 281.53125,
-                    y: 554.75,
-                ),
-            ),
-            fraction: 0.61205405,
-            fully_collapsed: false,
-            collapsed_leaf_count: 0,
-        )), Leaf((
-            rect: (
-                min: (
-                    x: 24.34375,
-                    y: 55.0,
-                ),
-                max: (
-                    x: 281.53125,
-                    y: 360.66666,
-                ),
-            ),
-            viewport: (
-                min: (
-                    x: 24.34375,
-                    y: 79.0,
-                ),
-                max: (
-                    x: 281.53125,
-                    y: 360.65625,
-                ),
-            ),
-            tabs: [Tuner],
-            active: (0),
-            scroll: 0.0,
-            collapsed: false,
-        )), Leaf((
-            rect: (
-                min: (
-                    x: 24.34375,
-                    y: 361.33334,
-                ),
-                max: (
-                    x: 281.53125,
-                    y: 554.75,
-                ),
-            ),
-            viewport: (
-                min: (
-                    x: 24.34375,
-                    y: 385.34375,
-                ),
-                max: (
-                    x: 281.53125,
-                    y: 554.75,
-                ),
-            ),
-            tabs: [Signal],
-            active: (0),
-            scroll: 0.0,
-            collapsed: false,
-        ))],
-        focused_node: Some((1)),
-        collapsed: false,
-        collapsed_leaf_count: 0,
-    ), (
-        screen_rect: None,
-        dragged: false,
-        next_position: None,
-        next_size: None,
-        expanded_height: None,
-        new: false,
-        minimized: false,
-    )), Window((
-        nodes: [Horizontal((
-            rect: (
-                min: (
-                    x: 305.0,
-                    y: 493.0,
-                ),
-                max: (
-                    x: 1595.4063,
-                    y: 1139.4063,
-                ),
-            ),
-            fraction: 0.5,
-            fully_collapsed: false,
-            collapsed_leaf_count: 0,
-        )), Leaf((
-            rect: (
-                min: (
-                    x: 305.0,
-                    y: 493.0,
-                ),
-                max: (
-                    x: 950.0,
-                    y: 1139.4063,
-                ),
-            ),
-            viewport: (
-                min: (
-                    x: 305.0,
-                    y: 517.0,
-                ),
-                max: (
-                    x: 950.0,
-                    y: 1139.4063,
-                ),
-            ),
-            tabs: [Traffic],
-            active: (0),
-            scroll: 0.0,
-            collapsed: false,
-        )), Leaf((
-            rect: (
-                min: (
-                    x: 950.6667,
-                    y: 493.0,
-                ),
-                max: (
-                    x: 1595.4063,
-                    y: 1139.4063,
-                ),
-            ),
-            viewport: (
-                min: (
-                    x: 950.65625,
-                    y: 517.0,
-                ),
-                max: (
-                    x: 1595.4063,
-                    y: 1139.4063,
-                ),
-            ),
-            tabs: [Weather],
-            active: (0),
-            scroll: 0.0,
-            collapsed: false,
-        ))],
-        focused_node: Some((2)),
-        collapsed: false,
-        collapsed_leaf_count: 0,
-    ), (
-        screen_rect: None,
-        dragged: false,
-        next_position: None,
-        next_size: None,
-        expanded_height: None,
-        new: false,
-        minimized: false,
-    ))],
-    focused_surface: Some((4)),
+    )), Empty, Empty],
+    focused_surface: Some((2)),
     translations: (
         tab_context_menu: (
             close_button: "Close",

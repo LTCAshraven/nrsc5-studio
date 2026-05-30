@@ -77,9 +77,16 @@ Users without an SDRplay device can ignore this entirely — the bundled module 
 
 HackRF support ships in v0.3.0 but is **not yet bench-validated**. The device profile (`LNA`, `VGA`, `AMP` gain stages) is conservative but may need tuning for HD Radio. If you have a HackRF and try it, opening an issue with your findings would be hugely appreciated.
 
-### Deferred to v0.5.0: rtl_tcp / networked SDRs
+### Remote SDRs (SoapyRemote and rtl_tcp)
 
-The v0.2.x **rtl_tcp networked input** path is **deferred to v0.5.0** with full restoration planned via [SoapyRemote](https://github.com/pothosware/SoapyRemote) alongside native `rtl_tcp` compatibility. If your existing `config.toml` has `use_rtl_tcp = true`, NRSC5 Studio logs a one-shot warning on launch and falls back to local USB RTL-SDR for the session. Your `rtl_tcp_host` / `rtl_tcp_port` settings are preserved untouched and will be re-honored automatically when v0.5.0 ships.
+NRSC5 Studio can drive a remote SDR via one of two protocols, picked from the **Transport** row at the top of **📡 SDR Settings…**:
+
+- **SoapyRemote** — connects to a `SoapySDRServer` instance on the remote host. Use this when the remote dongle is anything other than a plain RTL-SDR (e.g. SDRplay over the network) or when you want SoapySDR's full feature set (per-element gain, antenna selection, etc.). The remote machine must have **SoapyRemote** installed alongside the device's Soapy module (`SoapyRTLSDR`, `SoapySDRPlay3`, …). Default port `55132`.
+- **rtl_tcp** — connects directly to a native `rtl_tcp` server. Use this for the classic RTL-SDR-over-network case where you only need a single tuner-gain control. The remote machine just needs `rtl_tcp` (ships with `rtl-sdr` on most distributions). Default port `1234`.
+
+Pick the transport, enter the remote host and port, and press Start as usual. The in-process spectrum, AGC, and audio pipeline are identical regardless of transport.
+
+Configs from earlier 0.2.x / 0.3.x releases that used `use_rtl_tcp = true` are migrated automatically to `transport = "rtl_tcp_remote"` on first launch; the legacy keys are then dropped from `config.toml`.
 
 ---
 

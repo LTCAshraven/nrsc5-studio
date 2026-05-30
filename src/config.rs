@@ -2,6 +2,29 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
 
+/// Which I/Q transport feeds the in-process piped pipeline. Persisted
+/// in `[sdr]` so the SDR Settings modal can route Start through the
+/// right backend without consulting any legacy 0.2.x fields. `LocalSoapy`
+/// is the default for fresh installs; `SoapyRemote` and `RtlTcpRemote`
+/// add the matching connection fields (`remote_host`, `remote_port`,
+/// `remote_extra_args`) to [`SdrConfigSection`].
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SdrTransport {
+    /// Open a local SoapySDR device described by `driver` + `device_args`.
+    /// The default — what you get on a fresh install with a USB SDR.
+    #[default]
+    LocalSoapy,
+    /// Open a SoapyRemote device. Composed args end up as
+    /// `driver=remote,remote=<host>:<port>` plus any extras from
+    /// `remote_extra_args`. Requires `SoapySDRServer` on the remote host.
+    SoapyRemote,
+    /// Open a native rtl_tcp connection. Routes through the
+    /// `RtlTcpSdr` backend rather than SoapySDR. Requires an
+    /// `rtl_tcp` server on the remote host.
+    RtlTcpRemote,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum GainMode {
@@ -25,13 +48,18 @@ pub enum GainMode {
 /// choice survives across sessions. Chunk 4.3 wires Off and
 /// Continuous; Chunk 4.4 adds the PerSong PSD-split logic on top of
 /// the same `RecordingSession` lifecycle.
+///
+/// As of 0.4.x there's only effectively one mode: recording is
+/// always available when a stream is up, and arms when the user
+/// clicks the Rec button on the Tuner panel. The enum is retained
+/// only for backward compatibility with existing on-disk configs;
+/// the default is now `On` so users who never touched the legacy
+/// dropdown get sensible behavior.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum RecordingMode {
-    /// Pressing the Record button is a no-op; the recorder never
-    /// spawns. Default — we don't want to surprise a user with disk
-    /// fills on first launch.
-    #[default]
+    /// Legacy "disabled" state. The Rec button no longer honors this
+    /// — kept only so we don't break deserialization of old configs.
     Off,
     /// Record the locked subchannel continuously, rotating to a
     /// fresh file whenever `recording_max_minutes` is reached. The
@@ -39,6 +67,7 @@ pub enum RecordingMode {
     /// deserialize to this — PSD timing on real-world stations is
     /// too irregular for reliable song-boundary splits, so they're
     /// folded into one "just record" mode.
+    #[default]
     #[serde(alias = "per_song", alias = "continuous")]
     On,
 }
@@ -65,17 +94,24 @@ pub struct AppConfig {
     pub frequency_mhz: f32,
     pub selected_program: u32,
     pub dark_mode: bool,
+    /// **Legacy (pre-0.5.0).** Kept only so old configs deserialize.
+    /// Migrated into `sdr.transport` + `sdr.remote_host` + `sdr.remote_port`
+    /// by [`migrate_legacy_sdr`] and never written back to disk.
+    #[serde(default, skip_serializing)]
     pub use_rtl_tcp: bool,
+    /// **Legacy (pre-0.3.0).** Migrated into `sdr.device_args`
+    /// (`device=N`) by [`migrate_legacy_sdr`] and never written back.
+    #[serde(default, skip_serializing)]
     pub rtl_device_index: u32,
+    /// **Legacy (pre-0.5.0).** Migrated into `sdr.remote_host`.
+    #[serde(default = "default_rtl_tcp_host", skip_serializing)]
     pub rtl_tcp_host: String,
+    /// **Legacy (pre-0.5.0).** Migrated into `sdr.remote_port`.
+    #[serde(default = "default_rtl_tcp_port", skip_serializing)]
     pub rtl_tcp_port: u16,
-    /// **Dev-only** (v0.2.0 step 4): when `true`, the Start command
-    /// drives `nrsc5.exe` from our own in-process [`Sdr`](crate::sdr)
-    /// backend via stdin (`-r -`) instead of letting nrsc5 open the USB
-    /// device itself. Off by default — flip in `config.toml` to test the
-    /// piped path. Once the waterfall (step 5+) is wired in, this will
-    /// become the default and the flag will graduate to a real UI toggle.
-    #[serde(default)]
+    /// **Legacy (pre-0.3.0).** The piped path is now the only path.
+    /// Kept here only so older configs deserialize; never written back.
+    #[serde(default, skip_serializing)]
     pub use_piped_sdr: bool,
     #[serde(default)]
     pub presets: Vec<Preset>,
@@ -127,6 +163,12 @@ pub struct AppConfig {
     /// want all subchannels always-on can set it once.
     #[serde(default)]
     pub auto_decode_all_advertised: bool,
+    /// Number of preset slots rendered on the Tuner panel. Range is
+    /// clamped to 1..=48 at apply time so a hand-edited config can't
+    /// blow up the layout. Default 6 matches the original hardcoded
+    /// value before this was made configurable.
+    #[serde(default = "default_preset_slot_count")]
+    pub preset_slot_count: u32,
     /// Phase 4 — selected recording mode. See `RecordingMode` for the
     /// behavior of each variant.
     #[serde(default)]
@@ -177,6 +219,11 @@ pub struct AppConfig {
 /// directly without going through config.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SdrConfigSection {
+    /// Selected transport. Determines how the in-process pipeline
+    /// opens the I/Q source: a local Soapy device, a SoapyRemote
+    /// connection, or a native rtl_tcp server.
+    #[serde(default)]
+    pub transport: SdrTransport,
     #[serde(default = "default_sdr_driver")]
     pub driver: String,
     #[serde(default)]
@@ -193,6 +240,21 @@ pub struct SdrConfigSection {
     /// dropdown when the live SDR reports more than one antenna.
     #[serde(default)]
     pub antenna: Option<String>,
+    /// Host for `SoapyRemote` / `RtlTcpRemote` transports. Ignored
+    /// when `transport == LocalSoapy`.
+    #[serde(default)]
+    pub remote_host: Option<String>,
+    /// Port for `SoapyRemote` / `RtlTcpRemote` transports. Ignored
+    /// when `transport == LocalSoapy`. Defaults applied per-transport
+    /// by [`SdrConfigSection::effective_remote_port`].
+    #[serde(default)]
+    pub remote_port: Option<u16>,
+    /// Optional trailing args appended to the SoapyRemote args string
+    /// (e.g. `"remote:driver=rtlsdr"`). Power-user escape hatch; the
+    /// UI fills the common `host:port` case via the dedicated fields
+    /// above. Ignored for non-SoapyRemote transports.
+    #[serde(default)]
+    pub remote_extra_args: Option<String>,
 }
 
 fn default_sdr_driver() -> String {
@@ -202,25 +264,114 @@ fn default_sdr_driver() -> String {
 impl Default for SdrConfigSection {
     fn default() -> Self {
         Self {
+            transport: SdrTransport::default(),
             driver: default_sdr_driver(),
             device_args: String::new(),
             freq_correction_ppm: 0.0,
             gains: BTreeMap::new(),
             antenna: None,
+            remote_host: None,
+            remote_port: None,
+            remote_extra_args: None,
         }
     }
 }
 
 impl SdrConfigSection {
-    /// Build the full SoapySDR args string for `Device::new`. Combines
-    /// `driver` and `device_args` so the caller doesn't need to repeat
-    /// the formatting. Returns `"driver=rtlsdr"` for the default
-    /// case, or `"driver=rtlsdr,device=2"` etc. when args are set.
+    /// Build the full SoapySDR args string for `Device::new`. Composes
+    /// based on the active transport:
+    ///
+    /// * `LocalSoapy`   → `driver=<driver>[,device_args]`
+    /// * `SoapyRemote`  → `driver=remote,remote=<host>:<port>[,remote_extra_args]`
+    /// * `RtlTcpRemote` → also returns the LocalSoapy form, but callers
+    ///                    on this transport should open via the
+    ///                    `RtlTcpSdr` backend instead of SoapySDR.
+    ///                    This string is unused in that path but kept
+    ///                    deterministic so logging / display still works.
     pub fn to_args_string(&self) -> String {
-        if self.device_args.trim().is_empty() {
-            format!("driver={}", self.driver)
-        } else {
-            format!("driver={},{}", self.driver, self.device_args.trim())
+        match self.transport {
+            SdrTransport::SoapyRemote => {
+                let host = self.effective_remote_host();
+                let port = self.effective_remote_port();
+                let mut s = format!("driver=remote,remote={host}:{port}");
+                if let Some(extra) = self.remote_extra_args.as_ref() {
+                    let extra = extra.trim();
+                    if !extra.is_empty() {
+                        s.push(',');
+                        s.push_str(extra);
+                    }
+                }
+                s
+            }
+            SdrTransport::LocalSoapy | SdrTransport::RtlTcpRemote => {
+                if self.device_args.trim().is_empty() {
+                    format!("driver={}", self.driver)
+                } else {
+                    format!("driver={},{}", self.driver, self.device_args.trim())
+                }
+            }
+        }
+    }
+
+    /// Transport-aware short label suitable for the top-bar chip
+    /// (e.g. "sdrplay", "remote", "rtl_tcp"). Unlike `driver` this
+    /// reflects what's actually being talked to right now — when the
+    /// user switches to `rtl_tcp` the chip should stop saying
+    /// "sdrplay" even though that's still the last-bound local
+    /// driver.
+    pub fn chip_label(&self) -> String {
+        match self.transport {
+            SdrTransport::LocalSoapy => self.driver.clone(),
+            SdrTransport::SoapyRemote => "remote".to_string(),
+            SdrTransport::RtlTcpRemote => "rtl_tcp".to_string(),
+        }
+    }
+
+    /// Transport-aware connection summary suitable for the Settings
+    /// modal's right-hand-side `code(...)` readout. Unlike
+    /// `to_args_string()` this NEVER returns the SoapySDR
+    /// `driver=sdrplay,...` form when the active transport is
+    /// `rtl_tcp` — that was technically correct (it's the local
+    /// driver that's "selected") but it confused users who saw
+    /// `driver=sdrplay` while clearly streaming over the network.
+    pub fn display_connection_string(&self) -> String {
+        match self.transport {
+            SdrTransport::SoapyRemote | SdrTransport::LocalSoapy => {
+                self.to_args_string()
+            }
+            SdrTransport::RtlTcpRemote => {
+                format!(
+                    "rtl_tcp://{}:{}",
+                    self.effective_remote_host(),
+                    self.effective_remote_port(),
+                )
+            }
+        }
+    }
+
+    /// Resolved remote host string, falling back to `127.0.0.1` when
+    /// the user hasn't filled the field. Trims whitespace.
+    pub fn effective_remote_host(&self) -> String {
+        self.remote_host
+            .as_ref()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "127.0.0.1".to_string())
+    }
+
+    /// Resolved remote port, with per-transport defaults: `1234` for
+    /// `RtlTcpRemote`, `55132` for `SoapyRemote`, `0` otherwise (the
+    /// caller is expected to ignore the value on `LocalSoapy`).
+    pub fn effective_remote_port(&self) -> u16 {
+        if let Some(p) = self.remote_port {
+            if p != 0 {
+                return p;
+            }
+        }
+        match self.transport {
+            SdrTransport::RtlTcpRemote => 1234,
+            SdrTransport::SoapyRemote => 55132,
+            SdrTransport::LocalSoapy => 0,
         }
     }
 }
@@ -247,6 +398,18 @@ fn default_recording_max_minutes() -> u32 {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_rtl_tcp_host() -> String {
+    "127.0.0.1".to_string()
+}
+
+fn default_rtl_tcp_port() -> u16 {
+    1234
+}
+
+fn default_preset_slot_count() -> u32 {
+    6
 }
 
 impl Default for AppConfig {
@@ -277,6 +440,7 @@ impl Default for AppConfig {
             sdr: SdrConfigSection::default(),
             show_hd5_hd8: false,
             auto_decode_all_advertised: false,
+            preset_slot_count: default_preset_slot_count(),
             recording_mode: RecordingMode::Off,
             recording_dir: None,
             recording_max_minutes: 60,
@@ -317,9 +481,9 @@ fn sanitize(cfg: &mut AppConfig) {
     migrate_legacy_sdr(cfg);
 }
 
-/// Migrate the pre-0.3.0 SDR config layout into the new `[sdr]`
-/// section. Triggered on every load — idempotent in steady state
-/// because we only fill in fields the user hasn't already configured.
+/// Migrate the pre-0.3.0 / pre-0.5.0 SDR config layout into the new
+/// `[sdr]` section. Triggered on every load — idempotent in steady
+/// state because we only fill in fields the user hasn't already configured.
 ///
 /// Migration rules:
 ///
@@ -330,17 +494,15 @@ fn sanitize(cfg: &mut AppConfig) {
 /// * If `cfg.sdr.gains` is empty AND legacy `manual_gain_tenths` is
 ///   non-default, seed a `TUNER` entry so saving the config produces
 ///   a sensible round-trip.
-/// * If `use_rtl_tcp` is `true`, log a one-shot warning that rtl_tcp
-///   support is deferred to 0.4.0 (via SoapyRemote) — but DON'T touch
-///   the legacy fields. The user's preferences for host/port survive
-///   the upgrade; we just fall back to local USB RTL-SDR for the
-///   0.3.x cycle. See `/memories/session/plan-0.4.0-stub.md` for the
-///   restoration plan.
+/// * If `use_rtl_tcp == true` AND the user hasn't already picked a
+///   modern transport, set `sdr.transport = RtlTcpRemote` and copy
+///   the legacy `rtl_tcp_host` / `rtl_tcp_port` into the new
+///   `sdr.remote_host` / `sdr.remote_port` fields.
 ///
-/// The legacy fields (`rtl_device_index`, `use_rtl_tcp`,
-/// `rtl_tcp_host`, `rtl_tcp_port`, `use_piped_sdr`, `manual_gain_tenths`,
-/// `gain_mode`) are NOT removed from `AppConfig` — they keep
-/// round-tripping unchanged so 0.4.0 can read them.
+/// The legacy fields are kept on `AppConfig` as `skip_serializing`
+/// stubs so old files still deserialize, but never round-trip back
+/// to disk — the only canonical runtime source of truth is the `[sdr]`
+/// section.
 fn migrate_legacy_sdr(cfg: &mut AppConfig) {
     // Populate device_args from rtl_device_index if the user hasn't
     // set anything explicit. We use the heuristic "default driver AND
@@ -364,17 +526,25 @@ fn migrate_legacy_sdr(cfg: &mut AppConfig) {
         );
     }
 
-    // rtl_tcp deferral notice. Logged through eprintln rather than
-    // tracing/log because the rest of this module is unaware of those
-    // facades; the goal is just to surface the change once on launch
-    // without breaking anyone's existing config.
-    if cfg.use_rtl_tcp {
+    // Legacy rtl_tcp → modern transport. Only fires when the user
+    // hadn't already chosen a modern transport (so re-loads of an
+    // already-migrated config are a no-op).
+    if cfg.use_rtl_tcp && cfg.sdr.transport == SdrTransport::LocalSoapy {
+        cfg.sdr.transport = SdrTransport::RtlTcpRemote;
+        if cfg.sdr.remote_host.is_none() {
+            let host = cfg.rtl_tcp_host.trim();
+            if !host.is_empty() {
+                cfg.sdr.remote_host = Some(host.to_string());
+            }
+        }
+        if cfg.sdr.remote_port.is_none() && cfg.rtl_tcp_port != 0 {
+            cfg.sdr.remote_port = Some(cfg.rtl_tcp_port);
+        }
         eprintln!(
-            "[config] WARN: use_rtl_tcp=true in config — rtl_tcp support is \
-             deferred to v0.4.0 via SoapyRemote (see CHANGELOG and \
-             README 'Supported SDRs'). Falling back to local USB RTL-SDR \
-             via SoapySDR for this session. Your rtl_tcp_host/port settings \
-             are preserved untouched and will be re-honored when 0.4.0 ships."
+            "[config] migrated legacy use_rtl_tcp=true → sdr.transport=rtl_tcp_remote \
+             (host={}, port={}). Legacy fields will no longer be written back.",
+            cfg.sdr.effective_remote_host(),
+            cfg.sdr.effective_remote_port()
         );
     }
 }
@@ -397,4 +567,143 @@ pub fn save_config(cfg: &AppConfig) {
     };
 
     let _ = fs::write(path, raw);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_use_rtl_tcp_migrates_to_transport() {
+        let raw = r#"
+            frequency_mhz = 101.1
+            selected_program = 0
+            dark_mode = true
+            use_rtl_tcp = true
+            rtl_device_index = 0
+            rtl_tcp_host = "192.168.1.50"
+            rtl_tcp_port = 1234
+        "#;
+        let mut cfg: AppConfig = toml::from_str(raw).expect("parse legacy config");
+        sanitize(&mut cfg);
+        assert_eq!(cfg.sdr.transport, SdrTransport::RtlTcpRemote);
+        assert_eq!(cfg.sdr.remote_host.as_deref(), Some("192.168.1.50"));
+        assert_eq!(cfg.sdr.remote_port, Some(1234));
+    }
+
+    #[test]
+    fn legacy_rtl_device_index_migrates_to_device_args() {
+        let raw = r#"
+            frequency_mhz = 101.1
+            selected_program = 0
+            dark_mode = true
+            use_rtl_tcp = false
+            rtl_device_index = 2
+            rtl_tcp_host = "127.0.0.1"
+            rtl_tcp_port = 1234
+        "#;
+        let mut cfg: AppConfig = toml::from_str(raw).expect("parse legacy config");
+        sanitize(&mut cfg);
+        assert_eq!(cfg.sdr.transport, SdrTransport::LocalSoapy);
+        assert_eq!(cfg.sdr.device_args, "device=2");
+    }
+
+    #[test]
+    fn already_migrated_config_is_idempotent() {
+        let raw = r#"
+            frequency_mhz = 101.1
+            selected_program = 0
+            dark_mode = true
+            use_rtl_tcp = true
+            rtl_device_index = 0
+            rtl_tcp_host = "127.0.0.1"
+            rtl_tcp_port = 1234
+
+            [sdr]
+            transport = "soapy_remote"
+            driver = "rtlsdr"
+            remote_host = "10.0.0.5"
+            remote_port = 55132
+        "#;
+        let mut cfg: AppConfig = toml::from_str(raw).expect("parse modern config");
+        sanitize(&mut cfg);
+        // Modern transport already set — the legacy migration must NOT
+        // clobber it back to RtlTcpRemote.
+        assert_eq!(cfg.sdr.transport, SdrTransport::SoapyRemote);
+        assert_eq!(cfg.sdr.remote_host.as_deref(), Some("10.0.0.5"));
+        assert_eq!(cfg.sdr.remote_port, Some(55132));
+    }
+
+    #[test]
+    fn save_drops_legacy_fields() {
+        let mut cfg = AppConfig::default();
+        cfg.use_rtl_tcp = true;
+        cfg.rtl_device_index = 7;
+        cfg.use_piped_sdr = true;
+        let raw = toml::to_string_pretty(&cfg).expect("serialize default config");
+        assert!(
+            !raw.contains("use_rtl_tcp"),
+            "use_rtl_tcp must not round-trip back to disk; raw was:\n{raw}"
+        );
+        assert!(
+            !raw.contains("rtl_device_index"),
+            "rtl_device_index must not round-trip; raw was:\n{raw}"
+        );
+        assert!(
+            !raw.contains("rtl_tcp_host"),
+            "rtl_tcp_host must not round-trip; raw was:\n{raw}"
+        );
+        assert!(
+            !raw.contains("rtl_tcp_port"),
+            "rtl_tcp_port must not round-trip; raw was:\n{raw}"
+        );
+        assert!(
+            !raw.contains("use_piped_sdr"),
+            "use_piped_sdr must not round-trip; raw was:\n{raw}"
+        );
+    }
+
+    #[test]
+    fn soapy_remote_args_string() {
+        let mut sdr = SdrConfigSection::default();
+        sdr.transport = SdrTransport::SoapyRemote;
+        sdr.remote_host = Some("192.168.1.20".to_string());
+        sdr.remote_port = Some(55132);
+        assert_eq!(
+            sdr.to_args_string(),
+            "driver=remote,remote=192.168.1.20:55132"
+        );
+    }
+
+    #[test]
+    fn soapy_remote_args_string_falls_back_to_loopback() {
+        let mut sdr = SdrConfigSection::default();
+        sdr.transport = SdrTransport::SoapyRemote;
+        // remote_host left None → fallback to 127.0.0.1
+        assert_eq!(
+            sdr.to_args_string(),
+            "driver=remote,remote=127.0.0.1:55132"
+        );
+    }
+
+    #[test]
+    fn soapy_remote_args_string_with_extras() {
+        let mut sdr = SdrConfigSection::default();
+        sdr.transport = SdrTransport::SoapyRemote;
+        sdr.remote_host = Some("rs.local".to_string());
+        sdr.remote_port = Some(1337);
+        sdr.remote_extra_args = Some("remote:driver=rtlsdr".to_string());
+        assert_eq!(
+            sdr.to_args_string(),
+            "driver=remote,remote=rs.local:1337,remote:driver=rtlsdr"
+        );
+    }
+
+    #[test]
+    fn local_soapy_args_string_unchanged() {
+        let mut sdr = SdrConfigSection::default();
+        sdr.driver = "sdrplay".to_string();
+        sdr.device_args = "serial=02000001".to_string();
+        assert_eq!(sdr.to_args_string(), "driver=sdrplay,serial=02000001");
+    }
 }
