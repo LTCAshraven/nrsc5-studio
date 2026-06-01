@@ -261,13 +261,19 @@ impl DockViewer<'_> {
         ui.add_space(2.0);
         ui.horizontal(|ui| {
             ui.label(RichText::new("Frequency").strong());
-            ui.add(
+            let freq_resp = ui.add(
                 DragValue::new(&mut self.app_state.frequency_mhz)
                     .speed(0.1)
                     .suffix(" MHz")
                     .range(87.5..=108.0),
             );
-            if ui.button("Tune").clicked() {
+            // Treat <Enter> in the Frequency field as a Tune click so the
+            // user doesn't have to grab the mouse after typing a freq.
+            // `lost_focus()` + `Enter` is egui's idiomatic "submit" gesture
+            // for text-editable widgets including `DragValue`.
+            let enter_pressed = freq_resp.lost_focus()
+                && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if ui.button("Tune").clicked() || enter_pressed {
                 self.commands
                     .push(UiCommand::TuneMhz(self.app_state.frequency_mhz));
             }

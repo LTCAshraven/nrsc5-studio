@@ -1960,15 +1960,36 @@ impl Nrsc5App {
                 }
             }
             NrscEvent::LotFile { lot, name, data, .. } => {
+                // Reconstruct the `{lot}_{name}` filename that the old
+                // `nrsc5.exe --dump-aas-files` flag used to write.
+                // Downstream consumers (`extract_call_sign`,
+                // `TrafficMap::process_lot`, `WeatherMap::process_lot`,
+                // `WeatherMap::bootstrap_from_cache`) all split on the
+                // first `_` to strip that prefix, so the on-disk name
+                // and the strings we pass them must include it; otherwise
+                // `TMT_…` / `DWRO_…` / `DWRI_…` get their leading token
+                // mistaken for the lot prefix and fail every
+                // `starts_with` check.
+                let filename = if name.is_empty() {
+                    String::new()
+                } else {
+                    format!("{lot}_{name}")
+                };
                 // Persist the payload to the AAS scratch directory.
-                // Downstream consumers (cover art, traffic map, weather
-                // map) all read from disk via `aas_dir.join(name)`, so
-                // the write must happen before they're invoked. An
-                // empty payload (libnrsc5 emitted a null/zero-size data
-                // pointer) is skipped — an empty file would corrupt
-                // the image-decode paths.
-                if !data.is_empty() && !name.is_empty() {
-                    let path = self.aas_dir.join(&name);
+                // Downstream map / cover-art code reads it back via
+                // `aas_dir.join(filename)`. Empty payloads (libnrsc5
+                // emitted a null/zero-size data pointer) are skipped
+                // because an empty file would corrupt the image-decode
+                // paths.
+                #[cfg(debug_assertions)]
+                eprintln!(
+                    "[lot] arrive lot={} name={} bytes={}",
+                    lot,
+                    filename,
+                    data.len()
+                );
+                if !data.is_empty() && !filename.is_empty() {
+                    let path = self.aas_dir.join(&filename);
                     if let Err(e) = std::fs::write(&path, &data) {
                         eprintln!(
                             "[aas] failed to write LOT {} -> {}: {}",
@@ -1979,16 +2000,34 @@ impl Nrsc5App {
                     }
                 }
                 if self.app_state.call_sign.is_empty() {
-                    if let Some(cs) = extract_call_sign(&name) {
+                    if let Some(cs) = extract_call_sign(&filename) {
                         self.app_state.call_sign = cs;
                     }
                 }
                 // Feed to map processors before storing.
-                if self.traffic_map.process_lot(&name) {
+                let traffic_completed = self.traffic_map.process_lot(&filename);
+                #[cfg(debug_assertions)]
+                if filename.contains("_TMT_") {
+                    eprintln!(
+                        "[map] traffic tile name={} completed_stitch={}",
+                        filename, traffic_completed
+                    );
+                }
+                if traffic_completed {
                     self.app_state.traffic_map_path =
                         self.traffic_map.completed_path.clone();
                 }
-                if self.weather_map.process_lot(&name) {
+                let weather_new = self.weather_map.process_lot(&filename);
+                #[cfg(debug_assertions)]
+                if filename.contains("_DWRI_") || filename.contains("_DWRO_") {
+                    eprintln!(
+                        "[map] weather lot name={} new_frame={} total_frames={}",
+                        filename,
+                        weather_new,
+                        self.weather_map.frames.len()
+                    );
+                }
+                if weather_new {
                     let prev_len = self.app_state.weather_frames.len();
                     let prev_idx = self.app_state.weather_current_frame;
                     let new_frames = self.weather_map.frames.clone();
@@ -2017,7 +2056,7 @@ impl Nrsc5App {
                         shifted_idx.min(new_last)
                     };
                 }
-                self.lot_files.insert(lot, name);
+                self.lot_files.insert(lot, filename);
             }
             NrscEvent::Xhdr { program, param, lot } => {
                 if let Some(filename) = self.lot_files.get(&lot) {
@@ -2304,6 +2343,14 @@ impl Nrsc5App {
                 self.app_state.currently_synced = false;
                 self.app_state.lost_sync_at = None;
                 self.app_state.call_sign.clear();
+                // Wipe stale MER from the previous station so the Signal
+                // meters and AGC-status readout don't show last station's
+                // value during the gap between tune and first new MER
+                // event. The next NRSC5_EVENT_MER refills these once
+                // libnrsc5 re-acquires sync on the new carrier.
+                self.app_state.mer = 0.0;
+                self.app_state.mer_lower = 0.0;
+                self.app_state.mer_upper = 0.0;
                 // PSD belongs to the previous station's broadcast; clear
                 // every program slot so the panel doesn't show the wrong
                 // song while the new station's SIS / PSD roll in.

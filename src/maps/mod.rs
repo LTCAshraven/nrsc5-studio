@@ -354,6 +354,11 @@ impl WeatherMap {
         // here: keeping it on disk lets the next call (after a DWRI
         // arrives and `make_base_map` runs) re-attempt the composite.
         if self.base_map_path.is_none() {
+            #[cfg(debug_assertions)]
+            eprintln!(
+                "[map] DWRO {} dropped: no basemap yet (DWRI not received)",
+                filename
+            );
             return false;
         }
 
@@ -367,6 +372,11 @@ impl WeatherMap {
         bytes.hash(&mut hasher);
         let hash = hasher.finish();
         if self.last_overlay_hash == Some(hash) {
+            #[cfg(debug_assertions)]
+            eprintln!(
+                "[map] DWRO {} dropped: identical bytes to last accepted overlay (no radar update)",
+                filename
+            );
             return false;
         }
 
