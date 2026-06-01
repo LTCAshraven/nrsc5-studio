@@ -25,6 +25,10 @@ pub enum UiCommand {
     /// advertised subchannel" reconcile loop. Persisted via
     /// `AppConfig::auto_decode_all_advertised`.
     SetAutoDecodeAllAdvertised(bool),
+    /// Set the soft cap on the number of decoders that may run at
+    /// once. Clamped to 1..=[`crate::ffi::MAX_DECODERS`] at apply
+    /// time. Persisted via `AppConfig::max_concurrent_decoders`.
+    SetMaxConcurrentDecoders(u32),
     /// Set how many preset slots the Tuner panel renders. Clamped
     /// to 1..=48 at apply time. Persisted via
     /// `AppConfig::preset_slot_count`.

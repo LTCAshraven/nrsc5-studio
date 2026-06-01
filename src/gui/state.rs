@@ -156,6 +156,12 @@ pub struct AppState {
     /// can still flip individual toggles off after the auto-add.
     /// Persisted via `AppConfig::auto_decode_all_advertised`.
     pub auto_decode_all_advertised: bool,
+    /// Soft cap on the number of decoders that may run at once. The
+    /// app refuses `SetDecoderEnabled(_, true)` and skips
+    /// `reconcile_auto_decoders` add calls once this limit is hit.
+    /// Range 1..=[`crate::ffi::MAX_DECODERS`]; mirror of
+    /// `AppConfig::max_concurrent_decoders`.
+    pub max_concurrent_decoders: u32,
     /// Number of preset slots the Tuner panel renders. Range 1..=48
     /// clamped at apply time. Mirror of `AppConfig::preset_slot_count`
     /// so the dock doesn't take a borrow on config every frame.

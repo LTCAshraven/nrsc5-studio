@@ -298,6 +298,9 @@ impl Nrsc5App {
                 manual_gain_tenths: config.manual_gain_tenths,
                 show_hd5_hd8: config.show_hd5_hd8,
                 auto_decode_all_advertised: config.auto_decode_all_advertised,
+                max_concurrent_decoders: config
+                    .max_concurrent_decoders
+                    .clamp(1, crate::ffi::MAX_DECODERS as u32),
                 preset_slot_count: config.preset_slot_count.clamp(1, 48),
                 recording_mode: config.recording_mode,
                 // Default to "present" + "probe available" so the no-SDR
@@ -387,6 +390,12 @@ impl eframe::App for Nrsc5App {
         if let Some(nrsc5) = &self.nrsc5 {
             let mut pending = Vec::new();
             while let Ok(evt) = nrsc5.events().try_recv() {
+                // Tee MER / Sync / etc into the AGC controller
+                // centrally. Used to live in each decoder's libnrsc5
+                // callback but moved here so AGC keeps getting fed
+                // when the primary decoder is disabled and so that
+                // starting on a non-HD1 program still drives AGC.
+                nrsc5.forward_event_to_agc(&evt);
                 pending.push(evt);
             }
             for evt in pending {
@@ -1324,6 +1333,7 @@ impl Nrsc5App {
             return;
         };
         let visible_cap = if self.app_state.show_hd5_hd8 { 8 } else { 4 };
+        let soft_cap = self.app_state.max_concurrent_decoders.max(1) as usize;
         for i in 0..visible_cap {
             if self.app_state.auto_add_attempted[i] {
                 continue;
@@ -1343,6 +1353,13 @@ impl Nrsc5App {
                 // previous reconcile pass landed it). Mark attempted
                 // so we stop checking until the next session.
                 self.app_state.auto_add_attempted[i] = true;
+                continue;
+            }
+            // Honor the soft cap — but only skip without marking
+            // `auto_add_attempted`. That way if the user raises the
+            // cap (or removes a decoder), the next frame's reconcile
+            // pass picks up the remaining slots.
+            if nrsc5.decoder_count() >= soft_cap {
                 continue;
             }
             self.app_state.auto_add_attempted[i] = true;
@@ -2457,6 +2474,25 @@ impl Nrsc5App {
                     return;
                 };
                 if enabled {
+                    // Soft cap: refuse to spawn another decoder once the
+                    // user-configured ceiling is hit. The FFI hard cap
+                    // (`MAX_DECODERS`) still applies as a last resort,
+                    // but this lets the user pin CPU usage long before
+                    // we'd otherwise hit it. Re-enabling an already-
+                    // running decoder is harmless and slips through
+                    // because `add_decoder` is idempotent on `program`.
+                    let cap = self
+                        .app_state
+                        .max_concurrent_decoders
+                        .max(1) as usize;
+                    if !nrsc5.is_decoding(clamped) && nrsc5.decoder_count() >= cap {
+                        self.app_state.nrsc5_status = format!(
+                            "decoder soft cap reached ({cap}); raise it in \
+                             SDR Settings \u{2192} Display to start HD{}",
+                            clamped + 1
+                        );
+                        return;
+                    }
                     match nrsc5.add_decoder(clamped) {
                         Ok(()) => {
                             self.app_state.nrsc5_status = format!(
@@ -2525,6 +2561,14 @@ impl Nrsc5App {
                 self.app_state.preset_slot_count = clamped;
                 self.config.preset_slot_count = clamped;
                 save_config(&self.config);
+            }
+            UiCommand::SetMaxConcurrentDecoders(n) => {
+                let clamped = n.clamp(1, crate::ffi::MAX_DECODERS as u32);
+                self.app_state.max_concurrent_decoders = clamped;
+                self.config.max_concurrent_decoders = clamped;
+                save_config(&self.config);
+                self.app_state.nrsc5_status =
+                    format!("decoder soft cap = {clamped}");
             }
             UiCommand::SetRecordingMode(mode) => {
                 self.config.recording_mode = mode;
@@ -3742,6 +3786,42 @@ impl Nrsc5App {
         if resp.changed() {
             commands.push(UiCommand::SetAutoDecodeAllAdvertised(auto_decode));
         }
+
+        ui.add_space(10.0);
+
+        // Soft cap on simultaneous decoders. Range hard-coded to the
+        // FFI ceiling so a typo can't request more than the libnrsc5
+        // wrapper would actually allow.
+        let mut cap = self
+            .app_state
+            .max_concurrent_decoders
+            .clamp(1, crate::ffi::MAX_DECODERS as u32) as i32;
+        ui.horizontal(|ui| {
+            ui.label("Max concurrent decoders:");
+            let resp = ui.add(
+                egui::DragValue::new(&mut cap)
+                    .range(1..=(crate::ffi::MAX_DECODERS as i32))
+                    .speed(0.05),
+            );
+            if resp.drag_stopped() || resp.lost_focus() || resp.changed() {
+                let clamped =
+                    (cap.clamp(1, crate::ffi::MAX_DECODERS as i32)) as u32;
+                if clamped != self.app_state.max_concurrent_decoders {
+                    commands
+                        .push(UiCommand::SetMaxConcurrentDecoders(clamped));
+                }
+            }
+        });
+        ui.label(
+            egui::RichText::new(
+                "Each running decoder costs roughly one CPU core. The \
+                 default of 4 fits the typical HD1\u{2013}HD4 lineup; raise \
+                 it to 8 only on multi-core desktops where you actually \
+                 want every MP11 subchannel decoding at once.",
+            )
+            .small()
+            .color(egui::Color32::from_gray(140)),
+        );
 
         ui.add_space(14.0);
         ui.separator();

@@ -608,6 +608,15 @@ impl Nrsc5Process {
         self.decoders.iter().map(|d| d.program).collect()
     }
 
+    /// Number of decoders currently running against the shared SDR
+    /// pipeline. Used by the soft-cap gate in `app.rs` to refuse
+    /// further `add_decoder` calls once the user-configured ceiling
+    /// is reached; the FFI layer's own [`MAX_DECODERS`] hard cap is
+    /// always enforced inside [`add_decoder`].
+    pub fn decoder_count(&self) -> usize {
+        self.decoders.len()
+    }
+
     /// Whether `program` is currently being decoded against the
     /// shared SDR pipeline. O(N) over the small `decoders` vec
     /// (capped at [`MAX_DECODERS`]).
@@ -663,16 +672,15 @@ impl Nrsc5Process {
         // above, but the field is `Option`-typed so handle it).
         let frequency_mhz = self.last_frequency_mhz.unwrap_or(0.0);
 
-        // Additional decoders do NOT drive the AGC controller â€” only
-        // the first decoder spawned by `start_piped` gets that
-        // responsibility. Passing `None` skips the AGC tee in
-        // `spawn_decoder`'s event callback.
+        // Additional decoders share the same IqBus; AGC is fed
+        // centrally from `Nrsc5Process::forward_event_to_agc`, so
+        // no per-decoder agc handle is needed here.
         let bus = self
             .iq_bus
             .as_ref()
             .expect("iq_bus is_some, checked above")
             .clone();
-        let decoder = self.spawn_decoder(program, &bus, frequency_mhz, None)?;
+        let decoder = self.spawn_decoder(program, &bus, frequency_mhz)?;
 
         // Register the new ring with the router. Do NOT auto-activate
         // it as speaker â€” caller decides via `set_active_speaker`.
@@ -847,6 +855,29 @@ impl Nrsc5Process {
         &self.rx
     }
 
+    /// Tee a single event into the AGC controller, if one is installed.
+    /// Called by the app's event-drain loop on every event pulled from
+    /// [`events`]. This used to live inside the per-decoder libnrsc5
+    /// callback, but moved here so that:
+    ///   * AGC keeps getting fed even when the user disables the
+    ///     primary decoder via `SetDecoderEnabled(0, false)`.
+    ///   * Starting on a non-HD1 program still drives AGC.
+    ///   * Multi-decoder sessions don't double-feed AGC by routing
+    ///     duplicate MER events from every decoder's callback.
+    ///
+    /// AGC's `on_event` filters internally to the variants it cares
+    /// about (MER, Sync, LostSync, AudioBitrate), so passing every
+    /// event is cheap. The one-frame latency added by the central
+    /// dispatch (events queue → app polls per egui frame → forward)
+    /// is irrelevant for AGC's seconds-scale time constants.
+    pub fn forward_event_to_agc(&self, event: &NrscEvent) {
+        if let Some(handle) = self.agc.as_ref() {
+            if let Ok(mut ctrl) = handle.lock() {
+                ctrl.on_event(event);
+            }
+        }
+    }
+
     /// Apply a manual per-element gain on the live SDR if a piped
     /// stream is currently running. No-op when there's no active SDR
     /// (the change still survives in config and is applied on the
@@ -981,24 +1012,19 @@ impl Nrsc5Process {
     /// against the same shared IqBus). Returns the populated
     /// [`DecoderInstance`] ready to be pushed into `self.decoders`.
     ///
-    /// `agc_handle` is the controller cloned by `start_piped` for
-    /// the **first** decoder only â€” its event callback tees MER /
-    /// Sync events into the controller. Additional decoders pass
-    /// `None` (only the primary decoder drives AGC; secondary
-    /// decoders' events would just duplicate the signal).
-    ///
     /// The event callback runs on libnrsc5's worker thread, so it
     /// must be `Send + Sync + 'static`; this is enforced at the
-    /// closure type. The PCM sink filters by program so a session
-    /// that happens to decode multiple programs only delivers the
-    /// expected subchannel's audio to this decoder's ring (matches
-    /// the previous nrsc5.exe `-r - <program>` filter behavior).
+    /// closure type. AGC routing is NOT done here — see
+    /// [`Nrsc5Process::forward_event_to_agc`] for the central tee.
+    /// The PCM sink filters by program so a session that happens to
+    /// decode multiple programs only delivers the expected
+    /// subchannel's audio to this decoder's ring (matches the
+    /// previous nrsc5.exe `-r - <program>` filter behavior).
     fn spawn_decoder(
         &self,
         program: u32,
         iq_bus: &Arc<IqBus>,
         frequency_mhz: f32,
-        agc_handle: Option<Arc<Mutex<AgcController>>>,
     ) -> Result<DecoderInstance, Nrsc5Error> {
         // Build + configure the session. All configuration calls must
         // precede `start`; the session moves into the feeder thread
@@ -1007,17 +1033,22 @@ impl Nrsc5Process {
         session.set_mode(Mode::Fm)?;
         session.set_frequency_hz(frequency_mhz * 1_000_000.0)?;
 
-        // Event callback. Three jobs:
+        // Event callback. Two jobs:
         //   1. Rewrite events that carry a stale `program` field
         //      (`LotFile`) so the per-decoder routing layer sees the
         //      right subchannel. libnrsc5's LOT events don't carry a
         //      program identifier; api.rs hardcodes 0 as a placeholder.
-        //   2. Tee MER / Sync events into the AGC controller (only on
-        //      the primary decoder).
-        //   3. Forward the (possibly rewritten) event to the shared
+        //   2. Forward the (possibly rewritten) event to the shared
         //      `self.tx` channel for the app's event-loop consumer.
+        //
+        // AGC tee used to live here, gated on `agc_handle.is_some()`
+        // for the primary decoder only. That broke when the primary
+        // decoder was disabled via `SetDecoderEnabled` or when the
+        // user started on a non-HD1 program. The AGC controller is
+        // station-wide signal quality, not per-program, so the tee
+        // moved to the central event dispatch in `app.rs` via
+        // [`Nrsc5Process::forward_event_to_agc`].
         let event_tx = self.tx.clone();
-        let agc_cb = agc_handle.clone();
         session.set_event_callback(move |ev| {
             // Rewrite events that need this decoder's program number.
             let ev = match ev {
@@ -1026,13 +1057,6 @@ impl Nrsc5Process {
                 }
                 other => other,
             };
-            // Tee into AGC. on_event filters internally to the event
-            // variants it cares about, so passing everything is cheap.
-            if let Some(handle) = agc_cb.as_ref() {
-                if let Ok(mut ctrl) = handle.lock() {
-                    ctrl.on_event(&ev);
-                }
-            }
             let _ = event_tx.send(ev);
         })?;
 
@@ -1245,7 +1269,7 @@ impl Nrsc5Process {
         let profile = crate::sdr::profile::lookup(sdr.driver())
             .copied()
             .unwrap_or(crate::sdr::profile::RTLSDR);
-        let (agc, agc_stderr_handle, cache_hit_logged) = if gain_mode == GainMode::Auto {
+        let (agc, _agc_stderr_handle, cache_hit_logged) = if gain_mode == GainMode::Auto {
             // Build the controller with the profile's per-driver start
             // gain. The global `AgcConfig::default()` aims at the RTL-SDR
             // sweet spot (19.7 dB); SDRplay and HackRF override it via
@@ -1367,11 +1391,12 @@ impl Nrsc5Process {
 
         // Spawn the first decoder. Owns the libnrsc5 session + the
         // feeder thread that pumps I/Q from `bus` into it. The event
-        // callback tees MER / Sync into the AGC controller (if any)
-        // and forwards every translated event to `self.tx`. The PCM
+        // callback forwards every translated event to `self.tx`.
+        // AGC tee happens centrally in
+        // [`Nrsc5Process::forward_event_to_agc`], not here. The PCM
         // callback pushes decoded samples into a fresh `PcmRing`
         // attached to the returned `DecoderInstance.pcm_ring`.
-        let decoder = self.spawn_decoder(program, &bus, frequency_mhz, agc_stderr_handle.clone())?;
+        let decoder = self.spawn_decoder(program, &bus, frequency_mhz)?;
         let pcm_ring = decoder.pcm_ring.clone();
 
         // I/Q source pump. Runs `run_stream`, feeds the spectrum tap,
