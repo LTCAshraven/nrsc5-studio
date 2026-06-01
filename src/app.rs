@@ -583,8 +583,8 @@ impl eframe::App for Nrsc5App {
             let status_resp = ui.label(
                 egui::RichText::new(&self.app_state.nrsc5_status).color(status_color),
             );
-            if let Some(path) = self.nrsc5.as_ref().map(|n| n.exe_path().display().to_string()) {
-                status_resp.on_hover_text(path);
+            if let Some(version) = self.nrsc5.as_ref().map(|n| n.version()) {
+                status_resp.on_hover_text(version);
             }
             ui.separator();
 

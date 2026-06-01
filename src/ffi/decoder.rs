@@ -1,76 +1,66 @@
-//! One running `nrsc5.exe` child plus its supporting plumbing.
+//! One running libnrsc5 session plus the I/Q feeder thread that
+//! drives it.
 //!
-//! Phase 3 of the 0.4.0 audio-path refactor introduces this type so
-//! that `Nrsc5Process` can eventually hold a **vector** of instances
-//! (one per HD program being decoded simultaneously). For Chunk 1 of
-//! Phase 3 we keep `Nrsc5Process` single-decoder — it owns exactly
-//! one `Option<DecoderInstance>` — but the per-program state is now
-//! encapsulated in a struct instead of being spread across four
-//! independent `Option<…>` fields on the process. This is the safe
-//! refactor checkpoint before the multi-decoder API lands.
+//! Phase 3 of the libnrsc5 migration: each `DecoderInstance` now owns
+//! a [`Nrsc5Session`] (the safe wrapper around `libnrsc5.dll`'s in-
+//! process API) instead of an `nrsc5.exe` child process. The four
+//! external-process threads (stdin pump, stderr parser, PCM pump,
+//! plus the child handle) collapse into one in-process `feeder_thread`
+//! which:
 //!
-//! # What's in here
+//! * subscribes to the shared [`IqBus`],
+//! * blocks on `recv` or on a per-decoder shutdown channel via
+//!   `crossbeam::select!`,
+//! * pushes each payload into the owned session with
+//!   `Nrsc5Session::pipe_samples_cu8`,
+//! * drops the session on exit so its `Drop` impl can run
+//!   `nrsc5_stop` → `nrsc5_close` and join libnrsc5's worker thread.
 //!
-//! * The decoder's `Child` (nrsc5.exe).
-//! * The threads that service its stdio:
-//!   - `stderr_thread` — parses status events; always present.
-//!   - `stdin_thread` — subscribes to the shared [`IqBus`] and writes
-//!     raw I/Q to the child's stdin. Only populated on the piped path
-//!     (Chunk 0's `start_piped`); `None` for the legacy USB and
-//!     rtl_tcp paths where nrsc5 reads I/Q directly from a dongle or
-//!     a network socket.
-//!   - `pcm_thread` — reads decoded PCM from the child's stdout and
-//!     feeds the audio sink. `None` when no audio sink is installed
-//!     (headless tests) or for the legacy USB / rtl_tcp paths where
-//!     nrsc5 drives libao itself.
-//!
-//! # What's *not* in here
-//!
-//! Anything that's shared across decoders (the SDR pump, the IqBus,
-//! the AGC controller, the spectrum tap, the audio sink) stays on
-//! `Nrsc5Process`. Per-program PCM ring buffers and the speaker-
-//! routing thread arrive in Phase 3 Chunk 2.
+//! Metadata events and decoded PCM are delivered through the two
+//! callbacks installed on the session before `start`; those run on
+//! libnrsc5's worker thread, not on the feeder thread.
 //!
 //! [`IqBus`]: crate::sdr::IqBus
+//! [`Nrsc5Session`]: super::api::Nrsc5Session
 
-use std::process::Child;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
 use crate::audio::PcmRing;
 
-/// One nrsc5.exe child plus the threads that service its stdio.
+/// One libnrsc5 session plus the feeder thread that pumps I/Q into
+/// it.
 ///
 /// Lifetime: created during one of the `Nrsc5Process::start*` paths
-/// after the child has been spawned and its three pumps have been
-/// wired up. Consumed during `Nrsc5Process::stop` (joins all threads,
-/// kills the child).
+/// (or `add_decoder`) once the session has been opened, callbacks
+/// installed, and the feeder thread spawned. Consumed during
+/// `remove_decoder` / `stop` — dropping `shutdown_tx` wakes the
+/// feeder thread's `select!`, the feeder drops the session (which
+/// triggers `nrsc5_stop` + `nrsc5_close`), and `feeder_thread.join()`
+/// returns.
 pub(crate) struct DecoderInstance {
-    /// HD program number (0-based) this child is decoding. nrsc5
-    /// reports `program=N` in stderr events for the program it was
-    /// invoked with; we keep our own copy here so callers don't have
-    /// to fish it out of the event stream.
+    /// HD program number (0-based) this session is decoding. We keep
+    /// our own copy here so callers don't have to fish it out of the
+    /// event stream or the session.
     pub program: u32,
-    /// The running nrsc5.exe child. Owns stdio handles; the pump
-    /// threads below own clones of `Child::stdin` / `Child::stdout`
-    /// /  `Child::stderr` taken before this struct was constructed.
-    pub child: Child,
-    /// stderr parser thread. Always present — every spawned decoder
-    /// has a stderr pump because that's how we surface SIS / song
-    /// metadata / sync / MER events.
-    pub stderr_thread: JoinHandle<()>,
-    /// I/Q stdin pump thread. `Some` on the piped path; `None` on
-    /// USB / rtl_tcp where nrsc5 reads its own I/Q.
-    pub stdin_thread: Option<JoinHandle<()>>,
-    /// PCM stdout pump thread. `Some` when an audio sink is installed
-    /// AND we asked nrsc5 for `-o -` (piped path). `None` otherwise.
-    pub pcm_thread: Option<JoinHandle<()>>,
-    /// Per-decoder PCM ring. The `pcm_thread` above pushes decoded
-    /// samples here instead of into the global `AudioSink`; the
-    /// shared `SpeakerRouter` thread drains this ring and routes its
-    /// samples to the speakers iff this decoder is the active
-    /// speaker. `Some` on the piped path with an installed audio
-    /// sink; `None` for the legacy USB / rtl_tcp paths (where nrsc5
-    /// drives libao itself) and for headless tests with no sink.
+    /// I/Q feeder thread. Owns the [`Nrsc5Session`]; pumps the bus
+    /// receiver into `pipe_samples_cu8` until either the bus
+    /// disconnects (global stop) or `shutdown_tx` is dropped
+    /// (per-decoder remove). Drops the session at exit, which calls
+    /// `nrsc5_stop` + `nrsc5_close` to join libnrsc5's worker thread.
+    ///
+    /// [`Nrsc5Session`]: super::api::Nrsc5Session
+    pub feeder_thread: JoinHandle<()>,
+    /// Sender side of the per-decoder shutdown channel. Drop this to
+    /// ask `feeder_thread` to exit without tearing down the whole
+    /// shared IqBus — used by `remove_decoder`. `stop()` also drops
+    /// it (along with shutting the bus down) on the way through.
+    pub shutdown_tx: crossbeam_channel::Sender<()>,
+    /// Per-decoder PCM ring. The session's PCM sink callback (set up
+    /// in `Nrsc5Process::spawn_decoder`) pushes decoded samples here;
+    /// the shared `SpeakerRouter` thread drains the ring and routes
+    /// its samples to the speakers iff this decoder is the active
+    /// speaker. `Some` when an audio sink is installed on
+    /// `Nrsc5Process`; `None` for headless tests with no sink.
     pub pcm_ring: Option<Arc<PcmRing>>,
 }
