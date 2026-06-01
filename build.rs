@@ -20,10 +20,37 @@ fn main() {
         // wrapper method is referenced (Phase 3 cutover wires real
         // callers; until then the linker GCs unused externs).
         emit_nrsc5_link_search();
+    } else {
+        // Non-Windows: `#[link(name = "nrsc5")]` needs the linker to
+        // find `libnrsc5.so`. The upstream nrsc5 build installs to
+        // `/usr/local/lib` by default (and ldconfig is configured for
+        // it at runtime), but rust-lld doesn't search `/usr/local/lib`
+        // at link time. Emit explicit search paths so a system-installed
+        // libnrsc5 resolves without manual RUSTFLAGS.
+        emit_unix_nrsc5_link_search();
     }
 
     // Optional bindgen generation, gated by NRSC5_GENERATE_BINDINGS.
     generate_bindings();
+}
+
+/// On Unix targets, ensure the linker can find a system-installed
+/// `libnrsc5.so`. Covers the common install prefixes used by the
+/// upstream `nrsc5` build (`/usr/local/lib`) and distro packages
+/// (`/usr/lib`, `/usr/lib/<triple>`). Each path is only emitted if
+/// it actually exists so we don't add noise to the link line.
+fn emit_unix_nrsc5_link_search() {
+    let candidates = [
+        "/usr/local/lib",
+        "/usr/local/lib/x86_64-linux-gnu",
+        "/usr/lib",
+        "/usr/lib/x86_64-linux-gnu",
+    ];
+    for path in candidates {
+        if Path::new(path).is_dir() {
+            println!("cargo:rustc-link-search=native={path}");
+        }
+    }
 }
 
 /// Emit `cargo:rustc-link-search` pointing at the workspace `bin/`
