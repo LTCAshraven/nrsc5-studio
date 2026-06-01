@@ -14,10 +14,32 @@ fn main() {
     if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         ensure_bundled_toolchain_on_path();
         embed_app_icon();
+        // Phase 2: the safe wrapper in src/ffi/api.rs declares
+        // `#[link(name = "nrsc5")]`. Tell the linker where to find
+        // `libnrsc5.dll` so the import resolution succeeds once any
+        // wrapper method is referenced (Phase 3 cutover wires real
+        // callers; until then the linker GCs unused externs).
+        emit_nrsc5_link_search();
     }
 
     // Optional bindgen generation, gated by NRSC5_GENERATE_BINDINGS.
     generate_bindings();
+}
+
+/// Emit `cargo:rustc-link-search` pointing at the workspace `bin/`
+/// directory so the LLD-link import-library lookup for `libnrsc5.dll`
+/// (and any other bundled DLL we may add later) can succeed. Idempotent
+/// and silent — only emits if `bin/` exists.
+fn emit_nrsc5_link_search() {
+    let Some(manifest_dir) = env::var_os("CARGO_MANIFEST_DIR").map(PathBuf::from) else {
+        return;
+    };
+    let bin = manifest_dir.join("bin");
+    if bin.is_dir() {
+        println!("cargo:rustc-link-search=native={}", bin.display());
+        // Re-run if a DLL is added/removed from bin/.
+        println!("cargo:rerun-if-changed={}", bin.display());
+    }
 }
 
 /// If the project's bundled llvm-mingw toolchain is present, prepend its
