@@ -1,6 +1,8 @@
 param(
 	[ValidateSet("debug", "release")]
-	[string]$Configuration = "debug"
+	[string]$Configuration = "debug",
+	[ValidateSet("build", "check", "test")]
+	[string]$Command = "build"
 )
 
 $ErrorActionPreference = "Stop"
@@ -22,13 +24,51 @@ if (-not (Test-Path $WinResAlias)) {
 	Copy-Item (Join-Path $ToolRoot "x86_64-w64-mingw32-windres.exe") $WinResAlias -Force
 }
 
-$env:PATH = "$env:USERPROFILE\.cargo\bin;$ToolRoot;$env:PATH"
-
-rustup toolchain install stable-x86_64-pc-windows-gnullvm
-
-$cargoArgs = @("+stable-x86_64-pc-windows-gnullvm", "build", "--target", "x86_64-pc-windows-gnullvm")
-if ($Configuration -eq "release") {
-	$cargoArgs += "--release"
+# PATH order matters:
+#   1) C:\msys64\mingw64\bin  -- libclang.dll's transitive deps
+#                                (libstdc++, libwinpthread) live here.
+#                                soapysdr-sys's build script invokes
+#                                bindgen, which loads libclang via
+#                                LoadLibraryExW; without these on PATH
+#                                it fails with "LoadLibraryExW failed".
+#   2) %USERPROFILE%\.cargo\bin -- cargo + rustup shims.
+#   3) llvm-mingw\bin           -- our pinned cross-compiler.
+$MsysBin = "C:\msys64\mingw64\bin"
+if (-not (Test-Path $MsysBin)) {
+	Write-Warning "MSYS2 mingw64 not found at $MsysBin -- bindgen-based build scripts may fail to load libclang."
+} else {
+	$env:PATH = "$MsysBin;$env:USERPROFILE\.cargo\bin;$ToolRoot;$env:PATH"
+	# bindgen also reads LIBCLANG_PATH directly; setting it explicitly
+	# avoids relying purely on PATH ordering for libclang.dll discovery.
+	$env:LIBCLANG_PATH = $MsysBin
+}
+if (-not $env:PATH.StartsWith($MsysBin)) {
+	$env:PATH = "$env:USERPROFILE\.cargo\bin;$ToolRoot;$env:PATH"
 }
 
-cargo @cargoArgs
+# rustup writes its "info: syncing channel updates..." progress to
+# stderr; under $ErrorActionPreference = "Stop" PowerShell 5.1 wraps
+# every native stderr line as a RemoteException error record and aborts
+# the script before cargo runs. Temporarily downgrade to "Continue" for
+# the native-command sections and rely on $LASTEXITCODE for real failure
+# detection.
+$prev = $ErrorActionPreference
+$ErrorActionPreference = "Continue"
+try {
+	& rustup toolchain install stable-x86_64-pc-windows-gnullvm
+	if ($LASTEXITCODE -ne 0) {
+		throw "rustup toolchain install failed with exit code $LASTEXITCODE"
+	}
+
+	$cargoArgs = @("+stable-x86_64-pc-windows-gnullvm", $Command, "--target", "x86_64-pc-windows-gnullvm")
+	if ($Configuration -eq "release") {
+		$cargoArgs += "--release"
+	}
+
+	& cargo @cargoArgs
+	$cargoExit = $LASTEXITCODE
+}
+finally {
+	$ErrorActionPreference = $prev
+}
+exit $cargoExit
