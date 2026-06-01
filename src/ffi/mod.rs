@@ -15,6 +15,12 @@ use crate::sdr::{GainCache, GainCacheEntry, GainCacheKey, IqBus, Sdr, SdrConfig,
 mod decoder;
 use decoder::DecoderInstance;
 
+// Phase 1: raw FFI bindings for libnrsc5. No callers yet — Phase 2 will
+// add the safe wrapper, Phase 3 will retire the `decoder` (nrsc5.exe)
+// path.
+#[allow(unused)]
+pub(crate) mod nrsc5_sys;
+
 // -- Events -----------------------------------------------------------
 
 #[derive(Debug, Clone)]
