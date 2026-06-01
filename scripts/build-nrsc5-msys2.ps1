@@ -116,8 +116,10 @@ Invoke-MSYS2 "bash ~/build-nrsc5.sh"
 # --- 3. harvest binaries ---
 $builtExe = Join-Path $Msys2Root "home\$env:USERNAME\nrsc5-$Tag\build\src\nrsc5.exe"
 $builtDll = Join-Path $Msys2Root "home\$env:USERNAME\nrsc5-$Tag\build\src\libnrsc5.dll"
+$builtHdr = Join-Path $Msys2Root "home\$env:USERNAME\nrsc5-$Tag\include\nrsc5.h"
 if (-not (Test-Path $builtExe)) { throw "Build did not produce $builtExe" }
 if (-not (Test-Path $builtDll)) { throw "Build did not produce $builtDll" }
+if (-not (Test-Path $builtHdr)) { throw "Upstream header missing at $builtHdr" }
 
 # Always back up the existing bin\ before overwriting.
 if (Test-Path $binDir) {
@@ -131,6 +133,51 @@ if (Test-Path $binDir) {
 
 Copy-Item $builtExe (Join-Path $binDir "nrsc5.exe") -Force
 Copy-Item $builtDll (Join-Path $binDir "libnrsc5.dll") -Force
+
+# Keep res\nrsc5.h locked to the same upstream tag we just built. The
+# committed copy lets `cargo check` and the bindgen invocation (gated on
+# NRSC5_GENERATE_BINDINGS=1 in build.rs) work without anyone re-running
+# this MSYS2 pipeline.
+$resHdr = Join-Path $repoRoot "res\nrsc5.h"
+Copy-Item $builtHdr $resHdr -Force
+Write-Host "Synced upstream header -> $resHdr" -ForegroundColor Cyan
+
+# --- 4. sanity-check the DLL exports ---
+# Confirms the libnrsc5.dll we just shipped exports every symbol the Rust
+# FFI wrapper depends on. If upstream renames or removes one of these, the
+# build script fails LOUDLY here instead of breaking the Rust link step
+# downstream with a cryptic LNK error. Uses MSYS2's nm/objdump so we don't
+# need the MSVC toolchain to be installed.
+$expectedSymbols = @(
+    "nrsc5_open_pipe",
+    "nrsc5_set_callback",
+    "nrsc5_pipe_samples_cu8",
+    "nrsc5_start",
+    "nrsc5_stop",
+    "nrsc5_close",
+    "nrsc5_set_mode",
+    "nrsc5_set_frequency",
+    "nrsc5_get_version"
+)
+Write-Host "=== Verifying libnrsc5.dll exports ===" -ForegroundColor Cyan
+$dllForBash = (Join-Path $binDir "libnrsc5.dll") -replace "\\", "/" -replace "^([A-Z]):", "/`$1"
+# objdump -p prints `Export Address Table` containing each exported name.
+# Join the multi-line output into one string so `-match` returns a scalar
+# boolean. (Against a string[] PowerShell's -match/-notmatch operators filter
+# the array instead of returning bool, which silently breaks the check.)
+$exportDump = (& $shell -mingw64 -defterm -no-start -here -c "objdump -p '$dllForBash' 2>/dev/null | grep -A 9999 'Export Address Table'") -join "`n"
+$missing = @()
+foreach ($sym in $expectedSymbols) {
+    if ($exportDump -notmatch "\b$sym\b") {
+        $missing += $sym
+    }
+}
+if ($missing.Count -gt 0) {
+    Write-Host "MISSING exports:" -ForegroundColor Red
+    $missing | ForEach-Object { Write-Host "  - $_" -ForegroundColor Red }
+    throw "libnrsc5.dll is missing $($missing.Count) expected export(s). Upstream ABI change?"
+}
+Write-Host "All $($expectedSymbols.Count) expected symbols present." -ForegroundColor Green
 
 Write-Host "=== Done. New binaries in $binDir ===" -ForegroundColor Green
 Get-Item (Join-Path $binDir "nrsc5.exe"), (Join-Path $binDir "libnrsc5.dll") |
