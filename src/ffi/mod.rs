@@ -69,16 +69,23 @@ pub enum NrscEvent {
         album: String,
         genre: String,
     },
-    /// LOT file received. `lot` is the LOT ID, `name` is the filename
-    /// written to the AAS directory (e.g. "42_cover.jpg").
+    /// LOT file received. `lot` is the LOT ID, `name` is the suggested
+    /// filename (e.g. "42_cover.jpg"); `data` is the fully reassembled
+    /// payload as delivered by libnrsc5. The app layer is responsible
+    /// for writing the bytes into the AAS scratch directory before
+    /// dispatching to the cover-art / traffic-map / weather-map
+    /// processors, which all consume on-disk files.
+    ///
     /// `program` is the HD subchannel whose decoder produced this
-    /// event â€” stamped by `parse_stderr` from the per-child context.
-    /// Used by the multi-decoder routing layer to attribute album art
-    /// and station logo updates to the correct `programs[]` slot.
+    /// event â€” stamped by the per-decoder event-callback tee in
+    /// `spawn_decoder`. Used by the multi-decoder routing layer to
+    /// attribute album art and station logo updates to the correct
+    /// `programs[]` slot.
     LotFile {
         program: u32,
         lot: String,
         name: String,
+        data: Vec<u8>,
     },
     /// XHDR event â€” param 0 = cover art, param 1 = station logo.
     /// `program` is the HD subchannel whose decoder produced this
@@ -1014,8 +1021,8 @@ impl Nrsc5Process {
         session.set_event_callback(move |ev| {
             // Rewrite events that need this decoder's program number.
             let ev = match ev {
-                NrscEvent::LotFile { program: _, lot, name } => {
-                    NrscEvent::LotFile { program, lot, name }
+                NrscEvent::LotFile { program: _, lot, name, data } => {
+                    NrscEvent::LotFile { program, lot, name, data }
                 }
                 other => other,
             };

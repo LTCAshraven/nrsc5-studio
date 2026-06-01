@@ -35,12 +35,11 @@ Copy-Item -Path (Join-Path $TargetDir "nrsc5-studio.exe") -Destination $OutDir -
 #   <exe_dir>\libgcc_s_seh-1.dll     -- transitive load-time dep of libSoapySDR
 #   <exe_dir>\libwinpthread-1.dll    -- transitive load-time dep of libSoapySDR
 #   <exe_dir>\libstdc++-6.dll        -- transitive load-time dep of libSoapySDR
-#   <exe_dir>\bin\nrsc5.exe
-#   <exe_dir>\bin\libnrsc5.dll       -- loaded by nrsc5.exe (its own exe dir)
+#   <exe_dir>\bin\libnrsc5.dll       -- in-process HD Radio decoder (loaded by us)
 #   <exe_dir>\bin\librtlsdr.dll      -- loaded by SoapyRTLSDR (PATH at runtime)
 #   <exe_dir>\bin\libusb-1.0.dll     -- transitive dep of librtlsdr
-#   <exe_dir>\bin\libao-4.dll        -- loaded by nrsc5.exe (its own exe dir)
-#   <exe_dir>\bin\libgcc_s_dw2-1.dll -- loaded by nrsc5.exe (its own exe dir)
+#   <exe_dir>\bin\libao-4.dll        -- transitive dep of libnrsc5
+#   <exe_dir>\bin\libgcc_s_dw2-1.dll -- transitive dep of libnrsc5
 #   <exe_dir>\bin\SoapySDR\modules0.8\*.dll
 #
 # Why the split: Windows resolves the exe's load-time imports BEFORE
@@ -48,12 +47,10 @@ Copy-Item -Path (Join-Path $TargetDir "nrsc5-studio.exe") -Destination $OutDir -
 # (libSoapySDR.dll + the MSYS2 C/C++ runtime libs it pulls in) must
 # sit in a directory Windows' default DLL search covers -- i.e. next
 # to the exe, since we don't want to require System32 installs. The
-# remaining DLLs (`bin\...`) are either loaded by the `nrsc5.exe`
-# subprocess (whose own exe dir is `bin\`, so Windows finds them
-# natively) or loaded by libSoapySDR's modules AFTER
-# `main.rs::install_bundled_dll_paths()` has prepended `<exe>\bin`
-# to PATH and pointed `SOAPY_SDR_PLUGIN_PATH` at
-# `<exe>\bin\SoapySDR\modules0.8`.
+# remaining DLLs (`bin\...`) are loaded by libSoapySDR's modules or
+# by `libnrsc5.dll` AFTER `main.rs::install_bundled_dll_paths()` has
+# prepended `<exe>\bin` to PATH and pointed `SOAPY_SDR_PLUGIN_PATH`
+# at `<exe>\bin\SoapySDR\modules0.8`.
 $LoadTimeDlls = @(
     "libSoapySDR.dll",
     "libunwind.dll",
@@ -69,9 +66,8 @@ if (Test-Path $BinSrc) {
     #    `paths::bundled_soapy_modules_dir()` looks for).
     Copy-Item -Path $BinSrc -Destination $OutDir -Recurse -Force
     # 2) Promote the load-time DLLs up to the exe root. Each is
-    #    *also* left in `bin\` as a copy so that an end user who
-    #    runs `bin\nrsc5.exe` directly (e.g. for debugging) still
-    #    gets a self-consistent bin\ folder.
+    #    *also* left in `bin\` as a copy so a flat `bin\` lookup
+    #    from any future helper still finds them.
     foreach ($dll in $LoadTimeDlls) {
         $src = Join-Path $BinSrc $dll
         if (Test-Path $src) {

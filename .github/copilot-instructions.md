@@ -43,16 +43,33 @@ cargo generate-rpm       # .rpm
 
 ```
 SDR hardware
-  → SoapySdr / RtlTcpSdr (src/sdr/)     # I/Q acquisition
-  → IqBus (src/sdr/iq_bus.rs)            # fan-out to consumers
-  → SpectrumTap (src/dsp/spectrum.rs)    # FFT for waterfall/spectrum UI
-  → nrsc5.exe stdin pipe (src/ffi/)      # HD Radio decode (external process)
-  → stderr parser → NrscEvent channel    # metadata, MER, BER, sync events
-  → stdout PCM pipe → cpal audio output  # s16le 44.1kHz stereo via src/audio/
-  → RecordingSession (src/recorder/)     # optional 96kbps Opus recording
+  → SoapySdr / RtlTcpSdr (src/sdr/)         # I/Q acquisition
+  → IqBus (src/sdr/iq_bus.rs)                # fan-out to consumers
+  → SpectrumTap (src/dsp/spectrum.rs)        # FFT for waterfall/spectrum UI
+  → Nrsc5Session::pipe_samples_cu8 (src/ffi/api.rs)
+                                             # in-process libnrsc5.dll decode
+  → trampoline → NrscEvent channel           # metadata, MER, BER, sync, LOT bytes
+  → PcmSink → PcmRing → cpal audio output    # s16le 44.1kHz stereo via src/audio/
+  → RecordingSession (src/recorder/)         # optional 96kbps Opus recording
 ```
 
-`nrsc5.exe` is an external C binary (bundled in `bin/`) spawned as a child process. NRSC5 Studio feeds it I/Q samples via stdin and reads decoded PCM from stdout (`-o -` flag). Metadata, signal quality (MER/BER), and sync status are parsed from nrsc5's stderr line-by-line in `src/ffi/decoder.rs`.
+`libnrsc5.dll` (built by `scripts/build-nrsc5-msys2.ps1` from the upstream
+`theori-io/nrsc5` repo at tag `v3.1.0`) is loaded in-process via implicit
+linking (`#[link(name = "nrsc5")]`). Each `DecoderInstance` owns one
+`Nrsc5Session` driven by a dedicated feeder thread that pumps I/Q samples
+from the shared `IqBus` and synchronously calls `pipe_samples_cu8`.
+Decoded events arrive on libnrsc5's worker thread via a C callback; the
+safe wrapper in `src/ffi/api.rs` translates each `nrsc5_event_t` into an
+owned `NrscEvent` (copying every C string and slice — strings are
+`to_string_lossy` since station messages may be Latin-1). PCM audio
+takes a separate fast path: a typed `PcmSink` callback receives a
+borrowed `&[i16]` and pushes into the per-program `PcmRing` without
+allocation.
+
+LOT (large-object-transfer) payloads arrive in-callback with the raw
+bytes; the app layer writes them to the AAS scratch directory
+(`Nrsc5Process::aas_dir`) before the cover-art / traffic-map /
+weather-map processors read them back from disk.
 
 ### GUI architecture (immediate-mode)
 
@@ -81,10 +98,11 @@ SDRplay devices require software resampling (2 Msps → 1.488375 Msps) via the `
 
 ## Key conventions
 
-- **Error handling:** `anyhow::Result` for application-level errors; `thiserror` enums (`SdrError`, `Nrsc5Error`) for typed domain errors in the SDR and FFI layers.
-- **Threading model:** Background threads (SDR stream, nrsc5 stderr parser, PCM pump, AGC controller) communicate with the GUI via `crossbeam-channel` or `std::sync::mpsc`. The GUI thread never blocks on I/O.
+- **Error handling:** `anyhow::Result` for application-level errors; `thiserror` enums (`SdrError`, `Nrsc5Error`, `Nrsc5ApiError`) for typed domain errors in the SDR and FFI layers.
+- **Threading model:** Background threads (SDR stream, per-decoder I/Q feeder, libnrsc5 worker, AGC controller) communicate with the GUI via `crossbeam-channel` or `std::sync::mpsc`. The GUI thread never blocks on I/O.
+- **Unsafe surface:** 100% of the project's `unsafe` lives in `src/ffi/api.rs` (callback trampoline + linked-list walks + slice/string copy-out). Everything else is safe Rust.
 - **Gain values** are stored in tenths of dB (`i32`) throughout the codebase and snapped to the nearest device gain-table step at apply time.
 - **Release profile** optimizes aggressively: `opt-level = "z"`, LTO, `panic = "abort"`, strip symbols. Debug builds set `opt-level = 3` for dependencies only (real-time DSP can't keep up at opt-level 0).
 - **Window subsystem:** Release builds use `#![windows_subsystem = "windows"]` (no console); debug builds keep the console for println debugging.
-- **DLL loading:** Native DLLs (`libSoapySDR.dll`, `librtlsdr.dll`, Soapy modules) are resolved at startup by prepending `bin/` to PATH and setting `SOAPY_SDR_PLUGIN_PATH`. The `libloading` crate handles runtime dynamic loading.
+- **DLL loading:** Native DLLs (`libSoapySDR.dll`, `libnrsc5.dll`, `librtlsdr.dll`, Soapy modules) are resolved at startup by prepending `bin/` to PATH and setting `SOAPY_SDR_PLUGIN_PATH`. `libnrsc5.dll` is implicitly linked via `#[link(name = "nrsc5")]`; the Soapy modules use runtime `libloading`.
 - **Platform guards:** Windows-specific code (e.g., `rfd` file dialogs, DLL path setup) is gated with `cfg(windows)` / `cfg(target_os = "linux")`. Linux uses the `xdg-portal` feature for file dialogs.

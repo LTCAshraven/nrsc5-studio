@@ -1959,7 +1959,25 @@ impl Nrsc5App {
                     }
                 }
             }
-            NrscEvent::LotFile { lot, name, .. } => {
+            NrscEvent::LotFile { lot, name, data, .. } => {
+                // Persist the payload to the AAS scratch directory.
+                // Downstream consumers (cover art, traffic map, weather
+                // map) all read from disk via `aas_dir.join(name)`, so
+                // the write must happen before they're invoked. An
+                // empty payload (libnrsc5 emitted a null/zero-size data
+                // pointer) is skipped — an empty file would corrupt
+                // the image-decode paths.
+                if !data.is_empty() && !name.is_empty() {
+                    let path = self.aas_dir.join(&name);
+                    if let Err(e) = std::fs::write(&path, &data) {
+                        eprintln!(
+                            "[aas] failed to write LOT {} -> {}: {}",
+                            lot,
+                            path.display(),
+                            e
+                        );
+                    }
+                }
                 if self.app_state.call_sign.is_empty() {
                     if let Some(cs) = extract_call_sign(&name) {
                         self.app_state.call_sign = cs;

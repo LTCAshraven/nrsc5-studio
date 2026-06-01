@@ -417,13 +417,26 @@ unsafe fn translate_event(tag: u32, payload: &sys::nrsc5_event_payload) -> Vec<N
         }
         sys::NRSC5_EVENT_LOT => {
             let lot = unsafe { payload.lot };
-            // Phase 2 placeholder: program=0. Phase 3 will derive
-            // it from `lot.service` / `lot.component` once the
-            // multi-program routing layer needs it.
+            // Copy the payload bytes out before returning — libnrsc5
+            // owns the buffer for the duration of this callback only.
+            // A null pointer or zero size both mean "no payload" and
+            // yield an empty Vec; the app layer will then skip the
+            // disk write (an empty file would corrupt cover-art /
+            // map processors that expect real image data).
+            let data = if lot.data.is_null() || lot.size == 0 {
+                Vec::new()
+            } else {
+                unsafe { slice::from_raw_parts(lot.data, lot.size as usize) }.to_vec()
+            };
+            // Phase 2 placeholder: program=0. The per-decoder event
+            // callback in `Nrsc5Process::spawn_decoder` rewrites this
+            // to the right subchannel; Phase 5 (multi-program decode)
+            // will derive it from `lot.service` / `lot.component`.
             out.push(NrscEvent::LotFile {
                 program: 0,
                 lot: lot.lot.to_string(),
                 name: unsafe { cstr_to_string(lot.name) },
+                data,
             });
         }
         sys::NRSC5_EVENT_SIS => {
@@ -787,6 +800,81 @@ mod tests {
                 assert_eq!(lot, "42");
             }
             other => panic!("expected Xhdr, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lot_event_copies_payload_bytes() {
+        let (mut ctx, out) = capture();
+        let name = CString::new("123_cover.jpg").unwrap();
+        // Use a non-trivial byte pattern so the test catches a wrong
+        // length, off-by-one, or missing copy.
+        let bytes: Vec<u8> = (0u8..32).collect();
+        let mut payload = zeroed_payload();
+        payload.lot = sys::nrsc5_event_lot {
+            port: 0,
+            lot: 123,
+            size: bytes.len() as u32,
+            mime: sys::NRSC5_MIME_JPEG,
+            name: name.as_ptr(),
+            data: bytes.as_ptr(),
+            expiry_utc: ptr::null_mut(),
+            service: ptr::null_mut(),
+            component: ptr::null_mut(),
+        };
+        dispatch(
+            sys::nrsc5_event_t {
+                event: sys::NRSC5_EVENT_LOT,
+                payload,
+            },
+            &mut ctx,
+        );
+        let got = out.lock().unwrap();
+        assert_eq!(got.len(), 1);
+        match &got[0] {
+            NrscEvent::LotFile {
+                lot,
+                name,
+                data,
+                program,
+            } => {
+                assert_eq!(lot, "123");
+                assert_eq!(name, "123_cover.jpg");
+                assert_eq!(*program, 0); // api.rs hardcodes 0; rewritten by mod.rs.
+                assert_eq!(data, &bytes);
+            }
+            other => panic!("expected LotFile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lot_event_with_null_data_yields_empty_vec() {
+        let (mut ctx, out) = capture();
+        let name = CString::new("noop.bin").unwrap();
+        let mut payload = zeroed_payload();
+        payload.lot = sys::nrsc5_event_lot {
+            port: 0,
+            lot: 7,
+            size: 999, // size lies; data is null -> must be ignored.
+            mime: 0,
+            name: name.as_ptr(),
+            data: ptr::null(),
+            expiry_utc: ptr::null_mut(),
+            service: ptr::null_mut(),
+            component: ptr::null_mut(),
+        };
+        dispatch(
+            sys::nrsc5_event_t {
+                event: sys::NRSC5_EVENT_LOT,
+                payload,
+            },
+            &mut ctx,
+        );
+        let got = out.lock().unwrap();
+        assert_eq!(got.len(), 1);
+        match &got[0] {
+            NrscEvent::LotFile { data, .. } => assert!(data.is_empty()),
+            other => panic!("expected LotFile, got {other:?}"),
         }
     }
 
