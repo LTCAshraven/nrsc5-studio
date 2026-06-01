@@ -21,6 +21,12 @@ use decoder::DecoderInstance;
 #[allow(unused)]
 pub(crate) mod nrsc5_sys;
 
+// Phase 2: safe wrapper around `nrsc5_sys`. The only place in the
+// crate (besides `nrsc5_sys` itself) where `unsafe` is allowed.
+// Dead code until Phase 3 cuts callers over from `decoder.rs`.
+#[allow(unused)]
+pub(crate) mod api;
+
 // -- Events -----------------------------------------------------------
 
 #[derive(Debug, Clone)]
