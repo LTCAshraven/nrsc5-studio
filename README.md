@@ -228,11 +228,23 @@ scripts/            PowerShell build/package helpers
 
 NRSC5 Studio is a thin Rust GUI on top of a lot of excellent open-source work:
 
-- **[`nrsc5`](https://github.com/theori-io/nrsc5)** — the HD Radio decoder that does the actual heavy lifting. License: GPL-3.0.
-- **[`librtlsdr`](https://github.com/osmocom/rtl-sdr)** — RTL-SDR driver library. License: GPL-2.0.
-- **[`libao`](https://www.xiph.org/ao/)**, **[`libusb`](https://libusb.info/)** — audio output and USB I/O. Licenses: GPL-2.0 and LGPL-2.1 respectively.
+- **[`nrsc5`](https://github.com/theori-io/nrsc5)** — the HD Radio decoder this app dynamically links against (`libnrsc5`). License: GPL-3.0.
+- **[`librtlsdr`](https://github.com/osmocom/rtl-sdr)** — RTL-SDR driver library, loaded via SoapySDR's RTL-SDR plugin. License: GPL-2.0-or-later.
+- **[`libusb`](https://libusb.info/)** — cross-platform USB I/O, used transitively by librtlsdr. License: LGPL-2.1-or-later.
+- **[`SoapySDR`](https://github.com/pothosware/SoapySDR)** — vendor-neutral SDR abstraction layer + RTL-SDR / HackRF / SDRplay plugin modules. License: Boost Software License 1.0 (core) / MIT (plugins).
 - **[`egui`](https://www.egui.rs/) / [`eframe`](https://github.com/emilk/egui)** — the immediate-mode GUI framework. License: MIT or Apache-2.0.
 - **[`egui_dock`](https://github.com/Adanos020/egui_dock)** — the dockable tab system. License: MIT.
+
+A complete list of third-party components and their licenses, including the corresponding-source URLs required by GPL-3.0 Section 6, is in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+---
+
+## License
+
+- **The Rust source code in this repository is licensed under the [MIT License](LICENSE).** You're welcome to reuse it in your own projects under MIT terms.
+- **The distributed binary** (the executable in the Windows portable zip / Linux .deb / .rpm) **dynamically links against `libnrsc5` (GPL-3.0)** and is therefore a combined work licensed as a whole under GPL-3.0. The full GPL-3.0 license text is bundled in the release as `COPYING.GPL-3.0`. The corresponding source for every GPL/LGPL component is enumerated in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) and available from this repository plus the upstream URLs listed there.
+
+In short: the source is MIT, the compiled binary is GPL-3.0. If you redistribute the binary you inherit the GPL-3.0 obligations from Section 6 (provide source, preserve the notices).
 
 ---
 
@@ -240,7 +252,7 @@ NRSC5 Studio is a thin Rust GUI on top of a lot of excellent open-source work:
 
 This project stands on the shoulders of the HD Radio reverse-engineering community — particularly:
 
-- **Aiden / theori** — [`nrsc5`](https://github.com/theori-io/nrsc5), the HD Radio decoder this project links against.
+- **TheDaChicken / Argilo** — [`nrsc5`](https://github.com/theori-io/nrsc5), the HD Radio decoder this project links against.
 - **cmnybo** — [`nrsc5-gui`](https://github.com/cmnybo/nrsc5-gui).
 - **markjfine** — [`nrsc5-dui`](https://github.com/markjfine/nrsc5-dui).
 

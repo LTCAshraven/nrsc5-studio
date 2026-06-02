@@ -35,11 +35,11 @@ Copy-Item -Path (Join-Path $TargetDir "nrsc5-studio.exe") -Destination $OutDir -
 #   <exe_dir>\libgcc_s_seh-1.dll     -- transitive load-time dep of libSoapySDR
 #   <exe_dir>\libwinpthread-1.dll    -- transitive load-time dep of libSoapySDR
 #   <exe_dir>\libstdc++-6.dll        -- transitive load-time dep of libSoapySDR
-#   <exe_dir>\bin\libnrsc5.dll       -- in-process HD Radio decoder (loaded by us)
+#   <exe_dir>\bin\libnrsc5.dll       -- in-process HD Radio decoder (loaded by us;
+#                                       statically links FFTW + libusb + libao,
+#                                       so it has no further DLL deps of its own)
 #   <exe_dir>\bin\librtlsdr.dll      -- loaded by SoapyRTLSDR (PATH at runtime)
 #   <exe_dir>\bin\libusb-1.0.dll     -- transitive dep of librtlsdr
-#   <exe_dir>\bin\libao-4.dll        -- transitive dep of libnrsc5
-#   <exe_dir>\bin\libgcc_s_dw2-1.dll -- transitive dep of libnrsc5
 #   <exe_dir>\bin\SoapySDR\modules0.8\*.dll
 #
 # Why the split: Windows resolves the exe's load-time imports BEFORE
@@ -109,7 +109,7 @@ if (Test-Path (Join-Path $Root "res\portable.txt")) {
 }
 
 # Licensing / documentation (required by MIT and GPL bundled DLLs)
-foreach ($doc in @("README.md", "LICENSE", "THIRD_PARTY_NOTICES.md")) {
+foreach ($doc in @("README.md", "LICENSE", "COPYING.GPL-3.0", "THIRD_PARTY_NOTICES.md")) {
     $src = Join-Path $Root $doc
     if (Test-Path $src) {
         Copy-Item -Path $src -Destination $OutDir -Force
