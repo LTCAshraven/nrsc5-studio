@@ -167,6 +167,10 @@ assets = [
     ["packaging/linux/icons/hicolor/256x256/apps/nrsc5-studio.png", "usr/share/icons/hicolor/256x256/apps/nrsc5-studio.png", "644"],
     # Bundled nrsc5 helper installer (user runs it once post-install)
     ["scripts/install-nrsc5-helper.sh", "usr/share/nrsc5-studio/install-nrsc5-helper.sh", "755"],
+    # US base map used by the weather radar overlay processor. Without
+    # this file `WeatherMap::make_base_map` never produces a cropped
+    # basemap and every DWRO overlay is dropped silently.
+    ["res/map.png", "usr/share/nrsc5-studio/map.png", "644"],
 ]
 
 [package.metadata.generate-rpm]
@@ -192,6 +196,8 @@ assets = [
     { source = "packaging/linux/icons/hicolor/256x256/apps/nrsc5-studio.png", dest = "/usr/share/icons/hicolor/256x256/apps/nrsc5-studio.png", mode = "644" },
     # Bundled nrsc5 helper installer
     { source = "scripts/install-nrsc5-helper.sh", dest = "/usr/share/nrsc5-studio/install-nrsc5-helper.sh", mode = "755" },
+    # US base map used by the weather radar overlay processor.
+    { source = "res/map.png", dest = "/usr/share/nrsc5-studio/map.png", mode = "644" },
 ]
 
 # Fedora package names: SoapySDR (capitalized), rtl-sdr (provides

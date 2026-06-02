@@ -506,7 +506,10 @@ fn lat_rad(deg: f64) -> f64 {
 
 /// Locate res/map.png using the same search strategy as find_nrsc5_exe:
 /// exe_dir/res/, cwd/res/, and walk up from exe_dir for dev builds
-/// (target/x86_64-.../debug/ → project root).
+/// (target/x86_64-.../debug/ → project root). On Unix, also check the
+/// standard FHS install locations the Linux packages use
+/// (`/usr/share/nrsc5-studio/map.png`, etc.) so a system-installed
+/// build can find the basemap without relying on $PWD.
 fn find_map_file() -> Option<PathBuf> {
     let name = Path::new("res").join("map.png");
 
@@ -536,6 +539,30 @@ fn find_map_file() -> Option<PathBuf> {
         let candidate = cwd.join(&name);
         if candidate.exists() {
             return Some(candidate);
+        }
+    }
+
+    // 3. Unix install locations. The Linux .deb and .rpm install the
+    // basemap to `/usr/share/nrsc5-studio/map.png` (see Cargo.toml
+    // `[package.metadata.deb]` and `[package.metadata.generate-rpm]`
+    // asset lists). Also honour `XDG_DATA_DIRS` (colon-separated)
+    // and `/usr/local/share` so users who install from source land
+    // on a working path too.
+    #[cfg(unix)]
+    {
+        let mut data_dirs: Vec<PathBuf> = Vec::new();
+        if let Some(xdg) = std::env::var_os("XDG_DATA_DIRS") {
+            for part in std::env::split_paths(&xdg) {
+                data_dirs.push(part);
+            }
+        }
+        data_dirs.push(PathBuf::from("/usr/local/share"));
+        data_dirs.push(PathBuf::from("/usr/share"));
+        for base in data_dirs {
+            let candidate = base.join("nrsc5-studio").join("map.png");
+            if candidate.exists() {
+                return Some(candidate);
+            }
         }
     }
 
