@@ -25,7 +25,7 @@
 %global debug_package %{nil}
 
 Name:           %{appname}
-Version:        0.3.7
+Version:        0.5.0
 Release:        1%{?dist}
 Summary:        HD Radio FM receiver and station explorer built on nrsc5 and SoapySDR
 

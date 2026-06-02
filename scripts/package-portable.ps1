@@ -31,28 +31,34 @@ Copy-Item -Path (Join-Path $TargetDir "nrsc5-studio.exe") -Destination $OutDir -
 #
 #   <exe_dir>\nrsc5-studio.exe
 #   <exe_dir>\libSoapySDR.dll        -- load-time import of the exe
+#   <exe_dir>\libnrsc5.dll           -- load-time import of the exe
+#                                       (#[link(name = "nrsc5")] in src/ffi/api.rs;
+#                                       statically links FFTW + libusb + FAAD2 +
+#                                       rtl-sdr, so it has no further DLL deps
+#                                       of its own)
 #   <exe_dir>\libunwind.dll          -- load-time import of the exe
 #   <exe_dir>\libgcc_s_seh-1.dll     -- transitive load-time dep of libSoapySDR
 #   <exe_dir>\libwinpthread-1.dll    -- transitive load-time dep of libSoapySDR
 #   <exe_dir>\libstdc++-6.dll        -- transitive load-time dep of libSoapySDR
-#   <exe_dir>\bin\libnrsc5.dll       -- in-process HD Radio decoder (loaded by us;
-#                                       statically links FFTW + libusb + libao,
-#                                       so it has no further DLL deps of its own)
+#   <exe_dir>\bin\libnrsc5.dll       -- redundant copy left in bin\ for tools that
+#                                       expect everything DLL-y under bin\
 #   <exe_dir>\bin\librtlsdr.dll      -- loaded by SoapyRTLSDR (PATH at runtime)
 #   <exe_dir>\bin\libusb-1.0.dll     -- transitive dep of librtlsdr
 #   <exe_dir>\bin\SoapySDR\modules0.8\*.dll
 #
 # Why the split: Windows resolves the exe's load-time imports BEFORE
 # any of our Rust code runs, so any DLL the exe links statically
-# (libSoapySDR.dll + the MSYS2 C/C++ runtime libs it pulls in) must
-# sit in a directory Windows' default DLL search covers -- i.e. next
-# to the exe, since we don't want to require System32 installs. The
-# remaining DLLs (`bin\...`) are loaded by libSoapySDR's modules or
-# by `libnrsc5.dll` AFTER `main.rs::install_bundled_dll_paths()` has
-# prepended `<exe>\bin` to PATH and pointed `SOAPY_SDR_PLUGIN_PATH`
-# at `<exe>\bin\SoapySDR\modules0.8`.
+# (libSoapySDR.dll, libnrsc5.dll, libunwind.dll + the MSYS2 C/C++
+# runtime libs they pull in) must sit in a directory Windows' default
+# DLL search covers -- i.e. next to the exe, since we don't want to
+# require System32 installs. The remaining DLLs (`bin\...`) are
+# loaded by libSoapySDR's plugin modules AFTER
+# `main.rs::install_bundled_dll_paths()` has prepended `<exe>\bin` to
+# PATH and pointed `SOAPY_SDR_PLUGIN_PATH` at
+# `<exe>\bin\SoapySDR\modules0.8`.
 $LoadTimeDlls = @(
     "libSoapySDR.dll",
+    "libnrsc5.dll",
     "libunwind.dll",
     "libgcc_s_seh-1.dll",
     "libwinpthread-1.dll",

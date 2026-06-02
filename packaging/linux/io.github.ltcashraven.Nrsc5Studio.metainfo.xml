@@ -81,6 +81,53 @@
   <content_rating type="oars-1.1" />
 
   <releases>
+    <release version="0.5.0" date="2026-06-02">
+      <description>
+        <p>libnrsc5 in-process cutover. NRSC5 Studio no longer ships
+        and shells out to a separate nrsc5 child process — the
+        decoder is dynamically linked against libnrsc5 and runs as
+        a thread inside the app. The same plumbing now decodes up
+        to four HD subchannels (HD1-HD4) in parallel from a single
+        tune via a shared IQ fan-out. Fixes a Linux rtl_tcp GUI
+        freeze on Start (bad host or wrong port now fails in ~5s
+        instead of locking the GUI). The weather map base image
+        (res/map.png) is now correctly installed by the .deb/.rpm
+        at /usr/share/nrsc5-studio/res/. The shipped binary is now
+        a combined work under GPL-3.0 (the project source remains
+        MIT); COPYING.GPL-3.0 ships in the package and
+        THIRD_PARTY_NOTICES.md documents the corresponding source.</p>
+      </description>
+    </release>
+    <release version="0.4.1" date="2026-05-30">
+      <description>
+        <p>SDR transport refactor and Settings modal redesign. The
+        [sdr] config models the data source as an explicit transport
+        choice (LocalSoapy / SoapyRemote / rtl_tcp). The 0.2.x
+        runtime fallback start paths (USB-direct and legacy rtl_tcp
+        process launch) are removed; every Start goes through the
+        same in-process piped IQ → spectrum → AGC → nrsc5 pipeline.
+        Native rtl_tcp client implemented end-to-end in Rust at
+        src/sdr/rtltcp.rs (no Soapy on the wire). 4-tab Settings
+        modal (Connection / Gain / Display / Recording) with a
+        transport picker and a transport-aware connection-string
+        display. 1080p-friendly default dock layout; top bar wraps
+        to a second line on narrow windows.</p>
+      </description>
+    </release>
+    <release version="0.4.0" date="2026-05-28">
+      <description>
+        <p>Closed-loop AGC overhaul. The host-side gain controller
+        is rewritten around a Coarse-then-Fine search instead of the
+        flat hill-climb that 0.3.x used. A new 7-day persistent
+        gain cache lets the AGC skip the cold search entirely on
+        stations you visit regularly. The settle gate moves from
+        raw elapsed time to a sample-driven window (8 MER reports
+        ≈ 2 s at nrsc5's 4 Hz cadence), so the first sample after
+        a gain change can't contaminate the decision. A new
+        agc-trace.log file is written next to the other app data on
+        every tune for observability.</p>
+      </description>
+    </release>
     <release version="0.3.10" date="2026-05-27">
       <description>
         <p>Tuner ergonomics release. Multi-input SDRplay RSPs

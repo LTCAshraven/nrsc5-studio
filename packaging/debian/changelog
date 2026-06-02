@@ -1,3 +1,37 @@
+nrsc5-studio (0.5.0-1) unstable; urgency=medium
+
+  * libnrsc5 in-process cutover. nrsc5.exe is gone from bin/; the
+    decoder is now linked dynamically against libnrsc5.dll /
+    libnrsc5.so and runs as a thread inside the app. New FFI layer
+    under src/ffi/ (raw bindings + safe wrapper + per-program
+    DecoderInstance). 100% of the project's unsafe code is now
+    isolated to src/ffi/api.rs.
+  * Multi-program HD decode. A single SDR tune now feeds up to 4
+    HD subchannels (HD1-HD4) in parallel via a shared IqBus fan-out.
+    Central AGC tee, per-program play_log dedup, soft cap of 4
+    active decoders.
+  * Fix Linux rtl_tcp GUI freeze on Start. Hostname resolution +
+    bounded connect (3s) + bounded handshake read (2s) so a bad
+    host or wrong port fails in ~5s instead of locking the GUI
+    until the OS produces a Force-Quit dialog.
+  * Ship res/map.png in the .deb/.rpm install at
+    /usr/share/nrsc5-studio/res/map.png so the weather overlay's
+    fallback base map is available on Linux. The maps module now
+    searches FHS install paths in addition to the portable res/
+    directory.
+  * License: the shipped binary is now a GPL-3.0 combined work
+    (the Rust source is still MIT). Ship COPYING.GPL-3.0 at
+    /usr/share/doc/nrsc5-studio/COPYING.GPL-3.0. THIRD_PARTY_NOTICES.md
+    rewritten to document the GPL-2.0/2.1+ libraries statically
+    embedded inside libnrsc5.dll (FFTW3, FAAD2, libusb 1.0.27,
+    rtl-sdr 2.0.2).
+  * Smaller fixes: LOT filename prefix no longer doubled; MER
+    resets to zero on retune; Enter key inside the Tuner frequency
+    field triggers tune; cargo-gnu.ps1 prepends MSYS2 mingw64 to
+    PATH so the right pkg-config and libclang are picked.
+
+ -- LTCAshraven <ltcashraven@users.noreply.github.com>  Tue, 02 Jun 2026 14:14:01 +0000
+
 nrsc5-studio (0.4.1-1) unstable; urgency=medium
 
   * SDR transport refactor. The [sdr] config models the data source

@@ -1,10 +1,10 @@
 # NRSC5 Studio
 
-A native Windows desktop app for listening to **HD Radio** broadcasts with an RTL-SDR or SDRplay receiver. Built in Rust with [egui](https://www.egui.rs/), wrapped around the excellent [`nrsc5`](https://github.com/theori-io/nrsc5) HD Radio decoder, with a unified [SoapySDR](https://github.com/pothosware/SoapySDR) device layer underneath.
+A native Windows and Linux desktop app for listening to **HD Radio** broadcasts with an RTL-SDR, SDRplay, or HackRF receiver. Built in Rust with [egui](https://www.egui.rs/), wrapped around the excellent [`nrsc5`](https://github.com/theori-io/nrsc5) HD Radio decoder, with a unified [SoapySDR](https://github.com/pothosware/SoapySDR) device layer underneath.
 
-NRSC5 Studio gives you everything `nrsc5.exe` already does — tuning, demodulating, decoding HD1–HD4 subchannels, pulling album art and station logos — and adds a polished, persistent GUI on top, with a few extras the command line never had.
+NRSC5 Studio gives you everything the upstream `nrsc5` command-line decoder already does — tuning, demodulating, decoding HD1–HD4 subchannels, pulling album art and station logos — and adds a polished, persistent GUI on top, with a few extras the command line never had.
 
-> **Status:** pre-release polish. Functional and stable on Windows 10/11 x64. Linux/macOS aren't supported yet (the Windows-specific per-app volume control would need replacing).
+> **Status:** stable on Windows 10/11 x64 and Linux x86_64 (Debian/Ubuntu via `.deb`, Fedora via `.rpm`). macOS isn't supported yet.
 
 ---
 
@@ -33,7 +33,7 @@ NRSC5 Studio gives you everything `nrsc5.exe` already does — tuning, demodulat
 - **Traffic Map** — TPEG traffic-tile decode, stitched into a single map image the moment all tiles for an area arrive. Only IHeartMedia stations transmit this. [IHeartMedia Stations](https://www.iheartmedia.com/stations)
 - **Weather Radar Animation** — every weather overlay frame from the broadcast is captured with its real wall-clock timestamp. Play / pause / scrub through up to 90 minutes of frames with a rocker slider; duplicate frames are deduplicated by content hash so the loop only advances when the station actually pushes new radar. Only IHeartMedia stations transmit this. [IHeartMedia Stations](https://www.iheartmedia.com/stations)
 - **Signal Quality** — live MER (lower / upper sidebands), BER counters, and the current AGC gain in dB with a status badge (probing / settled / bailed) and time-since-last-change.
-- **Per-app Volume** — Windows COM-based per-process volume / mute, so NRSC5 Studio's volume slider only changes NRSC5 Studio's audio (not the whole system).
+- **Per-app Volume** — on Windows, a COM-based per-process volume / mute control so NRSC5 Studio's volume slider only changes NRSC5 Studio's audio (not the whole system). On Linux the slider applies a software-side gain to the cpal output stream.
 - **Multi-SDR support** — RTL-SDR (R820T2 / E4000), SDRplay (RSP1A / RSPduo / RSPdx via the proprietary SDRplay API), and HackRF One out of the box. Switch devices via the hamburger menu's **📡 SDR Settings…** modal; per-element gain sliders, PPM correction, and HD-Radio-specific notes are surfaced per driver.
 - **Friendly first-run experience** — if no SDR is plugged in, a centered "Plug in an SDR and press Refresh" overlay replaces the cryptic empty state. The overlay auto-dismisses the moment a device is detected.
 - **Persistent dock layout** — drag tabs into floating sub-panes, split horizontally or vertically. Your layout is restored on the next launch.
@@ -45,7 +45,7 @@ NRSC5 Studio gives you everything `nrsc5.exe` already does — tuning, demodulat
 
 - An installed and working **SDR** with an antenna suitable for FM (87.5–108 MHz). Generic RTL2832U + R820T2 dongles are still the cheapest, most-tested option.
 - A nearby HD Radio FM broadcaster. (Most U.S. metro areas have several.)
-- Windows 10 or 11, x86_64.
+- Windows 10 or 11 (x86_64), or a Linux distribution recent enough to run a modern egui app (Debian 12+, Ubuntu 22.04+, Fedora 40+) on x86_64.
 
 ### Supported SDRs (v0.3.0)
 
@@ -92,6 +92,8 @@ Configs from earlier 0.2.x / 0.3.x releases that used `use_rtl_tcp = true` are m
 
 ## Install (portable)
 
+### Windows
+
 1. Download the latest `nrsc5-studio-portable.zip` from the Releases page.
 2. Unzip it anywhere — `Documents`, `Program Files`, a USB stick, wherever.
 3. Plug in your RTL-SDR dongle.
@@ -103,6 +105,14 @@ By default the zip ships in **portable mode** (a `portable.txt` marker file live
 
 If you'd rather use the standard Windows convention (state under `%APPDATA%\nrsc5-studio\` and `%LOCALAPPDATA%\nrsc5-studio\`), delete `portable.txt` and relaunch.
 
+### Linux (`.deb` / `.rpm`)
+
+1. Download the `.deb` (Debian/Ubuntu) or `.rpm` (Fedora) from the Releases page.
+2. Install it with `sudo apt install ./nrsc5-studio_<version>_amd64.deb` or `sudo dnf install ./nrsc5-studio-<version>.x86_64.rpm`. The package depends on `libsoapysdr` and the SDR plugin you want (e.g. `soapysdr-module-rtlsdr`).
+3. Plug in your SDR. (On Debian/Ubuntu, RTL-SDR needs a udev rule and your user in the `plugdev` group — see [docs/linux-install.md](docs/linux-install.md).)
+4. Launch from your desktop menu or run `nrsc5-studio` from a terminal.
+
+Installed-mode state lives under `$XDG_DATA_HOME/nrsc5-studio/` (typically `~/.local/share/nrsc5-studio/`).
 ---
 
 ## Quick start
@@ -163,7 +173,7 @@ Most users won't need this — grab the portable zip and you're done. But if you
 
 - A Rust toolchain (install via [rustup](https://rustup.rs/)). The build pins `stable-x86_64-pc-windows-gnullvm`.
 - The bundled `llvm-mingw` toolchain. The repo expects it at `.toolchains\llvm-mingw-20260505-ucrt-x86_64\` — download a release from [mstorsjo/llvm-mingw](https://github.com/mstorsjo/llvm-mingw/releases) and extract it there.
-- The bundled `bin\` runtime (nrsc5.exe + DLLs) — already in the repo.
+- The bundled `bin\` runtime (`libnrsc5.dll`, `libSoapySDR.dll`, `librtlsdr.dll`, Soapy plugin modules) — already in the repo. If you ever need to rebuild `libnrsc5.dll` from upstream source, `scripts\build-nrsc5-msys2.ps1` drives the full MSYS2 build of the pinned nrsc5 v3.1.0 tag with `USE_STATIC=ON`.
 
 ### Build
 
@@ -190,10 +200,13 @@ cargo +stable-x86_64-pc-windows-gnullvm build --release --target x86_64-pc-windo
 
 Bundles the release exe with `bin\` runtime into `dist\nrsc5-studio-portable\`.
 
-### Linux bring-up (developer preview)
+### Linux build
 
-Linux support is in-progress. For Ubuntu 22.04.5 LTS bring-up instructions,
-see [docs/linux-ubuntu-bringup.md](docs/linux-ubuntu-bringup.md).
+Linux builds use the system toolchain and SoapySDR packages. For an
+end-to-end pipeline (cargo build + `.deb` + `.rpm`) see
+[scripts/build-linux-release.sh](scripts/build-linux-release.sh). For
+Ubuntu 22.04.5 LTS bring-up instructions, see
+[docs/linux-ubuntu-bringup.md](docs/linux-ubuntu-bringup.md).
 
 ---
 
@@ -203,23 +216,47 @@ see [docs/linux-ubuntu-bringup.md](docs/linux-ubuntu-bringup.md).
 src/
   main.rs           entry point, window/viewport setup
   app.rs            top-level eframe app, event loop, command dispatch
+  lib.rs            crate root for the integration-test surface
   icon.rs           procedurally-rendered broadcast-tower window icon
-  config.rs         persisted user settings (presets, theme, volume, gain mode, ...)
+  icon_render.rs    pre-rendered icon PNG generation for Linux packaging
+  config.rs         persisted user settings (presets, theme, volume, gain mode, transport, …)
+  paths.rs          portable vs installed path resolution (config, cache, AAS scratch, logs)
   art_cache.rs      content-addressed on-disk cache for album art + station logos
-  play_log.rs       24-hour rolling song log + RFC-4180 CSV export
-  sdr_detect.rs     librtlsdr presence probe for the no-SDR overlay
-  ffi/              spawns nrsc5.exe, parses its stderr stream, runs the AGC driver thread
-  sdr/              in-process RTL-SDR backend (modern librtlsdr.dll, I/Q pipe to nrsc5.exe)
-  dsp/              FFT-based spectrum tap and the closed-loop AGC controller
-  gui/
-    dock.rs         tab definitions and tab UIs (Tuner, Spectrum, Signal, Log, ...)
-    state.rs        runtime state shared with the GUI
-  collage/          album-art history / squarified-treemap layout
+  play_log.rs       24-hour rolling song log + RFC-4180 CSV export, per-program dedup
+  station_info.rs   SIS table model (call sign, slogan, FCC ID, location, services, alerts)
+  sdr_detect.rs     SDR presence probe for the no-SDR overlay
+  ffi/
+    nrsc5_sys.rs    raw FFI bindings against nrsc5.h (v3.1.0)
+    api.rs          safe Rust wrapper around libnrsc5: Nrsc5Session, callback trampoline,
+                    typed NrscEvent / PcmSink — all project unsafe lives here
+    decoder.rs      per-program DecoderInstance + I/Q feeder thread
+    mod.rs          AGC driver thread, multi-decoder lifecycle (Nrsc5Process)
+  sdr/
+    mod.rs          trait Sdr + device discovery
+    soapy.rs        SoapySDR backend (RTL-SDR, SDRplay, HackRF, SoapyRemote)
+    rtltcp.rs       native rtl_tcp client (end-to-end Rust)
+    profile.rs      per-device gain tables, AGC element selection, sample-rate negotiation
+    iq_bus.rs       I/Q fan-out to decoder + spectrum tap + recorder
+    gain_cache.rs   7-day persistent per-station gain cache (RON)
+    resampler.rs    rubato wrapper for SDRplay's 2 Msps → 1.488375 Msps software resample
+  dsp/
+    agc.rs          closed-loop AGC controller (Coarse-then-Fine search)
+    spectrum.rs     FFT-based spectrum tap feeding the waterfall + scope UI
+    mod.rs
+  audio/            cpal output stream + Windows COM per-process volume; Linux software gain
+  recorder/         96 kbps Opus session recorder (Ogg Opus, Vorbis tags, rotation)
+  collage/          album-art history + squarified-treemap layout
   maps/             traffic + weather map composition (PNG outputs)
-  winaudio/         Windows COM per-process volume/mute
-res/                config defaults + nrsc5.h header
-bin/                bundled nrsc5.exe + DLLs (third-party, GPL)
-scripts/            PowerShell build/package helpers
+  gui/
+    dock.rs         tab definitions and tab UIs (Tuner, Spectrum, Signal, Log, Collage, …)
+    state.rs        runtime state snapshot shared with the GUI
+    widgets.rs      shared egui widgets
+    mod.rs
+res/                config defaults, nrsc5.h header, weather base map
+bin/                bundled runtime: libnrsc5.dll, libSoapySDR.dll, librtlsdr.dll,
+                    libusb-1.0.dll, GCC/libunwind runtime, SoapySDR\modules0.8\*
+scripts/            PowerShell + bash build/package helpers
+packaging/          Debian, Fedora, and Linux desktop integration assets
 ```
 
 ---

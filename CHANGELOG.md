@@ -6,6 +6,155 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-06-02
+
+The **libnrsc5 in-process cutover** release. NRSC5 Studio no longer
+shells out to a bundled `nrsc5.exe` child process for HD decode —
+instead it links directly against `libnrsc5.dll` at load time and
+runs the decoder inside its own address space. The four-phase FFI
+rewrite (raw `bindgen`-style bindings → safe Rust wrapper → audio
+path cutover → multi-decoder spawning) replaces the previous
+stdin/stdout pipe + s16le child-process pipeline with a single
+typed `Nrsc5Session` driven by a dedicated I/Q feeder thread, with
+PCM samples delivered straight to `cpal` via a callback. The same
+plumbing now decodes **up to four HD subchannels (HD1–HD4) in
+parallel** from a single tune.
+
+Alongside the cutover: a Linux-side `rtl_tcp` GUI-freeze bug is
+fixed; the weather-map `res/map.png` is now correctly installed by
+the `.deb`/`.rpm`; the licensing posture is brought into compliance
+with GPL-3.0 §6 now that the shipped binary is a combined work
+(the source remains MIT but the binary is GPL-3.0).
+
+### Added
+
+- **In-process `libnrsc5.dll` FFI** under `src/ffi/`:
+  - `src/ffi/nrsc5_sys.rs` — 710-line hand-curated raw FFI bindings
+    against the `res/nrsc5.h` header pinned at nrsc5 v3.1.0.
+  - `src/ffi/api.rs` — 1082-line safe Rust wrapper. Owns the
+    `Nrsc5Session` handle, runs the callback trampoline, copies
+    every C string and slice into owned `NrscEvent` variants on
+    libnrsc5's worker thread, and exposes a typed `PcmSink`
+    callback for the audio fast path.
+  - `build.rs` — Phase 0 build script that auto-syncs `res/nrsc5.h`
+    against the upstream theori-io/nrsc5 v3.1.0 release, emits the
+    correct `cargo:rustc-link-search` entries for `bin/` (Windows)
+    and the Unix link paths (Linux), and verifies the bundled DLL
+    actually exports every symbol the wrapper expects.
+- **Multi-program decode (HD1–HD4 in parallel).** A single SDR tune
+  now fans I/Q out to one decoder per program. A central AGC tee
+  feeds every decoder from the same gain trajectory, the per-program
+  `play_log` dedups song metadata across subchannels, and a soft
+  cap of 4 simultaneously active decoders (of nrsc5's 8 max)
+  protects CPU on lower-end machines. The Tuner panel sprouts
+  per-program enable toggles.
+- **`scripts/build-nrsc5-msys2.ps1`** — reproducible builder for
+  `libnrsc5.dll` from the upstream theori-io/nrsc5 v3.1.0 tag,
+  driven through MSYS2 with `USE_STATIC=ON` to statically embed
+  FFTW3, FAAD2, libusb, and rtl-sdr inside the DLL.
+- **`COPYING.GPL-3.0`** — canonical FSF text of the GPL-3.0,
+  shipped in the repo root, in the portable Windows zip, and in
+  the `.deb`/`.rpm` at `/usr/share/doc/nrsc5-studio/`.
+- **`scripts/fetch-corresponding-source.ps1`** — reproducible
+  downloader that gathers the 10 upstream source tarballs
+  (libnrsc5 v3.1.0, FFTW 3.3.10, FAAD2 2.11.2, libusb v1.0.27 +
+  v1.0.28, rtl-sdr v2.0.2 Osmocom, SoapySDR 0.8.1, SoapyRTLSDR
+  0.3.3, SoapyHackRF 0.3.4, SoapySDRPlay3) that constitute the
+  GPL-3.0 §6 corresponding source. Output staged to
+  `dist/corresponding-source/` (gitignored) and intended as a
+  release-page asset.
+
+### Changed
+
+- **`Nrsc5Process` rewritten** around in-process decoding. The old
+  `nrsc5.exe` `Child` is gone, along with its stdin write loop,
+  stderr parser, and stdout PCM reader. Each `DecoderInstance` now
+  owns one `Nrsc5Session` driven by a dedicated I/Q feeder thread
+  that pumps samples from the shared `IqBus` and calls
+  `pipe_samples_cu8` synchronously; metadata events arrive on
+  libnrsc5's worker thread via the safe wrapper's callback.
+- **Status bar `nrsc5 process` label** is gone — the in-process
+  decoder is no longer a separate process. Top-bar status now
+  reports the libnrsc5 version string from `nrsc5_get_version()`.
+- **Window-subsystem release builds** use `#![windows_subsystem =
+  "windows"]` more aggressively now that there's no child process
+  writing to stderr; everything that matters is mirrored to
+  `agc-trace.log` and the in-app Log panel.
+- **`THIRD_PARTY_NOTICES.md` fully rewritten** to reflect the
+  GPL-3.0 binary disclosure obligation. New Licensing Summary
+  explains the MIT-source / GPL-3.0-binary split; the components
+  statically embedded inside `libnrsc5.dll` (FFTW 3.3.10 GPL-2.0+,
+  FAAD2 2.11.2 GPL-2.0, libusb 1.0.27 LGPL-2.1+, rtl-sdr 2.0.2
+  Osmocom GPL-2.0+) are now documented; SoapySDR and its plugins
+  (BSL-1.0 / MIT) and the GCC runtime (GPL-3.0 + RLE 3.1) are
+  listed; a corresponding-source URL table is included.
+- **`README.md`** gained a License section explaining the
+  source/binary dual licensing and updated Credits to drop libao
+  (no longer linked into anything we ship) and acknowledge the
+  dynamic linkage against libnrsc5.
+- **`bin/` slimmed.** `nrsc5.exe` (~6.6 MB), `nrsc5` Linux binary
+  (~1.0 MB), `libao-4.dll` (~208 KB), and `libgcc_s_dw2-1.dll`
+  (~52 KB) all removed. `objdump -p` confirms nothing else in the
+  bundled DLL set imports the removed libraries.
+
+### Fixed
+
+- **`rtl_tcp` Linux GUI freeze on Start.** Selecting the `rtl_tcp`
+  transport with an unreachable host or wrong port would lock the
+  GUI thread until the OS produced the Force-Quit dialog (~22 s
+  on glibc). `RtlTcpSdr::open` now performs hostname resolution via
+  `to_socket_addrs()`, applies a 3 s `CONNECT_TIMEOUT`, installs a
+  2 s `HANDSHAKE_READ_TIMEOUT` **before** the `read_exact` for the
+  dongle-info header, then switches to a 5 s `READ_TIMEOUT` for
+  the streaming loop. Worst-case GUI block on a misconfigured
+  remote is now ~5 s.
+- **LOT filename prefix.** Large-object-transfer payloads written
+  to the AAS scratch directory had their port-id prefix doubled
+  in some paths, breaking the cover-art / weather-map / traffic-map
+  processors' file-name match logic. The prefix is now written
+  exactly once.
+- **MER no longer "sticks" across retunes.** The MER readout used
+  to retain the previous station's value until the new station
+  produced a sync report — confusing on a frequency with no signal.
+  Retune now resets the MER snapshot to zero, so the Signal panel
+  reads honestly while the controller is searching.
+- **Enter key tunes from the frequency field.** Pressing Enter
+  inside the Tuner panel's frequency text input now triggers
+  `Retune` directly instead of requiring a click on the Tune
+  button.
+- **Weather map missing from `.deb`/`.rpm` installs.** The bundled
+  `res/map.png` (CONUS base map used as the weather-overlay
+  underlay when no live tile is available) was not listed in the
+  packaging assets. `cargo deb` / `cargo generate-rpm` now install
+  it to `/usr/share/nrsc5-studio/res/map.png`, and `src/maps/mod.rs`
+  searches the FHS install path in addition to the portable
+  `res/` directory.
+- **`scripts/cargo-gnu.ps1` PATH ordering.** The MSYS2 `mingw64`
+  bin directory was being appended after the gnullvm toolchain
+  bin, so the wrong `pkg-config` could be picked up in some shells.
+  It's now prepended. The script also tolerates native stderr
+  output from the toolchain (previously misclassified as failure).
+
+### Internal
+
+- **Four-phase libnrsc5 cutover.** Tracked across branches
+  `refactor/libnrsc5-build` (Phase 0 — build script), then
+  `refactor/libnrsc5-bindings` (Phase 1 — raw FFI), then
+  `refactor/libnrsc5-api` (Phase 2 — safe wrapper), then
+  `refactor/libnrsc5-cutover` (Phase 3 — runtime cutover), then
+  `feat/multi-program-decode` (multi-decoder layer + Linux
+  packaging + rtl_tcp fix + licensing). All merged forward into
+  `main` via fast-forward.
+- **100% of project `unsafe`** is now isolated to `src/ffi/api.rs`
+  (callback trampoline, linked-list walks, slice/string copy-out
+  from C). Everything outside `src/ffi/` is safe Rust.
+- **Packaging assets refreshed.** `Cargo.toml`'s
+  `[package.metadata.deb].assets` and `[package.metadata.generate-rpm].assets`
+  now install `COPYING.GPL-3.0` and `res/map.png`.
+  `scripts/package-portable.ps1` sweeps `COPYING.GPL-3.0` into the
+  Windows zip alongside `LICENSE`, `README.md`, and
+  `THIRD_PARTY_NOTICES.md`.
+
 ## [0.4.1] - 2026-05-30
 
 SDR transport cleanup and Settings modal redesign. The `[sdr]` section
