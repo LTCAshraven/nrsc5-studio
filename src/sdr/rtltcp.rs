@@ -49,7 +49,7 @@
 //!   side of the socket so a blocked `read` returns immediately.
 
 use std::io::{Read, Write};
-use std::net::{Shutdown, TcpStream};
+use std::net::{Shutdown, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -73,6 +73,19 @@ const R820T_GAIN_TABLE_TENTHS: &[i32] = super::profile::R820T_GAINS_TENTHS;
 /// a transient pause in the IQ stream, short enough that a dead server
 /// or a `cancel_stream` is observable within a reasonable window.
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Connection timeout for the initial TCP handshake. Kept short so a
+/// misconfigured host doesn't freeze the GUI thread (where `open` is
+/// called synchronously from the Start button).
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Read timeout for the 12-byte dongle-info header. A real rtl_tcp
+/// server sends it within the first packet; if 2 s elapse with no
+/// bytes, the peer is almost certainly not an rtl_tcp server (e.g.
+/// user typed the wrong port and hit an unrelated service like ssh).
+/// Bounding this prevents the indefinite hang that previously made
+/// the app appear frozen until Linux's Force Quit dialog appeared.
+const HANDSHAKE_READ_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// One open rtl_tcp connection.
 pub struct RtlTcpSdr {
@@ -154,26 +167,68 @@ impl RtlTcpSdr {
     /// Connect to `host:port`, read the dongle-info header, and return
     /// a ready-to-`configure` SDR.
     ///
-    /// Sets a sensible read timeout on the underlying socket so the
-    /// `run_stream` loop can poll its `stop_flag` if the server pauses.
+    /// Resolves `host` via DNS so users can enter hostnames
+    /// (`localhost`, `mybox.local`, IPv6 literals) as well as raw
+    /// IPv4 addresses. Sets bounded timeouts for both the TCP
+    /// handshake and the dongle-info header read so a missing or
+    /// non-rtl_tcp peer fails fast instead of hanging the caller.
+    /// After the handshake, the longer steady-state `READ_TIMEOUT`
+    /// is installed so the `run_stream` loop can poll its stop_flag
+    /// if the server pauses.
     pub fn open(host: &str, port: u16) -> Result<Self, SdrError> {
         let addr = format!("{host}:{port}");
-        let mut stream =
-            TcpStream::connect_timeout(
-                &addr.parse().map_err(|e| SdrError::RtlTcpConnect {
-                    addr: addr.clone(),
-                    reason: format!("invalid address: {e}"),
-                })?,
-                Duration::from_secs(5),
-            )
+
+        // Resolve via DNS so hostnames work. `to_socket_addrs` may
+        // return multiple addrs (IPv4 + IPv6); try each in order and
+        // return the first successful connect. If all fail, surface
+        // the last error.
+        let sock_addrs: Vec<_> = addr
+            .to_socket_addrs()
             .map_err(|e| SdrError::RtlTcpConnect {
                 addr: addr.clone(),
-                reason: e.to_string(),
+                reason: format!("resolving address: {e}"),
+            })?
+            .collect();
+        if sock_addrs.is_empty() {
+            return Err(SdrError::RtlTcpConnect {
+                addr: addr.clone(),
+                reason: "address resolved to no socket addresses".to_string(),
+            });
+        }
+
+        let mut last_err: Option<std::io::Error> = None;
+        let mut stream: Option<TcpStream> = None;
+        for sa in &sock_addrs {
+            match TcpStream::connect_timeout(sa, CONNECT_TIMEOUT) {
+                Ok(s) => {
+                    stream = Some(s);
+                    break;
+                }
+                Err(e) => last_err = Some(e),
+            }
+        }
+        let mut stream = stream.ok_or_else(|| SdrError::RtlTcpConnect {
+            addr: addr.clone(),
+            reason: last_err
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "unknown connect error".to_string()),
+        })?;
+
+        // Install the short handshake read timeout BEFORE reading the
+        // header so a peer that accepts the connection but never
+        // sends bytes (wrong service, half-broken rtl_tcp, etc.)
+        // can't hang the GUI thread.
+        stream
+            .set_read_timeout(Some(HANDSHAKE_READ_TIMEOUT))
+            .map_err(|e| SdrError::RtlTcpIo {
+                addr: addr.clone(),
+                reason: format!("set_read_timeout (handshake): {e}"),
             })?;
 
-        // Read the 12-byte dongle-info header. `read_exact` on the
-        // connect path is fine — every conformant rtl_tcp implementation
-        // sends the header within the first packet of the connection.
+        // Read the 12-byte dongle-info header. `read_exact` will
+        // surface a timeout as `WouldBlock` / `TimedOut` if the peer
+        // is silent; we map that to the same RtlTcpIo variant so the
+        // user sees a clear failure instead of an indefinite freeze.
         let mut header = [0u8; 12];
         stream
             .read_exact(&mut header)
@@ -183,6 +238,9 @@ impl RtlTcpSdr {
             })?;
         let dongle = DongleInfo::parse(&header, &addr)?;
 
+        // Switch to the steady-state read timeout for the rest of the
+        // session. Long enough that transient IQ-stream pauses don't
+        // trip it; short enough that cancel_stream is observable.
         stream
             .set_read_timeout(Some(READ_TIMEOUT))
             .map_err(|e| SdrError::RtlTcpIo {
