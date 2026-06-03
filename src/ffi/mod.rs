@@ -1,4 +1,4 @@
-﻿use crossbeam_channel::{unbounded, Receiver, Sender};
+use crossbeam_channel::{unbounded, Receiver, Sender};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -11,7 +11,7 @@ use crate::sdr::profile::DeviceProfile;
 use crate::sdr::{GainCache, GainCacheEntry, GainCacheKey, IqBus, Sdr, SdrConfig, SdrError, StreamControl};
 
 mod decoder;
-use decoder::DecoderInstance;
+use decoder::{ActiveSession, MAX_PROGRAMS};
 
 // Phase 1: raw FFI bindings for libnrsc5. Consumed by `api` below.
 #[allow(unused)]
@@ -76,11 +76,13 @@ pub enum NrscEvent {
     /// dispatching to the cover-art / traffic-map / weather-map
     /// processors, which all consume on-disk files.
     ///
-    /// `program` is the HD subchannel whose decoder produced this
-    /// event â€” stamped by the per-decoder event-callback tee in
-    /// `spawn_decoder`. Used by the multi-decoder routing layer to
-    /// attribute album art and station logo updates to the correct
-    /// `programs[]` slot.
+    /// `program` is the HD subchannel this LOT belongs to. NOTE:
+    /// libnrsc5 currently hardcodes `program = 0` for LOT events
+    /// (the FFI translation layer passes that through verbatim), so
+    /// app-layer consumers rely on the on-disk filename pattern
+    /// produced by the AAS scratch directory rather than this field.
+    /// Kept for forward-compat with libnrsc5 versions that may tag
+    /// the LOT with a real service / component id.
     LotFile {
         program: u32,
         lot: String,
@@ -186,15 +188,6 @@ impl NrscEvent {
 
 // -- Errors -----------------------------------------------------------
 
-/// Hard cap on the number of concurrently-running decoders against
-/// one shared SDR pipeline. Each decoder is one libnrsc5 session plus
-/// its I/Q feeder thread, so the cost scales linearly; eight covers
-/// every HD Radio station's advertised program count (HD1â€“HD8) with a
-/// margin of safety. Default streaming behavior is single-decoder;
-/// the user opts in to extras via the per-program decode toggle in
-/// the HD grid.
-pub const MAX_DECODERS: usize = 8;
-
 #[derive(Debug, Error)]
 pub enum Nrsc5Error {
     /// libnrsc5 returned a non-zero result from one of its API
@@ -204,23 +197,16 @@ pub enum Nrsc5Error {
     Api(#[from] Nrsc5ApiError),
     #[error("SDR backend error: {0}")]
     Sdr(#[from] SdrError),
-    /// `add_decoder` / `set_active_speaker` called before any
+    /// `set_active_speaker` / `attach_recorder` called before any
     /// `start_piped` succeeded. The shared SDR + IqBus pipeline
-    /// must be running before per-program decoders can be added.
+    /// must be running.
     #[error("no piped session is active (call start_piped first)")]
     NotStarted,
-    /// `add_decoder(program)` called for a program that's already
-    /// being decoded. Idempotent failure â€” nothing was changed.
-    #[error("program {0} is already being decoded")]
-    DecoderAlreadyActive(u32),
-    /// `add_decoder` called when [`MAX_DECODERS`] are already
-    /// running. Tear one down before adding another.
-    #[error("decoder cap reached ({0} of {1})")]
-    DecoderCapReached(usize, usize),
-    /// `set_active_speaker(program)` referenced a program that
-    /// isn't being decoded. The speaker selection is unchanged.
-    #[error("no decoder is running for program {0}")]
-    NoSuchDecoder(u32),
+    /// `set_active_speaker(program)` / `attach_recorder(program)`
+    /// passed a program number outside 0..=7. The speaker
+    /// selection / recorder attach is unchanged.
+    #[error("program {0} is out of range (valid: 0..=7)")]
+    InvalidProgram(u32),
 }
 
 // -- Process Backend --------------------------------------------------
@@ -238,14 +224,19 @@ enum LastStartMode {
 }
 
 pub struct Nrsc5Process {
-    /// Active decoders for the current piped session (and the single
-    /// entry for the legacy USB / rtl_tcp paths). Empty between
-    /// `stop()` and the next `start*` call. Phase 3 Chunk 3 turned
-    /// this into a `Vec` so multiple HD programs can be decoded in
-    /// parallel against the same SDR pipeline; the public
-    /// `add_decoder` / `remove_decoder` / `set_active_speaker` API
-    /// arrived in the same chunk. Capped at [`MAX_DECODERS`].
-    decoders: Vec<DecoderInstance>,
+    /// Single libnrsc5 session driving the current piped tune.
+    /// `Some` between `start_piped` and `stop`; `None` otherwise.
+    ///
+    /// v0.5.1 collapsed the per-program `Vec<DecoderInstance>` to one
+    /// shared session because `nrsc5_pipe_samples_cu8` already
+    /// decodes every advertised HD subchannel from a single I/Q
+    /// stream and emits `NRSC5_EVENT_AUDIO` / `NRSC5_EVENT_ID3`
+    /// tagged with a `program` field. Running N parallel sessions
+    /// just multiplied CPU/memory cost N times for the same audio.
+    /// PCM is demuxed in the session's audio callback into one
+    /// [`PcmRing`] per program (0..=7); the speaker router picks
+    /// whichever ring matches `active_speaker`.
+    session: Option<ActiveSession>,
     /// I/Q **source** pump thread for the piped-SDR path. `Some`
     /// only while a piped Start is active; cleared by `stop`. Runs
     /// `sdr.run_stream`, feeds the spectrum tap, and publishes each
@@ -348,12 +339,8 @@ pub struct Nrsc5Process {
     /// without the caller having to re-supply the connection details.
     last_remote: Option<(String, u16)>,
     /// Frequency in MHz that was passed to the most recent
-    /// `start_piped`. Preserved across `stop()` so `add_decoder`
-    /// (which doesn't take a frequency arg â€” it inherits from the
-    /// already-running SDR) can pass it through to libnrsc5's
-    /// `set_frequency_hz`, keeping station-info events from
-    /// secondary decoders reporting the right value. `None` until
-    /// the first piped Start.
+    /// `start_piped`. Preserved across `stop()` for `retune`
+    /// convenience. `None` until the first piped Start.
     last_frequency_mhz: Option<f32>,
     /// Per-frequency gain cache (Phase 3 of the v0.4.0 AGC overhaul).
     /// Loaded once at `Nrsc5Process::new` from
@@ -524,7 +511,7 @@ impl Nrsc5Process {
             None => GainCache::new(),
         };
         Ok(Self {
-            decoders: Vec::new(),
+            session: None,
             iq_thread: None,
             iq_bus: None,
             audio_sink: None,
@@ -573,10 +560,10 @@ impl Nrsc5Process {
     /// spawned so we never have two routers competing for the sink.
     pub fn set_audio_sink(&mut self, sink: crate::audio::AudioSink) {
         // Shut down any pre-existing router first; safe even when
-        // mid-stream because the router only forwards samples â€” the
-        // decoder rings stay alive on the live `DecoderInstance` and
-        // the new router will pick them up via fresh `AddDecoder`
-        // commands on the next `start_piped`.
+        // mid-stream because the router only forwards samples. The
+        // active session's PCM rings stay alive on `ActiveSession`
+        // and the new router will pick them up via fresh
+        // `AddDecoder` commands on the next `start_piped`.
         if let Some(mut prev) = self.speaker_router.take() {
             prev.shutdown();
         }
@@ -585,43 +572,57 @@ impl Nrsc5Process {
     }
 
     // ---------------------------------------------------------------
-    // Multi-decoder API (Phase 3 Chunk 3)
+    // Per-program audio API (v0.5.1: single-session-per-tune)
     //
-    // `start_piped` brings up the shared SDR + IqBus + speaker router
-    // and spawns the first decoder. Callers can then add up to
-    // [`MAX_DECODERS`] additional decoders against the same SDR via
-    // `add_decoder`, switch which one is audible via
-    // `set_active_speaker`, and tear individual ones down via
-    // `remove_decoder`. `stop()` always tears down everything.
+    // `start_piped` brings up the shared SDR + IqBus, then spawns
+    // one libnrsc5 session that decodes every advertised HD
+    // subchannel. The session's audio callback demuxes PCM by
+    // `program` into eight pre-registered rings (HD1..HD8); the
+    // speaker router picks whichever ring matches the active
+    // speaker. Callers switch speakers via `set_active_speaker` and
+    // start/stop Opus recording on any program via
+    // `attach_recorder` / `detach_recorder`. `stop()` tears the
+    // whole session down.
     //
-    // The legacy USB and rtl_tcp paths (`start` / `start_rtltcp`) are
-    // single-decoder only; calling `add_decoder` against them returns
-    // `Nrsc5Error::NotStarted` because there's no IqBus to subscribe
-    // a new decoder to.
+    // `is_decoding(program)` reflects whether libnrsc5 has emitted
+    // an `AudioStarted` event for that program in the current
+    // session (i.e. the subchannel is actually advertised and
+    // streaming, not just speculatively wired). `is_streaming()`
+    // reflects whether the session pipeline itself is up.
     // ---------------------------------------------------------------
 
-    /// Programs currently being decoded, in spawn order. Cheap; the
-    /// returned Vec is freshly allocated and owned by the caller. The
-    /// GUI calls this every frame to drive the HD1-HD8 grid's
-    /// "decoded" indicators.
+    /// Programs that have produced at least one PCM frame in the
+    /// current session, in ascending order. The HD grid uses this
+    /// to drive the "decoded" indicator and the play log gates
+    /// audio-start events on it. Returns an empty Vec between
+    /// `stop()` and the next `start_piped`.
     pub fn decoded_programs(&self) -> Vec<u32> {
-        self.decoders.iter().map(|d| d.program).collect()
+        let Some(session) = self.session.as_ref() else {
+            return Vec::new();
+        };
+        (0..MAX_PROGRAMS as u32)
+            .filter(|p| session.audio_started[*p as usize].load(Ordering::Relaxed))
+            .collect()
     }
 
-    /// Number of decoders currently running against the shared SDR
-    /// pipeline. Used by the soft-cap gate in `app.rs` to refuse
-    /// further `add_decoder` calls once the user-configured ceiling
-    /// is reached; the FFI layer's own [`MAX_DECODERS`] hard cap is
-    /// always enforced inside [`add_decoder`].
-    pub fn decoder_count(&self) -> usize {
-        self.decoders.len()
-    }
-
-    /// Whether `program` is currently being decoded against the
-    /// shared SDR pipeline. O(N) over the small `decoders` vec
-    /// (capped at [`MAX_DECODERS`]).
+    /// Whether `program` has produced at least one PCM frame in the
+    /// current session. Cheap (a single atomic load) so callers can
+    /// poll it every frame. Returns `false` when no session is
+    /// active or when `program` is out of range.
     pub fn is_decoding(&self, program: u32) -> bool {
-        self.decoders.iter().any(|d| d.program == program)
+        let Some(session) = self.session.as_ref() else {
+            return false;
+        };
+        (program as usize) < MAX_PROGRAMS
+            && session.audio_started[program as usize].load(Ordering::Relaxed)
+    }
+
+    /// Whether the shared decode pipeline is up. `true` between
+    /// `start_piped` and `stop`. Recording / speaker-switch / play-log
+    /// gates that just care "is the system running" use this rather
+    /// than `is_decoding`, which is per-subchannel.
+    pub fn is_streaming(&self) -> bool {
+        self.session.is_some()
     }
 
     /// Program whose decoded PCM is currently routed to the
@@ -630,123 +631,20 @@ impl Nrsc5Process {
         self.active_speaker
     }
 
-    /// Spawn an additional decoder for `program` against the
-    /// currently-running shared SDR pipeline. The decoder subscribes
-    /// to the IqBus, gets its own PCM ring registered with the
-    /// speaker router, and starts producing events on the shared
-    /// `events()` channel just like the first decoder did.
-    ///
-    /// Does **not** change the active speaker â€” call
-    /// `set_active_speaker(program)` afterwards to listen to it. The
-    /// new decoder runs silently in the background until then; its
-    /// PCM ring is drained-and-discarded by the router, which keeps
-    /// CPU steady but doesn't ship samples to the cpal sink.
+    /// Route `program`'s decoded PCM to the speakers. The previous
+    /// active speaker (if any) stays decoded in the background; its
+    /// ring is drained-and-discarded by the router.
     ///
     /// Errors:
-    /// * [`Nrsc5Error::NotStarted`] â€” no piped session is active.
-    /// * [`Nrsc5Error::DecoderAlreadyActive`] â€” `program` is already
-    ///   being decoded; idempotent (no state changed).
-    /// * [`Nrsc5Error::DecoderCapReached`] â€” already at
-    ///   [`MAX_DECODERS`]; tear one down first.
-    /// * [`Nrsc5Error::Api`] â€” libnrsc5 refused to open or configure
-    ///   the new session.
-    pub fn add_decoder(&mut self, program: u32) -> Result<(), Nrsc5Error> {
-        // Validate the shared pipeline is up and we have headroom.
-        if self.iq_bus.is_none() {
+    /// * [`Nrsc5Error::NotStarted`] when no piped session is active.
+    /// * [`Nrsc5Error::InvalidProgram`] when `program` is outside
+    ///   `0..=7`.
+    pub fn set_active_speaker(&mut self, program: u32) -> Result<(), Nrsc5Error> {
+        if !self.is_streaming() {
             return Err(Nrsc5Error::NotStarted);
         }
-        if self.is_decoding(program) {
-            return Err(Nrsc5Error::DecoderAlreadyActive(program));
-        }
-        if self.decoders.len() >= MAX_DECODERS {
-            return Err(Nrsc5Error::DecoderCapReached(
-                self.decoders.len(),
-                MAX_DECODERS,
-            ));
-        }
-
-        // Inherit the frequency that `start_piped` was called with so
-        // the secondary session's station-info events report the same
-        // tune. Defaults to 0.0 in the rare case `start_piped` hasn't
-        // been called (impossible given the `iq_bus.is_none()` check
-        // above, but the field is `Option`-typed so handle it).
-        let frequency_mhz = self.last_frequency_mhz.unwrap_or(0.0);
-
-        // Additional decoders share the same IqBus; AGC is fed
-        // centrally from `Nrsc5Process::forward_event_to_agc`, so
-        // no per-decoder agc handle is needed here.
-        let bus = self
-            .iq_bus
-            .as_ref()
-            .expect("iq_bus is_some, checked above")
-            .clone();
-        let decoder = self.spawn_decoder(program, &bus, frequency_mhz)?;
-
-        // Register the new ring with the router. Do NOT auto-activate
-        // it as speaker â€” caller decides via `set_active_speaker`.
-        if let (Some(router), Some(ring)) =
-            (self.speaker_router.as_ref(), decoder.pcm_ring.as_ref())
-        {
-            let _ = router.cmd_tx().send(crate::audio::SpeakerCmd::AddDecoder {
-                program,
-                ring: Arc::clone(ring),
-            });
-        }
-
-        self.decoders.push(decoder);
-        Ok(())
-    }
-
-    /// Tear down the decoder for `program`. Idempotent â€” returns
-    /// `false` when no decoder was running for that program.
-    ///
-    /// If the removed decoder was the active speaker, the speaker
-    /// goes silent until the next `set_active_speaker` call. The
-    /// shared SDR pipeline stays running; call `stop()` for a full
-    /// teardown.
-    pub fn remove_decoder(&mut self, program: u32) -> bool {
-        let Some(idx) = self.decoders.iter().position(|d| d.program == program) else {
-            return false;
-        };
-        let DecoderInstance {
-            program,
-            feeder_thread,
-            shutdown_tx,
-            pcm_ring,
-        } = self.decoders.remove(idx);
-
-        // Detach this program's ring from the speaker router so the
-        // router stops draining a soon-to-be-dropped ring. Idempotent
-        // on the router's side. The ring itself is dropped when
-        // `pcm_ring` goes out of scope at the end of this block.
-        if let Some(router) = self.speaker_router.as_ref() {
-            let _ = router
-                .cmd_tx()
-                .send(crate::audio::SpeakerCmd::RemoveDecoder(program));
-        }
-        if Some(program) == self.active_speaker {
-            self.active_speaker = None;
-        }
-        let _ = pcm_ring;
-
-        // Drop the per-decoder shutdown sender to wake the feeder
-        // thread's `select!`. The feeder breaks its loop, drops its
-        // owned `Nrsc5Session` (which runs `nrsc5_stop` +
-        // `nrsc5_close` to join libnrsc5's worker), and emits the
-        // final `ChildExited` event. The join below is fast
-        // (typically <10 ms â€” bounded by `nrsc5_close` worker join).
-        drop(shutdown_tx);
-        let _ = feeder_thread.join();
-        true
-    }
-
-    /// Route `program`'s decoded PCM to the speakers. The previous
-    /// active speaker (if any) stays decoding in the background â€”
-    /// its ring is drained-and-discarded by the router. Returns
-    /// `NoSuchDecoder` if `program` isn't currently being decoded.
-    pub fn set_active_speaker(&mut self, program: u32) -> Result<(), Nrsc5Error> {
-        if !self.is_decoding(program) {
-            return Err(Nrsc5Error::NoSuchDecoder(program));
+        if (program as usize) >= MAX_PROGRAMS {
+            return Err(Nrsc5Error::InvalidProgram(program));
         }
         if let Some(router) = self.speaker_router.as_ref() {
             let _ = router
@@ -766,20 +664,27 @@ impl Nrsc5Process {
     /// Attach an Opus recorder tap to `program`'s PCM stream. The
     /// recorder receives a clone of every chunk the `SpeakerRouter`
     /// drains from `program`'s ring, independent of which subchannel
-    /// is currently on the speakers â€” so the user can listen to HD2
-    /// while recording HD1, or vice versa. Returns `NoSuchDecoder` if
-    /// `program` isn't currently being decoded (a recorder against a
-    /// dead decoder would just produce a zero-byte file). The tap is
-    /// last-writer-wins: attaching twice to the same program drops
-    /// the previous recorder cleanly (its forwarder sees the closed
-    /// channel and flushes the file).
+    /// is currently on the speakers, so the user can listen to HD2
+    /// while recording HD1, or vice versa.
+    ///
+    /// The tap is last-writer-wins: attaching twice to the same
+    /// program drops the previous recorder cleanly (its forwarder
+    /// sees the closed channel and flushes the file).
+    ///
+    /// Errors:
+    /// * [`Nrsc5Error::NotStarted`] when no piped session is active.
+    /// * [`Nrsc5Error::InvalidProgram`] when `program` is outside
+    ///   `0..=7`.
     pub fn attach_recorder(
         &mut self,
         program: u32,
         tap: crossbeam_channel::Sender<Vec<i16>>,
     ) -> Result<(), Nrsc5Error> {
-        if !self.is_decoding(program) {
-            return Err(Nrsc5Error::NoSuchDecoder(program));
+        if !self.is_streaming() {
+            return Err(Nrsc5Error::NotStarted);
+        }
+        if (program as usize) >= MAX_PROGRAMS {
+            return Err(Nrsc5Error::InvalidProgram(program));
         }
         if let Some(router) = self.speaker_router.as_ref() {
             let _ = router
@@ -792,7 +697,7 @@ impl Nrsc5Process {
     /// Detach the Opus recorder tap (if any) from `program`. After
     /// this returns the recorder thread sees a closed forwarder
     /// channel, sends itself a Stop, encodes any leftover frames,
-    /// and writes the Ogg EOS page. Idempotent â€” safe to call when
+    /// and writes the Ogg EOS page. Idempotent: safe to call when
     /// no tap is attached.
     pub fn detach_recorder(&mut self, program: u32) {
         if let Some(router) = self.speaker_router.as_ref() {
@@ -1005,27 +910,30 @@ impl Nrsc5Process {
         None
     }
 
-    /// Internal helper: open one `Nrsc5Session`, install event +
-    /// PCM callbacks, start it, and spawn the I/Q feeder thread that
-    /// owns the session for its lifetime. Used by both `start_piped`
-    /// (the first decoder) and `add_decoder` (additional decoders
-    /// against the same shared IqBus). Returns the populated
-    /// [`DecoderInstance`] ready to be pushed into `self.decoders`.
+    /// Build the single libnrsc5 session that drives the current
+    /// piped tune, demux its multi-program PCM output into per-
+    /// program rings, and spawn the I/Q feeder thread that pumps
+    /// samples from the shared bus into it. Returns an
+    /// [`ActiveSession`] ready to be assigned to `self.session`.
+    /// Used by `start_piped` only.
     ///
     /// The event callback runs on libnrsc5's worker thread, so it
     /// must be `Send + Sync + 'static`; this is enforced at the
-    /// closure type. AGC routing is NOT done here — see
+    /// closure type. AGC routing is NOT done here, see
     /// [`Nrsc5Process::forward_event_to_agc`] for the central tee.
-    /// The PCM sink filters by program so a session that happens to
-    /// decode multiple programs only delivers the expected
-    /// subchannel's audio to this decoder's ring (matches the
-    /// previous nrsc5.exe `-r - <program>` filter behavior).
-    fn spawn_decoder(
+    ///
+    /// The PCM callback demuxes by libnrsc5's per-chunk `program`
+    /// field into one of `MAX_PROGRAMS` rings; the speaker router
+    /// picks whichever ring matches the active speaker. Allocating
+    /// all eight rings upfront (whether or not the station
+    /// advertises that subchannel) is cheap and simplifies the
+    /// register-with-router code in [`start_piped`] (one fan-out
+    /// loop, no later "decoder added" path).
+    fn spawn_session(
         &self,
-        program: u32,
         iq_bus: &Arc<IqBus>,
         frequency_mhz: f32,
-    ) -> Result<DecoderInstance, Nrsc5Error> {
+    ) -> Result<ActiveSession, Nrsc5Error> {
         // Build + configure the session. All configuration calls must
         // precede `start`; the session moves into the feeder thread
         // immediately after `start`, so this is the only chance.
@@ -1033,68 +941,57 @@ impl Nrsc5Process {
         session.set_mode(Mode::Fm)?;
         session.set_frequency_hz(frequency_mhz * 1_000_000.0)?;
 
-        // Event callback. Two jobs:
-        //   1. Rewrite events that carry a stale `program` field
-        //      (`LotFile`) so the per-decoder routing layer sees the
-        //      right subchannel. libnrsc5's LOT events don't carry a
-        //      program identifier; api.rs hardcodes 0 as a placeholder.
-        //   2. Forward the (possibly rewritten) event to the shared
-        //      `self.tx` channel for the app's event-loop consumer.
+        // Event callback: forward every libnrsc5 event verbatim to
+        // the shared `self.tx` channel. Events already carry their
+        // own `program` field where it matters (Id3, Lot, AudioBitrate
+        // statistics, etc.); the v0.5.1 single-session design relies
+        // on that tagging rather than rewriting events on the way out.
         //
-        // AGC tee used to live here, gated on `agc_handle.is_some()`
-        // for the primary decoder only. That broke when the primary
-        // decoder was disabled via `SetDecoderEnabled` or when the
-        // user started on a non-HD1 program. The AGC controller is
-        // station-wide signal quality, not per-program, so the tee
-        // moved to the central event dispatch in `app.rs` via
-        // [`Nrsc5Process::forward_event_to_agc`].
+        // AGC tee used to live here, gated on `agc_handle.is_some()`,
+        // but the AGC controller is station-wide signal quality (not
+        // per-program), so the tee moved to the central event dispatch
+        // in `app.rs` via [`Nrsc5Process::forward_event_to_agc`].
         let event_tx = self.tx.clone();
         session.set_event_callback(move |ev| {
-            // Rewrite events that need this decoder's program number.
-            let ev = match ev {
-                NrscEvent::LotFile { program: _, lot, name, data } => {
-                    NrscEvent::LotFile { program, lot, name, data }
-                }
-                other => other,
-            };
             let _ = event_tx.send(ev);
         })?;
 
-        // PCM sink. Allocates the per-decoder ring buffer and pushes
-        // every decoded chunk into it (filtered by program â€” see
-        // module doc on multi-program sessions). Also emits the
-        // one-shot `AudioStarted` event on the first chunk so the
-        // app's "audio started in Xs" status message fires at the
-        // moment audio actually begins flowing rather than when
-        // libnrsc5 first logs a bit-rate line.
-        //
-        // `audio_sink_installed` controls whether we allocate a ring
-        // at all: in headless tests there's no sink to drain into, so
-        // we skip both the ring and the PCM callback (libnrsc5 still
-        // decodes audio internally but nothing observes it).
-        let audio_sink_installed = self.audio_sink.is_some();
-        let pcm_ring = if audio_sink_installed {
-            Some(Arc::new(crate::audio::PcmRing::new()))
-        } else {
-            None
-        };
-        if let Some(ring) = pcm_ring.as_ref() {
-            let ring_for_cb = Arc::clone(ring);
-            let audio_started_flag = Arc::new(AtomicBool::new(false));
-            let audio_started_tx = self.tx.clone();
-            session.set_pcm_sink(move |pcm_program, samples| {
-                // libnrsc5 decodes ALL programs present in the signal.
-                // Filter to the one this decoder claims so multiple
-                // decoders on the same SDR don't fight over rings.
-                if pcm_program != program {
-                    return;
-                }
-                if !audio_started_flag.swap(true, Ordering::Relaxed) {
-                    let _ = audio_started_tx.send(NrscEvent::AudioStarted { program });
-                }
-                ring_for_cb.push(samples);
-            })?;
-        }
+        // Build the per-program ring + audio-started-flag arrays. In
+        // headless tests there's no audio sink, so we skip the rings
+        // entirely; libnrsc5 still decodes audio internally but
+        // nothing observes it. The `audio_started` flags stay live
+        // either way so `decoded_programs()` / `is_decoding()` still
+        // reflect what's on the air.
+        let audio_started: [Arc<AtomicBool>; MAX_PROGRAMS] = std::array::from_fn(|_| {
+            Arc::new(AtomicBool::new(false))
+        });
+
+        let rings: Option<[Arc<crate::audio::PcmRing>; MAX_PROGRAMS]> =
+            if self.audio_sink.is_some() {
+                Some(std::array::from_fn(|_| Arc::new(crate::audio::PcmRing::new())))
+            } else {
+                None
+            };
+
+        // PCM callback. libnrsc5 emits one chunk per audio frame
+        // tagged with a `program` field (0..=7). We route into the
+        // matching ring and emit a one-shot `AudioStarted` event the
+        // first time each program produces samples.
+        let pcm_tx = self.tx.clone();
+        let pcm_audio_started = audio_started.clone();
+        let pcm_rings = rings.clone();
+        session.set_pcm_sink(move |pcm_program, samples| {
+            let idx = pcm_program as usize;
+            if idx >= MAX_PROGRAMS {
+                return;
+            }
+            if !pcm_audio_started[idx].swap(true, Ordering::Relaxed) {
+                let _ = pcm_tx.send(NrscEvent::AudioStarted { program: pcm_program });
+            }
+            if let Some(rs) = pcm_rings.as_ref() {
+                rs[idx].push(samples);
+            }
+        })?;
 
         // Start the worker thread inside libnrsc5. After this call
         // returns, the event + PCM callbacks may fire at any time
@@ -1102,9 +999,10 @@ impl Nrsc5Process {
         session.start();
 
         // Subscribe to the shared bus before we hand the session off
-        // to the feeder thread. Capacity 64 â‰ˆ 100 ms of buffer at
-        // 1.488 Msps CS16 in ~4 KB chunks â€” enough to absorb consumer
-        // scheduling jitter without back-pressuring the SDR.
+        // to the feeder thread. Capacity 64 covers ~100 ms of
+        // buffering at 1.488 Msps CS16 in ~4 KB chunks: enough to
+        // absorb consumer scheduling jitter without back-pressuring
+        // the SDR.
         let bus_rx = iq_bus.subscribe(64);
         let (shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<()>(1);
         let child_exit_tx = self.tx.clone();
@@ -1125,7 +1023,7 @@ impl Nrsc5Process {
                                 if session.pipe_samples_cu8(&payload).is_err() {
                                     // libnrsc5 refused the chunk (e.g.
                                     // after an internal `nrsc5_stop`).
-                                    // Treat it as terminal â€” the loop
+                                    // Treat it as terminal: the loop
                                     // exits and the session drops.
                                     break 'pump;
                                 }
@@ -1137,28 +1035,26 @@ impl Nrsc5Process {
                         }
                     }
                     recv(shutdown_rx) -> _ => {
-                        // Per-decoder remove: `shutdown_tx` was
-                        // dropped from the outside (`remove_decoder`).
+                        // `stop()` dropped `shutdown_tx`.
                         break 'pump;
                     }
                 }
             }
             // Explicit drop so the order is obvious from the source:
-            // session â†’ nrsc5_stop â†’ nrsc5_close â†’ free callback ctx.
+            // session -> nrsc5_stop -> nrsc5_close -> free callback ctx.
             drop(session);
-            // Notify the app that this decoder ended. The app's
-            // `ChildExited` handler treats it as pipeline-fatal only
-            // when no other decoders survive, so the `stop()` path
-            // and `remove_decoder` both produce this event without
-            // spurious "device lost" status changes.
+            // Notify the app that the session ended. The app's
+            // `ChildExited` handler treats it as pipeline-fatal so
+            // `stop()` and a libnrsc5 failure produce the same UI
+            // status transition.
             let _ = child_exit_tx.send(NrscEvent::ChildExited);
         });
 
-        Ok(DecoderInstance {
-            program,
+        Ok(ActiveSession {
             feeder_thread,
             shutdown_tx,
-            pcm_ring,
+            rings,
+            audio_started,
         })
     }
 
@@ -1184,6 +1080,9 @@ impl Nrsc5Process {
         manual_gain_tenths: i32,
         antenna: Option<String>,
     ) -> Result<(), Nrsc5Error> {
+        if (program as usize) >= MAX_PROGRAMS {
+            return Err(Nrsc5Error::InvalidProgram(program));
+        }
         self.stop();
         while self.rx.try_recv().is_ok() {}
 
@@ -1384,27 +1283,23 @@ impl Nrsc5Process {
         let _ = cache_hit_logged; // diagnostic side effect already emitted
 
         // I/Q fan-out bus. One producer (the SDR pump thread spawned
-        // below), zero-N consumers (decoders subscribe inside
-        // `spawn_decoder`). Built first so the decoder spawned next
-        // can subscribe before the SDR thread starts publishing.
+        // below), one consumer (the libnrsc5 feeder thread spawned in
+        // `spawn_session`). Built first so the session can subscribe
+        // before the SDR thread starts publishing.
         let bus = Arc::new(IqBus::new());
 
-        // Spawn the first decoder. Owns the libnrsc5 session + the
-        // feeder thread that pumps I/Q from `bus` into it. The event
-        // callback forwards every translated event to `self.tx`.
-        // AGC tee happens centrally in
-        // [`Nrsc5Process::forward_event_to_agc`], not here. The PCM
-        // callback pushes decoded samples into a fresh `PcmRing`
-        // attached to the returned `DecoderInstance.pcm_ring`.
-        let decoder = self.spawn_decoder(program, &bus, frequency_mhz)?;
-        let pcm_ring = decoder.pcm_ring.clone();
+        // Spawn the single libnrsc5 session for this tune. It owns
+        // the session, the per-program PCM rings, and the feeder
+        // thread that pumps I/Q from `bus` into it. Event + PCM
+        // callbacks fire on libnrsc5's worker thread and forward
+        // through `self.tx` (events) or per-program rings (PCM).
+        let session = self.spawn_session(&bus, frequency_mhz)?;
 
         // I/Q source pump. Runs `run_stream`, feeds the spectrum tap,
         // and publishes raw bytes onto the bus. On exit (clean
-        // cancel, USB unplug, etc.) calls `bus.shutdown()` so every
-        // subscriber (the feeder thread above, plus any extra
-        // decoders added via `add_decoder`) sees `Disconnected` on
-        // `recv` and exits cleanly.
+        // cancel, USB unplug, etc.) calls `bus.shutdown()` so the
+        // session's feeder thread sees `Disconnected` on `recv` and
+        // exits cleanly.
         let sdr_for_thread: Arc<dyn Sdr> = Arc::clone(&sdr);
         let bus_for_sdr = Arc::clone(&bus);
         let evt_tx = self.tx.clone();
@@ -1449,28 +1344,34 @@ impl Nrsc5Process {
             }
         });
 
-        // Hand the new ring to the speaker router and make this
-        // decoder the active speaker. Both commands are sent over
-        // the long-lived command channel set up in `set_audio_sink`;
-        // the router applies them on its next tick. Skipped when no
-        // audio sink is installed (no router, no ring). Also drop
-        // any audio currently queued in the cpal sink so the next
-        // Start doesn't replay a fraction of a second of stale audio
-        // from the previous session.
-        if let (Some(router), Some(ring)) = (self.speaker_router.as_ref(), pcm_ring.as_ref()) {
+        // Register all eight per-program rings with the speaker
+        // router upfront and pick `program` as the active speaker.
+        // The router will silently drain any program that never
+        // gets PCM, so wiring all eight is harmless and means a
+        // later `set_active_speaker(2)` switch is a single command
+        // rather than a register-then-activate dance. Skipped when
+        // no audio sink is installed (no router, no rings). Also
+        // clear any audio currently queued in the cpal sink so the
+        // next Start doesn't replay stale audio from the previous
+        // session.
+        if let (Some(router), Some(rings)) =
+            (self.speaker_router.as_ref(), session.rings.as_ref())
+        {
             if let Some(sink) = self.audio_sink.as_ref() {
                 sink.clear();
             }
             let tx = router.cmd_tx();
-            let _ = tx.send(crate::audio::SpeakerCmd::AddDecoder {
-                program,
-                ring: Arc::clone(ring),
-            });
+            for (p, ring) in rings.iter().enumerate() {
+                let _ = tx.send(crate::audio::SpeakerCmd::AddDecoder {
+                    program: p as u32,
+                    ring: Arc::clone(ring),
+                });
+            }
             let _ = tx.send(crate::audio::SpeakerCmd::SetActive(program));
             self.active_speaker = Some(program);
         }
 
-        self.decoders.push(decoder);
+        self.session = Some(session);
         self.iq_thread = Some(iq_thread);
         self.iq_bus = Some(bus);
         self.sdr = Some(sdr);
@@ -1682,65 +1583,59 @@ impl Nrsc5Process {
         if let Some(handle) = self.iq_thread.take() {
             let _ = handle.join();
         }
-        // Tear down every running decoder. With multi-decode active
-        // there can be more than one (the user may have opted in to
-        // extras via `add_decoder`). The shared SDR pump above has
-        // already called `bus.shutdown()`, so every decoder's feeder
-        // thread has woken from its `select!` with `Err(RecvError)`
-        // on the bus arm and is about to exit. Dropping
-        // `shutdown_tx` here is idempotent (the bus path already
-        // tripped the feeder); we do it anyway so the teardown is
-        // robust to the rare case where the bus shutdown raced with
-        // a manual `set_active_speaker` / similar.
+        // Tear down the per-tune session. The shared SDR pump above
+        // has already called `bus.shutdown()`, so the session's
+        // feeder thread has woken from its `select!` with
+        // `Err(RecvError)` on the bus arm and is about to exit.
+        // Dropping `shutdown_tx` here is idempotent (the bus path
+        // already tripped the feeder); we do it anyway so the
+        // teardown is robust to the rare case where the bus
+        // shutdown raced with a manual call.
         //
         // The session itself drops inside the feeder thread, which
         // runs `nrsc5_stop` + `nrsc5_close` to join libnrsc5's
         // worker before this `join()` returns.
-        let drained: Vec<DecoderInstance> = self.decoders.drain(..).collect();
-        let any_decoder = !drained.is_empty();
-        for decoder in drained {
-            let DecoderInstance {
-                program,
+        let had_session = self.session.is_some();
+        if let Some(session) = self.session.take() {
+            let ActiveSession {
                 feeder_thread,
                 shutdown_tx,
-                pcm_ring,
-            } = decoder;
-            // Detach this program's ring from the speaker router so
-            // the router stops draining samples from a soon-to-be-
-            // dropped ring. Idempotent on the router's side. The
-            // ring itself is dropped when `pcm_ring` goes out of
-            // scope at the end of this block.
+                rings,
+                audio_started: _,
+            } = session;
+            // Detach every per-program ring from the speaker router
+            // so it stops draining samples from soon-to-be-dropped
+            // rings. Idempotent on the router's side. The rings
+            // themselves drop when `rings` goes out of scope.
             if let Some(router) = self.speaker_router.as_ref() {
-                let _ = router.cmd_tx().send(
-                    crate::audio::SpeakerCmd::RemoveDecoder(program),
-                );
+                let tx = router.cmd_tx();
+                for p in 0..MAX_PROGRAMS as u32 {
+                    let _ = tx.send(crate::audio::SpeakerCmd::RemoveDecoder(p));
+                }
             }
-            if Some(program) == self.active_speaker {
-                self.active_speaker = None;
-            }
-            let _ = pcm_ring;
-            // Drop the per-decoder shutdown sender + join the feeder
-            // thread. The bus is already shut down so the feeder is
-            // either at or near exit; this just waits for the
+            self.active_speaker = None;
+            let _ = rings;
+            // Drop the shutdown sender + join the feeder thread.
+            // The bus is already shut down so the feeder is either
+            // at or near exit; this just waits for the
             // `nrsc5_close` inside the feeder's `drop(session)` to
             // join the worker thread.
             drop(shutdown_tx);
             let _ = feeder_thread.join();
         }
-        // Bus is single-use per stream â€” drop it so a stale
+        // Bus is single-use per stream: drop it so a stale
         // reference isn't carried into the next `start_piped`
         // (which builds a fresh bus).
         self.iq_bus = None;
         // Discard any PCM still sitting in the cpal queue so the
         // next Start doesn't replay a fraction of a second of stale
-        // audio. The per-decoder rings are dropped above when their
-        // `pcm_ring` Arcs go out of scope.
-        if any_decoder {
+        // audio. The per-program rings are dropped above when the
+        // session's `rings` array goes out of scope.
+        if had_session {
             if let Some(sink) = self.audio_sink.as_ref() {
                 sink.clear();
             }
-        }
-        // Drop the SDR last â€” all Arc clones (the one held by
+        }        // Drop the SDR last â€” all Arc clones (the one held by
         // iq_thread is already gone) are released, refcount hits zero,
         // and `RtlSdr::Drop` runs `rtlsdr_close`. Safe on the modern
         // osmocom librtlsdr.dll (â‰¥ 2022-01).

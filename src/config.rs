@@ -154,23 +154,6 @@ pub struct AppConfig {
     /// station with the MP11 partition.
     #[serde(default)]
     pub show_hd5_hd8: bool,
-    /// When true, every subchannel advertised by SIS gets a
-    /// background decoder spawned automatically as soon as it shows
-    /// up in the station info table. Off by default — most users
-    /// only want HD1 streaming, and an MP3 station with four
-    /// advertised programs would otherwise pin 3× the per-decoder
-    /// CPU as soon as you tune. Persisted so power users who do
-    /// want all subchannels always-on can set it once.
-    #[serde(default)]
-    pub auto_decode_all_advertised: bool,
-    /// Soft cap on simultaneously running decoders. Range clamped to
-    /// 1..=[`crate::ffi::MAX_DECODERS`] at apply time. Each extra
-    /// decoder is roughly one extra CPU core; the default 4 covers
-    /// most stations (HD1–HD4) without saturating a typical 4-core
-    /// laptop, but power users on big iron can raise it to 8 to
-    /// decode every MP11-partition subchannel at once.
-    #[serde(default = "default_max_concurrent_decoders")]
-    pub max_concurrent_decoders: u32,
     /// Number of preset slots rendered on the Tuner panel. Range is
     /// clamped to 1..=48 at apply time so a hand-edited config can't
     /// blow up the layout. Default 6 matches the original hardcoded
@@ -420,14 +403,6 @@ fn default_preset_slot_count() -> u32 {
     6
 }
 
-/// Soft cap on simultaneous decoders. Chosen to keep a typical 4-core
-/// laptop usable while still allowing HD1\u2013HD4 to all decode at once.
-/// Hard ceiling is [`crate::ffi::MAX_DECODERS`]; the UI clamps user
-/// input to that range.
-fn default_max_concurrent_decoders() -> u32 {
-    4
-}
-
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
@@ -455,8 +430,6 @@ impl Default for AppConfig {
             play_log_retention_hours: 24,
             sdr: SdrConfigSection::default(),
             show_hd5_hd8: false,
-            auto_decode_all_advertised: false,
-            max_concurrent_decoders: default_max_concurrent_decoders(),
             preset_slot_count: default_preset_slot_count(),
             recording_mode: RecordingMode::Off,
             recording_dir: None,

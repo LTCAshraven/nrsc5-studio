@@ -1,6 +1,6 @@
 [package]
 name = "nrsc5-studio"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2021"
 authors = ["LTCAshraven"]
 license = "MIT"
@@ -145,7 +145,6 @@ priority = "optional"
 # `$auto` resolves libc / libstdc++ / libgcc-s / libgl / libxkbcommon /
 # libwayland / libX11 / dbus etc. from the ELF NEEDED entries.
 depends = "$auto, libsoapysdr0.8, librtlsdr0, libasound2"
-recommends = "nrsc5"
 # Debian-format changelog. cargo-deb gzips and installs as changelog.Debian.gz.
 changelog = "packaging/debian/changelog"
 assets = [
@@ -166,8 +165,6 @@ assets = [
     ["packaging/linux/icons/hicolor/64x64/apps/nrsc5-studio.png", "usr/share/icons/hicolor/64x64/apps/nrsc5-studio.png", "644"],
     ["packaging/linux/icons/hicolor/128x128/apps/nrsc5-studio.png", "usr/share/icons/hicolor/128x128/apps/nrsc5-studio.png", "644"],
     ["packaging/linux/icons/hicolor/256x256/apps/nrsc5-studio.png", "usr/share/icons/hicolor/256x256/apps/nrsc5-studio.png", "644"],
-    # Bundled nrsc5 helper installer (user runs it once post-install)
-    ["scripts/install-nrsc5-helper.sh", "usr/share/nrsc5-studio/install-nrsc5-helper.sh", "755"],
     # US base map used by the weather radar overlay processor. Without
     # this file `WeatherMap::make_base_map` never produces a cropped
     # basemap and every DWRO overlay is dropped silently.
@@ -196,8 +193,6 @@ assets = [
     { source = "packaging/linux/icons/hicolor/64x64/apps/nrsc5-studio.png", dest = "/usr/share/icons/hicolor/64x64/apps/nrsc5-studio.png", mode = "644" },
     { source = "packaging/linux/icons/hicolor/128x128/apps/nrsc5-studio.png", dest = "/usr/share/icons/hicolor/128x128/apps/nrsc5-studio.png", mode = "644" },
     { source = "packaging/linux/icons/hicolor/256x256/apps/nrsc5-studio.png", dest = "/usr/share/icons/hicolor/256x256/apps/nrsc5-studio.png", mode = "644" },
-    # Bundled nrsc5 helper installer
-    { source = "scripts/install-nrsc5-helper.sh", dest = "/usr/share/nrsc5-studio/install-nrsc5-helper.sh", mode = "755" },
     # US base map used by the weather radar overlay processor.
     { source = "res/map.png", dest = "/usr/share/nrsc5-studio/map.png", mode = "644" },
 ]

@@ -12,23 +12,9 @@ pub enum UiCommand {
     Stop,
     TuneMhz(f32),
     SelectProgram(u32),
-    /// Toggle background decoding for an HD subchannel. Drives
-    /// `Nrsc5Process::add_decoder` / `remove_decoder` from the
-    /// iOS-style switches under the HD program buttons. No-op when
-    /// no session is running — the switches render disabled in that
-    /// state so the command shouldn't even arrive then.
-    SetDecoderEnabled(u32, bool),
     /// Show / hide the HD5..HD8 row of the program selector.
     /// Persisted via `AppConfig::show_hd5_hd8`.
     SetShowHd5Hd8(bool),
-    /// Enable / disable the "auto-spawn a decoder for every
-    /// advertised subchannel" reconcile loop. Persisted via
-    /// `AppConfig::auto_decode_all_advertised`.
-    SetAutoDecodeAllAdvertised(bool),
-    /// Set the soft cap on the number of decoders that may run at
-    /// once. Clamped to 1..=[`crate::ffi::MAX_DECODERS`] at apply
-    /// time. Persisted via `AppConfig::max_concurrent_decoders`.
-    SetMaxConcurrentDecoders(u32),
     /// Set how many preset slots the Tuner panel renders. Clamped
     /// to 1..=48 at apply time. Persisted via
     /// `AppConfig::preset_slot_count`.
@@ -667,82 +653,38 @@ impl DockViewer<'_> {
         decoded: &[bool; 8],
         is_streaming: bool,
     ) {
-        use crate::gui::widgets::{toggle_switch, toggle_switch_size};
-
-        // First strip: HD buttons. Allocate inside a horizontal so
-        // egui packs them in a single line; capture each button's
-        // x-center so the toggle row underneath can be positioned to
-        // match. Width is measured by reading back the rect of each
-        // returned response.
-        let mut button_centers_x: Vec<f32> = Vec::with_capacity(4);
+        // v0.5.1 single-session refactor: every advertised
+        // subchannel is decoded automatically by the one libnrsc5
+        // session, so the per-button toggle switches that used to
+        // start / stop background decoders are gone. The row is now
+        // just the four HD buttons; selecting one swaps the speaker.
+        // `decoded` is consulted to keep the button lit even when SIS
+        // hasn't yet advertised the subchannel but PCM is flowing.
+        let _ = is_streaming;
         ui.horizontal(|ui| {
             for col in 0..4u32 {
                 let i = row * 4 + col;
                 let lit = available[i as usize];
+                let on_air = decoded[i as usize];
                 let mut text = RichText::new(format!("HD{}", i + 1));
-                if !lit {
+                if !lit && !on_air {
                     text = text.weak();
                 }
                 let selected = active_idx as u32 == i;
                 let mut resp = ui.selectable_label(selected, text);
-                if !lit {
+                if !lit && !on_air {
                     resp = resp.on_hover_text(
                         "Not advertised by this station. \
                          Click to tune anyway.",
                     );
+                } else if on_air {
+                    resp = resp.on_hover_text("Decoding (audio on air).");
                 }
-                button_centers_x.push(resp.rect.center().x);
                 if resp.clicked() && active_idx as u32 != i {
                     self.commands.push(UiCommand::SelectProgram(i));
                 }
             }
         });
-
-        // Second strip: toggle switches. We allocate the same row
-        // height as the buttons (so the next row of buttons, if any,
-        // lines up underneath) and paint each switch centered on the
-        // matching button's x-center. `ui.put` lets us place a
-        // widget at an explicit rect inside the row's horizontal
-        // strip without breaking egui's auto-layout for everything
-        // else.
-        let switch_size = toggle_switch_size(ui);
-        let (row_rect, _) =
-            ui.allocate_exact_size(Vec2::new(ui.available_width(), switch_size.y), egui::Sense::hover());
-        let center_y = row_rect.center().y;
-        for col in 0..4u32 {
-            let i = (row * 4 + col) as usize;
-            let cx = button_centers_x
-                .get(col as usize)
-                .copied()
-                .unwrap_or(row_rect.left() + switch_size.x * 0.5);
-            let rect = egui::Rect::from_center_size(
-                egui::pos2(cx, center_y),
-                switch_size,
-            );
-            let mut child_ui = ui.new_child(
-                egui::UiBuilder::new()
-                    .max_rect(rect)
-                    .layout(egui::Layout::centered_and_justified(
-                        egui::Direction::TopDown,
-                    )),
-            );
-            // Disable the switch when no piped session is running \u2014
-            // there's no decoder pipeline to wire into and the user's
-            // click would silently no-op otherwise.
-            child_ui.set_enabled(is_streaming);
-            let mut on = decoded[i];
-            let resp = toggle_switch(&mut child_ui, &mut on).on_hover_text(
-                if is_streaming {
-                    "Start / stop the background decoder for this subchannel."
-                } else {
-                    "Press Start to enable per-subchannel decoders."
-                },
-            );
-            if resp.changed() {
-                self.commands
-                    .push(UiCommand::SetDecoderEnabled(i as u32, on));
-            }
-        }
         ui.add_space(2.0);
     }
 

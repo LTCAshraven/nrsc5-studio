@@ -1,3 +1,26 @@
+nrsc5-studio (0.5.1-1) unstable; urgency=medium
+
+  * Decode pipeline now runs ONE libnrsc5 session per station tuned.
+    The single `nrsc5_pipe_samples_cu8` session demuxes every
+    advertised HD subchannel internally and emits per-program PCM
+    via the audio callback's `program` field, so the v0.5.0 design
+    (one feeder + one session per HD1-HD4 toggle) was running the
+    same decode work up to four times in parallel against the same
+    I/Q. Thanks to argilo (upstream nrsc5 maintainer) for the
+    review.
+  * GUI: HD1-HD4 buttons no longer have per-program on/off toggles.
+    Every advertised subchannel decodes automatically and the row
+    just picks the speaker program. Auto-decode and max-concurrent
+    settings are gone (no longer meaningful).
+  * Keyboard shortcuts simplified: Alt+1..Alt+8 selects the speaker
+    program. The old Ctrl+Alt+1..Ctrl+Alt+8 / Ctrl+Alt+X shortcuts
+    are removed.
+  * Packaging: drop the `nrsc5` helper (Recommends + post-install
+    script). v0.5.0 moved decode in-process via libnrsc5; the
+    external `nrsc5` CLI is no longer used at runtime.
+
+ -- LTCAshraven <ltcashraven@users.noreply.github.com>  Wed, 03 Jun 2026 12:00:00 +0000
+
 nrsc5-studio (0.5.0-1) unstable; urgency=medium
 
   * libnrsc5 in-process cutover. nrsc5.exe is gone from bin/; the

@@ -7,4 +7,3 @@ packaging/linux/icons/hicolor/48x48/apps/nrsc5-studio.png              usr/share
 packaging/linux/icons/hicolor/64x64/apps/nrsc5-studio.png              usr/share/icons/hicolor/64x64/apps
 packaging/linux/icons/hicolor/128x128/apps/nrsc5-studio.png            usr/share/icons/hicolor/128x128/apps
 packaging/linux/icons/hicolor/256x256/apps/nrsc5-studio.png            usr/share/icons/hicolor/256x256/apps
-scripts/install-nrsc5-helper.sh                                        usr/share/nrsc5-studio

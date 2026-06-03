@@ -297,10 +297,6 @@ impl Nrsc5App {
                 gain_mode: config.gain_mode,
                 manual_gain_tenths: config.manual_gain_tenths,
                 show_hd5_hd8: config.show_hd5_hd8,
-                auto_decode_all_advertised: config.auto_decode_all_advertised,
-                max_concurrent_decoders: config
-                    .max_concurrent_decoders
-                    .clamp(1, crate::ffi::MAX_DECODERS as u32),
                 preset_slot_count: config.preset_slot_count.clamp(1, 48),
                 recording_mode: config.recording_mode,
                 // Default to "present" + "probe available" so the no-SDR
@@ -404,14 +400,6 @@ impl eframe::App for Nrsc5App {
             }
         }
 
-        // Auto-spawn decoders for every advertised subchannel when
-        // the user has opted in via the SDR Settings "Auto-decode
-        // all advertised" toggle. Runs after the event drain so a
-        // fresh SIS update in this frame is visible to the reconcile
-        // loop. Cheap: at most 8 array lookups + a single
-        // `add_decoder` per slot per session.
-        self.reconcile_auto_decoders();
-
         // Check if a background retune task finished.
         if let Some(handle) = self.retune_task.as_ref() {
             if handle.is_finished() {
@@ -439,15 +427,13 @@ impl eframe::App for Nrsc5App {
             }
         }
 
-        // --- Debug multi-decoder keyboard shortcuts (Phase 3 Chunk 3) -----
-        // Temporary, hidden until the HD1-HD8 grid lands in Chunk 6.
-        // Lets us exercise the new `add_decoder` / `set_active_speaker`
-        // / `remove_decoder` API live without any GUI plumbing.
-        // Visible feedback goes to stderr (see the launch terminal).
-        //
-        //   Ctrl+Alt+1..8  -> add_decoder(N-1)     (background decode)
-        //   Alt+1..8       -> set_active_speaker(N-1)
-        //   Ctrl+Alt+X     -> remove_decoder(active_speaker())
+        // --- Hidden debug keyboard shortcut: set_active_speaker -----------
+        // v0.5.1 collapsed multi-session decode to a single per-tune
+        // session, so `add_decoder` / `remove_decoder` no longer exist;
+        // every advertised subchannel is decoded by the one session
+        // and the only thing the user can change at runtime is which
+        // program is on the speakers. Alt+1..8 swaps the active
+        // speaker; visible feedback goes to stderr.
         if let Some(nrsc5) = self.nrsc5.as_mut() {
             const NUM_KEYS: [egui::Key; 8] = [
                 egui::Key::Num1, egui::Key::Num2, egui::Key::Num3, egui::Key::Num4,
@@ -455,34 +441,12 @@ impl eframe::App for Nrsc5App {
             ];
             for (idx, key) in NUM_KEYS.iter().enumerate() {
                 let program = idx as u32;
-                let add = egui::KeyboardShortcut::new(
-                    egui::Modifiers::CTRL | egui::Modifiers::ALT,
-                    *key,
-                );
                 let speak = egui::KeyboardShortcut::new(egui::Modifiers::ALT, *key);
-                if ui.ctx().input_mut(|i| i.consume_shortcut(&add)) {
-                    match nrsc5.add_decoder(program) {
-                        Ok(()) => eprintln!("[multi] add_decoder({program}) ok"),
-                        Err(e) => eprintln!("[multi] add_decoder({program}) err: {e}"),
-                    }
-                }
                 if ui.ctx().input_mut(|i| i.consume_shortcut(&speak)) {
                     match nrsc5.set_active_speaker(program) {
-                        Ok(()) => eprintln!("[multi] set_active_speaker({program}) ok"),
-                        Err(e) => eprintln!("[multi] set_active_speaker({program}) err: {e}"),
+                        Ok(()) => eprintln!("[speaker] set_active_speaker({program}) ok"),
+                        Err(e) => eprintln!("[speaker] set_active_speaker({program}) err: {e}"),
                     }
-                }
-            }
-            let remove_active = egui::KeyboardShortcut::new(
-                egui::Modifiers::CTRL | egui::Modifiers::ALT,
-                egui::Key::X,
-            );
-            if ui.ctx().input_mut(|i| i.consume_shortcut(&remove_active)) {
-                if let Some(p) = nrsc5.active_speaker() {
-                    let removed = nrsc5.remove_decoder(p);
-                    eprintln!("[multi] remove_decoder({p}) -> {removed}");
-                } else {
-                    eprintln!("[multi] no active speaker to remove");
                 }
             }
         }
@@ -1308,70 +1272,7 @@ impl Nrsc5App {
         self.try_record_play(program);
     }
 
-    /// Walk the SIS programs table and, for every subchannel that's
-    /// advertised but not yet decoding, fire a one-shot `add_decoder`.
-    /// Called every frame after the event drain so a fresh SIS update
-    /// is acted on within one tick.
-    ///
-    /// Gated by `auto_decode_all_advertised` (off by default — each
-    /// extra decoder is roughly one extra CPU core). HD5..HD8 are
-    /// skipped unless the user has also enabled the second-row
-    /// visibility toggle, so MP1/MP3 stations don't fan out to slots
-    /// the user can't see.
-    ///
-    /// Per-slot `auto_add_attempted` flag prevents the loop from
-    /// hammering `add_decoder` every frame on a station that
-    /// legitimately can't allocate another decoder (e.g. the
-    /// `MAX_DECODERS` cap is already saturated). Cleared on Stop /
-    /// TuneMhz / toggling the setting back on, so a re-Start or
-    /// re-tune gets a fresh shot.
-    fn reconcile_auto_decoders(&mut self) {
-        if !self.app_state.auto_decode_all_advertised {
-            return;
-        }
-        let Some(nrsc5) = self.nrsc5.as_mut() else {
-            return;
-        };
-        let visible_cap = if self.app_state.show_hd5_hd8 { 8 } else { 4 };
-        let soft_cap = self.app_state.max_concurrent_decoders.max(1) as usize;
-        for i in 0..visible_cap {
-            if self.app_state.auto_add_attempted[i] {
-                continue;
-            }
-            let advertised = self
-                .app_state
-                .station_info
-                .programs
-                .get(i)
-                .map(|s| s.is_some())
-                .unwrap_or(false);
-            if !advertised {
-                continue;
-            }
-            if self.app_state.decoded[i] {
-                // Already running (user toggled it on manually, or a
-                // previous reconcile pass landed it). Mark attempted
-                // so we stop checking until the next session.
-                self.app_state.auto_add_attempted[i] = true;
-                continue;
-            }
-            // Honor the soft cap — but only skip without marking
-            // `auto_add_attempted`. That way if the user raises the
-            // cap (or removes a decoder), the next frame's reconcile
-            // pass picks up the remaining slots.
-            if nrsc5.decoder_count() >= soft_cap {
-                continue;
-            }
-            self.app_state.auto_add_attempted[i] = true;
-            // Best-effort: failures (cap reached, child spawn failed)
-            // surface naturally via the mirrored `decoded[]` array on
-            // the next frame, which keeps the GUI's toggle in sync
-            // with reality.
-            let _ = nrsc5.add_decoder(i as u32);
-        }
-    }
-
-    /// Phase 4 — spawn a new Opus recording locked to whatever
+  /// Phase 4 — spawn a new Opus recording locked to whatever
     /// subchannel the user currently has *selected* (not necessarily
     /// the active speaker; the recorder follows the selection at
     /// start time, then stays put even if the user swaps speakers).
@@ -1414,7 +1315,7 @@ impl Nrsc5App {
         }
         if !decoder_up {
             self.app_state.nrsc5_status = format!(
-                "HD{} isn't decoding — toggle it on before recording",
+                "HD{} hasn't produced audio yet \u{2014} wait for it to come on air before recording",
                 program + 1,
             );
             return;
@@ -1825,22 +1726,18 @@ impl Nrsc5App {
                 self.app_state.nrsc5_status = format!("device lost: {detail}");
             }
             NrscEvent::ChildExited => {
-                // The PCM pump saw EOF on the child's stdout. With
-                // multi-decoder support (Phase 3 Chunk 3), this fires
-                // once per decoder \u2014 explicit removals via
-                // `remove_decoder` also trigger it. Treat it as
-                // pipeline-fatal only when no other decoders survive:
-                // a sibling decoder dying mid-stream is a localized
-                // failure that the user can recover from by toggling
-                // its switch back on, while *all* decoders gone means
-                // the stream really has ended (taskkill, crash, clean
-                // nrsc5 exit on unrecoverable error, etc.).
-                let any_decoders_left = self
+                // The libnrsc5 feeder thread exited. v0.5.1 runs one
+                // session per tune, so this always means the decode
+                // pipeline is gone (`stop()` tripped it, the bus
+                // died, or libnrsc5 refused a chunk). Treat as
+                // pipeline-fatal so the GUI flips back to "stream
+                // ended" and the user can re-Start.
+                let still_streaming = self
                     .nrsc5
                     .as_ref()
-                    .map(|n| !n.decoded_programs().is_empty())
+                    .map(|n| n.is_streaming())
                     .unwrap_or(false);
-                if self.app_state.is_streaming && !any_decoders_left {
+                if self.app_state.is_streaming && !still_streaming {
                     self.app_state.is_streaming = false;
                     self.start_requested_at = None;
                     self.last_signal_at = None;
@@ -2328,11 +2225,6 @@ impl Nrsc5App {
                 // "current" one once the stream is no longer running.
                 self.app_state.clear_all_programs();
                 self.app_state.active_speaker = None;
-                // Fresh session → fresh shot at auto-decoding every
-                // advertised subchannel. Without this, re-Starting on
-                // the same frequency would skip slots we previously
-                // tried (and possibly failed against the cap on).
-                self.app_state.auto_add_attempted = [false; 8];
                 self.traffic_map.clear();
                 self.weather_map.clear();
                 self.app_state.nrsc5_status = "stream stopped".to_string();
@@ -2372,10 +2264,6 @@ impl Nrsc5App {
                 // every program slot so the panel doesn't show the wrong
                 // song while the new station's SIS / PSD roll in.
                 self.app_state.clear_all_programs();
-                // New station → retry auto-decode against whatever it
-                // advertises. The previous station's bitmap is
-                // meaningless against the new SIS table.
-                self.app_state.auto_add_attempted = [false; 8];
                 self.lot_files.clear();
                 self.config.frequency_mhz = mhz;
                 save_config(&self.config);
@@ -2415,36 +2303,18 @@ impl Nrsc5App {
             UiCommand::SelectProgram(program) => {
                 let clamped = program.min(7);
 
-                // Multi-decoder semantics (Phase 3 Chunk 6): selecting
-                // an HD subchannel means "make it the active speaker",
-                // not "tear down and rebuild on this program". If a
-                // background decoder is already running for `clamped`
-                // we just route the speaker to it; otherwise we spawn
-                // one and then route to it. Either way, every other
-                // decoder keeps running so the user doesn't lose
-                // metadata or audio continuity on the channels they
-                // weren't actively listening to.
+                // v0.5.1 single-session-per-tune: every advertised
+                // subchannel is decoded by the one libnrsc5 session
+                // (PCM is demuxed by program into per-program rings),
+                // so selecting an HD just switches which ring the
+                // speaker router reads from. No per-program decoder
+                // spawn, no "is it decoding yet" check.
                 self.app_state.selected_program = clamped;
                 self.config.selected_program = clamped;
                 save_config(&self.config);
 
                 if self.app_state.is_streaming {
                     if let Some(nrsc5) = self.nrsc5.as_mut() {
-                        if !nrsc5.is_decoding(clamped) {
-                            // Spin up a background decoder for the
-                            // target program. Errors (cap reached,
-                            // duplicate, no bus, etc.) surface to the
-                            // status bar but don't abort the switch
-                            // attempt \u2014 set_active_speaker below will
-                            // simply fail too and we'll log the
-                            // underlying reason.
-                            if let Err(err) = nrsc5.add_decoder(clamped) {
-                                self.app_state.nrsc5_status = format!(
-                                    "could not start HD{} decoder: {err}",
-                                    clamped + 1
-                                );
-                            }
-                        }
                         match nrsc5.set_active_speaker(clamped) {
                             Ok(()) => {
                                 self.app_state.nrsc5_status = format!(
@@ -2466,93 +2336,10 @@ impl Nrsc5App {
                 self.app_state.nrsc5_status =
                     format!("selected HD{} (staged)", clamped + 1);
             }
-            UiCommand::SetDecoderEnabled(program, enabled) => {
-                let clamped = program.min(7);
-                let Some(nrsc5) = self.nrsc5.as_mut() else {
-                    self.app_state.nrsc5_status =
-                        "press Start before toggling decoders".to_string();
-                    return;
-                };
-                if enabled {
-                    // Soft cap: refuse to spawn another decoder once the
-                    // user-configured ceiling is hit. The FFI hard cap
-                    // (`MAX_DECODERS`) still applies as a last resort,
-                    // but this lets the user pin CPU usage long before
-                    // we'd otherwise hit it. Re-enabling an already-
-                    // running decoder is harmless and slips through
-                    // because `add_decoder` is idempotent on `program`.
-                    let cap = self
-                        .app_state
-                        .max_concurrent_decoders
-                        .max(1) as usize;
-                    if !nrsc5.is_decoding(clamped) && nrsc5.decoder_count() >= cap {
-                        self.app_state.nrsc5_status = format!(
-                            "decoder soft cap reached ({cap}); raise it in \
-                             SDR Settings \u{2192} Display to start HD{}",
-                            clamped + 1
-                        );
-                        return;
-                    }
-                    match nrsc5.add_decoder(clamped) {
-                        Ok(()) => {
-                            self.app_state.nrsc5_status = format!(
-                                "decoding HD{} in background",
-                                clamped + 1
-                            );
-                        }
-                        Err(err) => {
-                            self.app_state.nrsc5_status = format!(
-                                "could not start HD{} decoder: {err}",
-                                clamped + 1
-                            );
-                        }
-                    }
-                } else {
-                    // Refuse to remove the active speaker's decoder \u2014
-                    // that would yank audio out from under the user
-                    // with no fallback. The toggle in the GUI snaps
-                    // back to "on" on the next frame because the
-                    // mirrored decoded[] array hasn't changed.
-                    if nrsc5.active_speaker() == Some(clamped) {
-                        self.app_state.nrsc5_status = format!(
-                            "HD{} is on the speakers — switch to another \
-                             subchannel first",
-                            clamped + 1
-                        );
-                        return;
-                    }
-                    let removed = nrsc5.remove_decoder(clamped);
-                    self.app_state.nrsc5_status = if removed {
-                        format!("stopped HD{} decoder", clamped + 1)
-                    } else {
-                        format!("HD{} was not decoding", clamped + 1)
-                    };
-                }
-            }
             UiCommand::SetShowHd5Hd8(flag) => {
                 self.app_state.show_hd5_hd8 = flag;
                 self.config.show_hd5_hd8 = flag;
                 save_config(&self.config);
-            }
-            UiCommand::SetAutoDecodeAllAdvertised(flag) => {
-                self.app_state.auto_decode_all_advertised = flag;
-                self.config.auto_decode_all_advertised = flag;
-                save_config(&self.config);
-                // Flipping on mid-session: clear the "already tried"
-                // bitmap so the reconcile loop gets a fresh shot at
-                // every advertised slot on the very next frame.
-                // Flipping off: also clear it so a subsequent re-enable
-                // doesn't skip slots the user has since manually toggled
-                // off (we want "on" to mean "actively decode everything
-                // advertised", not "resume whatever we tried last time").
-                if flag {
-                    self.app_state.auto_add_attempted = [false; 8];
-                }
-                self.app_state.nrsc5_status = if flag {
-                    "auto-decoding all advertised subchannels".to_string()
-                } else {
-                    "auto-decode disabled; manual HD toggles only".to_string()
-                };
             }
             UiCommand::StartRecording => self.start_recording(),
             UiCommand::StopRecording => self.stop_recording(/* fatal = */ false),
@@ -2561,14 +2348,6 @@ impl Nrsc5App {
                 self.app_state.preset_slot_count = clamped;
                 self.config.preset_slot_count = clamped;
                 save_config(&self.config);
-            }
-            UiCommand::SetMaxConcurrentDecoders(n) => {
-                let clamped = n.clamp(1, crate::ffi::MAX_DECODERS as u32);
-                self.app_state.max_concurrent_decoders = clamped;
-                self.config.max_concurrent_decoders = clamped;
-                save_config(&self.config);
-                self.app_state.nrsc5_status =
-                    format!("decoder soft cap = {clamped}");
             }
             UiCommand::SetRecordingMode(mode) => {
                 self.config.recording_mode = mode;
@@ -3765,63 +3544,6 @@ impl Nrsc5App {
         if resp.changed() {
             commands.push(UiCommand::SetShowHd5Hd8(show_hd5_hd8));
         }
-
-        ui.add_space(10.0);
-
-        let mut auto_decode = self.app_state.auto_decode_all_advertised;
-        let resp = ui.checkbox(
-            &mut auto_decode,
-            "Auto-decode every advertised subchannel",
-        );
-        ui.label(
-            egui::RichText::new(
-                "When a station's SIS table advertises HD2\u{2013}HD4 (or \
-                 more), spawn a background decoder for each as soon as it \
-                 appears. Off by default: each extra decoder is roughly one \
-                 extra CPU core, and most listeners only want HD1.",
-            )
-            .small()
-            .color(egui::Color32::from_gray(140)),
-        );
-        if resp.changed() {
-            commands.push(UiCommand::SetAutoDecodeAllAdvertised(auto_decode));
-        }
-
-        ui.add_space(10.0);
-
-        // Soft cap on simultaneous decoders. Range hard-coded to the
-        // FFI ceiling so a typo can't request more than the libnrsc5
-        // wrapper would actually allow.
-        let mut cap = self
-            .app_state
-            .max_concurrent_decoders
-            .clamp(1, crate::ffi::MAX_DECODERS as u32) as i32;
-        ui.horizontal(|ui| {
-            ui.label("Max concurrent decoders:");
-            let resp = ui.add(
-                egui::DragValue::new(&mut cap)
-                    .range(1..=(crate::ffi::MAX_DECODERS as i32))
-                    .speed(0.05),
-            );
-            if resp.drag_stopped() || resp.lost_focus() || resp.changed() {
-                let clamped =
-                    (cap.clamp(1, crate::ffi::MAX_DECODERS as i32)) as u32;
-                if clamped != self.app_state.max_concurrent_decoders {
-                    commands
-                        .push(UiCommand::SetMaxConcurrentDecoders(clamped));
-                }
-            }
-        });
-        ui.label(
-            egui::RichText::new(
-                "Each running decoder costs roughly one CPU core. The \
-                 default of 4 fits the typical HD1\u{2013}HD4 lineup; raise \
-                 it to 8 only on multi-core desktops where you actually \
-                 want every MP11 subchannel decoding at once.",
-            )
-            .small()
-            .color(egui::Color32::from_gray(140)),
-        );
 
         ui.add_space(14.0);
         ui.separator();

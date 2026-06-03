@@ -6,6 +6,43 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-06-03
+
+The **single-session-per-station-tuned** correction release. Many thanks to
+**argilo** (upstream `nrsc5` maintainer) for the architectural review
+that prompted this change.
+
+### Fixed
+- Decode pipeline now runs **one** `nrsc5_pipe_samples_cu8` session
+  per station tuned, not one per HD subchannel. A single libnrsc5
+  session
+  already demuxes every advertised program internally and emits
+  per-program PCM via the `program` field on the audio callback,
+  so the previous v0.5.0 design (one feeder thread + one session
+  per HD1..HD4 button toggle) was running the same decode work up
+  to four times in parallel against the same I/Q stream. The new
+  layout fans the I/Q bus into one feeder and demuxes PCM into one
+  of eight per-program rings inside the audio callback.
+
+### Changed
+- HD1..HD4 buttons in the Tuner panel no longer have a per-program
+  on/off toggle switch. Every advertised subchannel decodes
+  automatically; the button row now just selects which program
+  reaches the speaker. Recording continues to target whichever
+  program is selected at the moment Record is pressed.
+- The "Auto-decode all advertised subchannels" and
+  "Max concurrent decoders" Settings entries are gone (the new
+  model makes both meaningless).
+- Keyboard shortcuts simplified: `Alt+1`..`Alt+8` selects the
+  speaker program. The old `Ctrl+Alt+1`..`Ctrl+Alt+8` add /
+  `Ctrl+Alt+X` remove shortcuts have been removed.
+
+### Packaging
+- Removed the `nrsc5` runtime helper from the Debian and RPM
+  packages (`recommends = "nrsc5"`, `install-nrsc5-helper.sh`).
+  v0.5.0 already moved decode in-process via `libnrsc5`, so the
+  external `nrsc5` CLI is no longer used at runtime.
+
 ## [0.5.0] - 2026-06-02
 
 The **libnrsc5 in-process cutover** release. NRSC5 Studio no longer

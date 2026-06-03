@@ -137,11 +137,11 @@ pub struct AppState {
     /// piped session is active. Used by [`Self::active_idx`] to
     /// pick which `programs[]` slot the Now Playing panel renders.
     pub active_speaker: Option<u32>,
-    /// Per-subchannel "decoder is running" gate, mirrored from
+    /// Per-subchannel "audio has been heard" gate, mirrored from
     /// `Nrsc5Process::decoded_programs()` every frame. Drives the
-    /// toggle-switch state under each HD button so the GUI shows
-    /// reality, not the user's last click intent (e.g. an
-    /// `add_decoder` that failed because the cap was reached).
+    /// HD1..HD8 button styling so the grid shows reality (which
+    /// subchannels are actually on the air and producing PCM)
+    /// rather than what the station advertises.
     pub decoded: [bool; 8],
     /// User setting: when true the HD program selector renders a
     /// second row exposing HD5..HD8. Default false because most
@@ -149,19 +149,6 @@ pub struct AppState {
     /// vertical space in the dock. Persisted via
     /// `AppConfig::show_hd5_hd8`.
     pub show_hd5_hd8: bool,
-    /// User setting: when true the per-frame reconcile loop in
-    /// `App::update` auto-spawns a background decoder for every
-    /// subchannel SIS advertises. Independent of `active_speaker`
-    /// (which one is currently routed to the speakers); the user
-    /// can still flip individual toggles off after the auto-add.
-    /// Persisted via `AppConfig::auto_decode_all_advertised`.
-    pub auto_decode_all_advertised: bool,
-    /// Soft cap on the number of decoders that may run at once. The
-    /// app refuses `SetDecoderEnabled(_, true)` and skips
-    /// `reconcile_auto_decoders` add calls once this limit is hit.
-    /// Range 1..=[`crate::ffi::MAX_DECODERS`]; mirror of
-    /// `AppConfig::max_concurrent_decoders`.
-    pub max_concurrent_decoders: u32,
     /// Number of preset slots the Tuner panel renders. Range 1..=48
     /// clamped at apply time. Mirror of `AppConfig::preset_slot_count`
     /// so the dock doesn't take a borrow on config every frame.
@@ -170,15 +157,6 @@ pub struct AppState {
     /// the Record button when set to `Off` without taking a borrow
     /// on the config. Updated every frame by `App::update`.
     pub recording_mode: crate::config::RecordingMode,
-    /// Per-subchannel "we already tried to auto-spawn this one"
-    /// guard. Set inside the reconcile loop the first time a slot
-    /// goes from "advertised + not decoded" to an `add_decoder`
-    /// call, regardless of whether the call succeeded. Prevents the
-    /// reconcile loop from hammering `add_decoder` every frame on
-    /// a station that legitimately can't allocate another decoder
-    /// (e.g. MAX_DECODERS already hit). Cleared on Stop / TuneMhz
-    /// so a re-tune gets a fresh shot at every subchannel.
-    pub auto_add_attempted: [bool; 8],
     /// Phase 4 — lightweight mirror of the live `RecordingSession` (if
     /// any) for the GUI to read. The session itself lives on `App`
     /// alongside `nrsc5` because it owns non-clone resources (the
