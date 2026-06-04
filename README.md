@@ -173,7 +173,7 @@ Most users won't need this — grab the portable zip and you're done. But if you
 
 - A Rust toolchain (install via [rustup](https://rustup.rs/)). The build pins `stable-x86_64-pc-windows-gnullvm`.
 - The bundled `llvm-mingw` toolchain. The repo expects it at `.toolchains\llvm-mingw-20260505-ucrt-x86_64\` — download a release from [mstorsjo/llvm-mingw](https://github.com/mstorsjo/llvm-mingw/releases) and extract it there.
-- The bundled `bin\` runtime (`libnrsc5.dll`, `libSoapySDR.dll`, `librtlsdr.dll`, Soapy plugin modules) — already in the repo. If you ever need to rebuild `libnrsc5.dll` from upstream source, `scripts\build-nrsc5-msys2.ps1` drives the full MSYS2 build of the pinned nrsc5 v3.1.0 tag with `USE_STATIC=ON`.
+- The bundled `bin\` runtime (`libnrsc5.dll`, `libSoapySDR.dll`, `librtlsdr.dll`, Soapy plugin modules) — already in the repo. If you ever need to rebuild `libnrsc5.dll` from upstream source, `scripts\build-nrsc5-msys2.ps1` drives the full MSYS2 build of the pinned nrsc5 v3.2.0 tag with `USE_STATIC=ON`.
 
 ### Build
 
@@ -226,7 +226,7 @@ src/
   station_info.rs   SIS table model (call sign, slogan, FCC ID, location, services, alerts)
   sdr_detect.rs     SDR presence probe for the no-SDR overlay
   ffi/
-    nrsc5_sys.rs    raw FFI bindings against nrsc5.h (v3.1.0)
+    nrsc5_sys.rs    raw FFI bindings against nrsc5.h (v3.2.0)
     api.rs          safe Rust wrapper around libnrsc5: Nrsc5Session, callback trampoline,
                     typed NrscEvent / PcmSink — all project unsafe lives here
     decoder.rs      per-program DecoderInstance + I/Q feeder thread
@@ -240,7 +240,7 @@ src/
     gain_cache.rs   7-day persistent per-station gain cache (RON)
     resampler.rs    rubato wrapper for SDRplay's 2 Msps → 1.488375 Msps software resample
   dsp/
-    agc.rs          closed-loop AGC controller (Coarse-then-Fine search)
+    agc.rs          closed-loop AGC controller (AmpProbe → Coarse → Fine search)
     spectrum.rs     FFT-based spectrum tap feeding the waterfall + scope UI
     mod.rs
   audio/            cpal output stream + Windows COM per-process volume; Linux software gain

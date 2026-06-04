@@ -6,7 +6,7 @@ use std::thread::JoinHandle;
 use thiserror::Error;
 
 use crate::config::{GainMode, SdrTransport};
-use crate::dsp::{AgcConfig, AgcController, AgcSnapshot, AgcStatus};
+use crate::dsp::{AgcConfig, AgcController, AgcSnapshot, AgcStatus, SearchPhase};
 use crate::sdr::profile::DeviceProfile;
 use crate::sdr::{GainCache, GainCacheEntry, GainCacheKey, IqBus, Sdr, SdrConfig, SdrError, StreamControl};
 
@@ -153,6 +153,58 @@ pub enum NrscEvent {
         tenths: i32,
         reason: String,
     },
+    /// AM-mode SYNC supplementary indicators (libnrsc5 v3.2.0). Emitted
+    /// alongside `Sync` only when libnrsc5 reports at least one of
+    /// these fields as non-sentinel (i.e. AM tunes). All four are
+    /// always -1 in FM mode, so no event is emitted there. Currently
+    /// stored on `StationInfo` for diagnostics but not rendered.
+    SyncAm {
+        /// Power Level Indicator.
+        pli: i32,
+        /// High-Power PIDS Indicator.
+        hppi: i32,
+        /// Analog Audio Bandwidth Indicator.
+        aabi: i32,
+        /// Reduced Digital Bandwidth Indicator.
+        rdbi: i32,
+    },
+    /// Exciter equipment metadata (libnrsc5 v3.2.0). One-shot per
+    /// session once SIS Parameter messages carrying exciter info land.
+    ExciterInfo {
+        manufacturer_id: String,
+        core_version: [i32; 4],
+        core_status: i32,
+        manufacturer_version: [i32; 4],
+        manufacturer_status: i32,
+        importer_connected: bool,
+    },
+    /// Importer equipment metadata (libnrsc5 v3.2.0). Same shape as
+    /// `ExciterInfo` minus `importer_connected`.
+    ImporterInfo {
+        manufacturer_id: String,
+        core_version: [i32; 4],
+        core_status: i32,
+        manufacturer_version: [i32; 4],
+        manufacturer_status: i32,
+    },
+    /// GPS leap-second offset and pending adjustment (libnrsc5 v3.2.0).
+    LeapSecondOffset {
+        pending_offset: i32,
+        current_offset: i32,
+        /// 0 if no pending adjustment.
+        pending_alfn: u32,
+    },
+    /// Broadcaster local time / DST schedule (libnrsc5 v3.2.0).
+    LocalTime {
+        /// Local Time Zone UTC Offset in minutes.
+        utc_offset_minutes: i32,
+        /// DST currently in effect regionally.
+        dst_regional: bool,
+        /// DST practiced locally.
+        dst_local: bool,
+        /// 0 = not practiced, 1 = U.S./Canada, 2 = EU.
+        dst_schedule: u8,
+    },
 }
 
 impl NrscEvent {
@@ -182,6 +234,11 @@ impl NrscEvent {
             Self::HereImage => "here-image",
             Self::Agc { .. } => "agc",
             Self::AgcDecision { .. } => "agc-decision",
+            Self::SyncAm { .. } => "sync-am",
+            Self::ExciterInfo { .. } => "exciter-info",
+            Self::ImporterInfo { .. } => "importer-info",
+            Self::LeapSecondOffset { .. } => "leap-second-offset",
+            Self::LocalTime { .. } => "local-time",
         }
     }
 }
@@ -327,6 +384,13 @@ pub struct Nrsc5Process {
     /// same reason as `last_sdr_args` so [`retune`](Self::retune) can
     /// reuse it. `None` until the first piped Start.
     last_antenna: Option<String>,
+    /// v0.6.0 amplitude pre-stage RMS target override (dBFS) used for
+    /// the current/last piped stream. `None` means "use profile
+    /// default". Preserved across `stop()` so [`retune`](Self::retune)
+    /// applies the same override the user has configured. `None` until
+    /// the first piped Start (which is fine — retune before any
+    /// Start is a no-op anyway).
+    last_agc_amp_target_dbfs_override: Option<f32>,
     /// Transport selection (local Soapy, SoapyRemote, native rtl_tcp)
     /// active for the current/last piped stream. Preserved across
     /// `stop()` so [`retune`](Self::retune) can re-open the same kind
@@ -362,24 +426,56 @@ pub struct Nrsc5Process {
 /// is created on first call if missing; truncation happens via
 /// [`agc_log_start`] at the top of each `start_piped` so each tune's
 /// trace stands alone.
+///
+/// v0.6.0: every line is prefixed with a `HH:MM:SS.mmm` wall-clock
+/// timestamp so amplitude-pre-stage probes (sub-second cadence) can
+/// be correlated with `[lot]` / `[map]` events and with whatever the
+/// user observed on the UI at the same moment.
 fn agc_log_append(line: &str) {
     let Some(path) = crate::paths::agc_trace_path() else {
         return;
     };
     use std::io::Write;
+    let ts = chrono::Local::now().format("%H:%M:%S%.3f");
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&path)
     {
-        let _ = writeln!(f, "{}", line);
+        let _ = writeln!(f, "{} {}", ts, line);
+    }
+}
+
+/// Emit one AGC trace line to BOTH stderr and the log file with a
+/// matching `HH:MM:SS.mmm` prefix. Saves every caller from typing
+/// `eprintln!` + `agc_log_append` + remembering to format the
+/// timestamp the same way in both places. v0.6.0 amplitude-pre-stage
+/// probes happen sub-second so the timestamp must come from one
+/// source-of-truth call site, not be looked up twice.
+fn agc_trace(line: &str) {
+    let ts = chrono::Local::now().format("%H:%M:%S%.3f");
+    eprintln!("{} {}", ts, line);
+    if let Some(path) = crate::paths::agc_trace_path() {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            let _ = writeln!(f, "{} {}", ts, line);
+        }
     }
 }
 
 /// Truncate the AGC trace log and write a header for a new tune.
 /// Called once at the top of `start_piped` (after gain cache lookup)
-/// so the file always reflects the current run only â€” old runs are
+/// so the file always reflects the current run only — old runs are
 /// overwritten by design. Best-effort: silently ignored on failure.
+///
+/// v0.6.0: writes a `YYYY-MM-DD HH:MM:SS%.3f` wall-clock header so
+/// that timestamps in subsequent [`agc_trace`] lines (which only
+/// include time-of-day) can be anchored to a date when the log is
+/// retrieved after the fact.
 fn agc_log_start(header: &str) {
     let Some(path) = crate::paths::agc_trace_path() else {
         return;
@@ -388,13 +484,14 @@ fn agc_log_start(header: &str) {
         let _ = std::fs::create_dir_all(parent);
     }
     use std::io::Write;
+    let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(true)
         .open(&path)
     {
-        let _ = writeln!(f, "{}", header);
+        let _ = writeln!(f, "{} {}", ts, header);
     }
 }
 
@@ -528,6 +625,7 @@ impl Nrsc5Process {
             last_sdr_args: None,
             last_ppm: None,
             last_antenna: None,
+            last_agc_amp_target_dbfs_override: None,
             last_transport: SdrTransport::LocalSoapy,
             last_remote: None,
             last_frequency_mhz: None,
@@ -1079,6 +1177,7 @@ impl Nrsc5Process {
         gain_mode: GainMode,
         manual_gain_tenths: i32,
         antenna: Option<String>,
+        agc_amp_target_dbfs_override: Option<f32>,
     ) -> Result<(), Nrsc5Error> {
         if (program as usize) >= MAX_PROGRAMS {
             return Err(Nrsc5Error::InvalidProgram(program));
@@ -1185,6 +1284,26 @@ impl Nrsc5Process {
             agc_cfg.initial_tenths = profile.default_agc_initial_tenths;
             agc_cfg.initial_direction = profile.default_agc_initial_direction;
             agc_cfg.coarse_probe_tenths = profile.coarse_probe_tenths;
+            // v0.6.0: pull the amplitude pre-stage knobs from the
+            // per-device profile so future profiles can override the
+            // RTL-SDR-flavored defaults baked into `AgcConfig::default`.
+            // The driver thread also reads `profile.amp_flush_ms` and
+            // `profile.amp_probe_samples` directly, but mirroring the
+            // target/enable here keeps the controller a single source
+            // of truth for the state machine.
+            agc_cfg.amp_target_dbfs = profile.amp_target_dbfs;
+            agc_cfg.amp_probe_samples = profile.amp_probe_samples;
+            agc_cfg.amp_flush_ms = profile.amp_flush_ms;
+            agc_cfg.amp_enable = profile.amp_enable;
+            // User-supplied override from the Settings → Gain tab. Clamp
+            // to a sane window so a manually-edited config can't push
+            // the controller into a degenerate state (e.g. −0 dBFS
+            // would peg every probe; −60 dBFS would never reach
+            // target). The UI exposes [−30, −10] but we accept a
+            // slightly wider band here for headroom.
+            if let Some(target) = agc_amp_target_dbfs_override {
+                agc_cfg.amp_target_dbfs = target.clamp(-40.0, -5.0);
+            }
             // Phase 3 gain-cache lookup. The key is built from the
             // about-to-be-tuned freq + driver + active antenna + the
             // PPM correction in use. A hit overrides the profile's
@@ -1228,8 +1347,7 @@ impl Nrsc5Process {
                             entry.best_mer_db,
                             agc_cfg.mer_target_db,
                         );
-                        eprintln!("{}", msg);
-                        agc_log_append(&msg);
+                        agc_trace(&msg);
                         true
                     }
                     None => {
@@ -1238,8 +1356,7 @@ impl Nrsc5Process {
                              running fresh coarse-then-fine search",
                             frequency_mhz, cache_key.driver,
                         );
-                        eprintln!("{}", msg);
-                        agc_log_append(&msg);
+                        agc_trace(&msg);
                         false
                     }
                 },
@@ -1384,6 +1501,7 @@ impl Nrsc5Process {
         self.last_transport = transport;
         self.last_remote = remote.map(|(h, p)| (h.to_string(), p));
         self.last_frequency_mhz = Some(frequency_mhz);
+        self.last_agc_amp_target_dbfs_override = agc_amp_target_dbfs_override;
 
         // ----- AGC driver thread (only when AGC is active) ----------
         // Ticks the controller every ~500 ms and applies any gain
@@ -1418,6 +1536,23 @@ impl Nrsc5Process {
                 ppm_correction as f32,
             );
             let cache_path_for_driver = crate::paths::gain_cache_path();
+            // v0.6.0: subscribe to the I/Q bus for the amplitude
+            // pre-stage. The driver thread reads cu8 chunks to
+            // measure RMS dBFS between probes. Capacity is small
+            // (8 chunks ≈ ~90 ms at 1.488 Msps / 16384-sample MTU)
+            // so backlogged stale samples can't pile up between
+            // probes — the eager `drain_now` at probe-start clears
+            // whatever queued anyway, but a small capacity keeps
+            // the worst-case carry-over bounded.
+            let bus_rx_for_agc = self
+                .iq_bus
+                .as_ref()
+                .expect("iq_bus just set in start_piped")
+                .subscribe(8);
+            // Amplitude-pre-stage timing knobs pulled off the
+            // profile so the thread doesn't have to re-borrow.
+            let amp_flush_ms = agc_profile.amp_flush_ms;
+            let amp_probe_samples = agc_profile.amp_probe_samples;
             let agc_thread = std::thread::spawn(move || {
                 // SDRplay is sensitive right after stream activation;
                 // avoid immediate AGC writes in the first moment.
@@ -1435,7 +1570,96 @@ impl Nrsc5Process {
                 // transition (not every tick while Settled) means the
                 // cache file gets written once per converged tune.
                 let mut prev_status = AgcStatus::Probing;
+                // v0.6.0: track whether we've called `tick_amp` at
+                // least once in the current AmpProbe phase. First
+                // call passes `peak=None` (no measurement yet, just
+                // write the binary-search seed gain); subsequent
+                // calls measure peak amplitude between probes.
+                // Resets if the phase ever returns to AmpProbe
+                // (which today only happens on a fresh tune via a
+                // new spawn, so reset is theoretical, but cheap).
+                let mut amp_first_iter = true;
                 while !agc_stop_for_driver.load(Ordering::Relaxed) {
+                    // Read phase up-front so the AmpProbe branch
+                    // can dispatch to `tick_amp` without sleeping
+                    // through a 500 ms `tick_ms` window. Lock
+                    // briefly; release before any I/O.
+                    let pre_phase = match agc_for_driver.lock() {
+                        Ok(c) => c.snapshot().phase,
+                        Err(_) => break,
+                    };
+
+                    // ---- v0.6.0 amplitude-pre-stage fast path ----
+                    if pre_phase == SearchPhase::AmpProbe {
+                        // First entry: write the binary-search seed
+                        // gain without a measurement. Subsequent
+                        // entries: drain the IqBus queue
+                        // (discards anything buffered before the
+                        // last gain write), wait `amp_flush_ms`
+                        // for the SDR USB transfer pipeline to
+                        // flush, drain again (discards the
+                        // pre-change samples that arrived during
+                        // the flush window), then measure RMS
+                        // dBFS over a fresh `amp_probe_samples`
+                        // window. The drain→sleep→drain→measure
+                        // pattern is what guarantees zero
+                        // carry-over of pre-gain-change samples
+                        // into the measurement — a single carry-
+                        // over chunk (16384 samples at 1.488 Msps
+                        // = 11 ms per chunk) is enough to poison
+                        // a peak metric to 0 dBFS, but RMS is
+                        // also more robust the cleaner the
+                        // window is.
+                        let rms = if amp_first_iter {
+                            None
+                        } else {
+                            let _pre = crate::sdr::iq_bus::drain_now(&bus_rx_for_agc);
+                            std::thread::sleep(
+                                std::time::Duration::from_millis(amp_flush_ms as u64),
+                            );
+                            let _post = crate::sdr::iq_bus::drain_now(&bus_rx_for_agc);
+                            crate::sdr::iq_bus::rms_dbfs_cu8(
+                                &bus_rx_for_agc,
+                                amp_probe_samples as usize,
+                                std::time::Duration::from_millis(200),
+                            )
+                        };
+                        let action = match agc_for_driver.lock() {
+                            Ok(mut c) => c.tick_amp(rms),
+                            Err(_) => break,
+                        };
+                        if let Some(action) = action {
+                            let line = format!(
+                                "[agc] amp-probe gain={:.1}dB(idx {}) rms={} :: {}",
+                                action.new_tenths as f32 / 10.0,
+                                action.new_idx,
+                                rms.map(|p| format!("{:.2}dBFS", p))
+                                    .unwrap_or_else(|| "n/a".to_string()),
+                                action.reason
+                            );
+                            agc_trace(&line);
+                            let _ = apply_agc_action(&sdr_for_agc, &agc_profile, &action);
+                            let _ = agc_tx.send(NrscEvent::AgcDecision {
+                                tenths: action.new_tenths,
+                                reason: action.reason,
+                            });
+                        }
+                        amp_first_iter = false;
+                        // No tick_ms sleep during AmpProbe — each
+                        // probe is already gated by
+                        // `amp_flush_ms` + the measurement window
+                        // (~80–180 ms total per profile), and we
+                        // want sub-second convergence on the
+                        // amplitude winner before MER even fires.
+                        continue;
+                    }
+                    // Re-arm `amp_first_iter` in case the phase
+                    // somehow re-enters AmpProbe later (cache
+                    // invalidation, manual re-tune from the UI,
+                    // etc.). Cheap; only fires once per phase
+                    // transition out of AmpProbe.
+                    amp_first_iter = true;
+
                     std::thread::sleep(std::time::Duration::from_millis(tick_ms));
                     if agc_stop_for_driver.load(Ordering::Relaxed) {
                         break;
@@ -1476,8 +1700,7 @@ impl Nrsc5Process {
                             best_str,
                             action.reason
                         );
-                        eprintln!("{}", line);
-                        agc_log_append(&line);
+                        agc_trace(&line);
                         let _ = apply_agc_action(&sdr_for_agc, &agc_profile, &action);
                         let _ = agc_tx.send(NrscEvent::AgcDecision {
                             tenths: action.new_tenths,
@@ -1513,8 +1736,7 @@ impl Nrsc5Process {
                                 snap.current_idx,
                                 mer,
                             );
-                            eprintln!("{}", msg);
-                            agc_log_append(&msg);
+                            agc_trace(&msg);
                         } else {
                             let msg = format!(
                                 "[agc] SETTLED at {:.1} dB (idx {}); no MER reading, \
@@ -1522,22 +1744,20 @@ impl Nrsc5Process {
                                 snap.current_tenths as f32 / 10.0,
                                 snap.current_idx,
                             );
-                            eprintln!("{}", msg);
-                            agc_log_append(&msg);
+                            agc_trace(&msg);
                         }
                     } else if prev_status == AgcStatus::Probing
                         && snap.status == AgcStatus::Bailed
                     {
                         let msg = format!(
-                            "[agc] BAILED â€” gain restored to {:.1} dB (idx {}, best MER {})",
+                            "[agc] BAILED — gain restored to {:.1} dB (idx {}, best MER {})",
                             snap.current_tenths as f32 / 10.0,
                             snap.current_idx,
                             snap.best_mer
                                 .map(|m| format!("{:.2}", m))
                                 .unwrap_or_else(|| "n/a".to_string())
                         );
-                        eprintln!("{}", msg);
-                        agc_log_append(&msg);
+                        agc_trace(&msg);
                     }
                     prev_status = snap.status;
                 }
@@ -1688,6 +1908,7 @@ impl Nrsc5Process {
                 let antenna = self.last_antenna.clone();
                 let transport = self.last_transport;
                 let remote = self.last_remote.clone();
+                let amp_override = self.last_agc_amp_target_dbfs_override;
                 self.start_piped(
                     frequency_mhz,
                     program,
@@ -1698,6 +1919,7 @@ impl Nrsc5Process {
                     gain_mode,
                     manual,
                     antenna,
+                    amp_override,
                 )
             }
             None => Ok(()),

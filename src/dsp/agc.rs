@@ -67,15 +67,38 @@ pub enum AgcStatus {
 }
 
 /// Sub-state of `AgcStatus::Probing`. Surfaced separately so the UI
-/// pill can show "PROBING (coarse)" vs "PROBING (fine)" — useful for
-/// diagnosing whether the controller is mid-sweep or mid-hill-climb.
+/// pill can show "PROBING (amp)" / "PROBING (coarse)" / "PROBING (fine)".
 /// `Done` is the terminal state for both Settled and Bailed.
+///
+/// Phase ordering on a fresh tune (libnrsc5 v3.2.0 / v0.6.0):
+///   `AmpProbe` -> `MerQualityCheck` -> (`Done` if MER good enough, else
+///   `Fine` seeded from the amplitude winner). The legacy `Coarse`
+///   phase is skipped on cold start because the amplitude binary search
+///   brackets the HD sweet spot more tightly than the 5-point coarse
+///   set ever could. Cache-hit warm starts skip both `AmpProbe` and
+///   `Coarse` and go directly to `Fine`, preserving the v0.5.x fast
+///   path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchPhase {
+    /// Binary-search amplitude pre-stage (v0.6.0). Drives RMS dBFS
+    /// to `cfg.amp_target_dbfs` in ~5 probes before MER
+    /// telemetry is even consulted. Cold-start only; skipped entirely
+    /// when `cfg.seeded_from_cache` is true or `cfg.amp_enable` is
+    /// false.
+    AmpProbe,
+    /// Brief MER hand-off after `AmpProbe` converges. Waits a few MER
+    /// frames at the amplitude winner; transitions to `Done` if MER
+    /// is already good, otherwise to `Fine` seeded from the
+    /// amplitude-probe result.
+    MerQualityCheck,
     /// Sweeping the profile's `coarse_probe_tenths` set, in order.
+    /// Only reached today via the legacy `amp_enable = false` path
+    /// (kept for test fixtures and as a fallback if AmpProbe is
+    /// disabled).
     Coarse,
-    /// ±1 hill-climb centred on the coarse winner (or on the legacy
-    /// `initial_tenths` when the profile has no coarse set).
+    /// ±1 hill-climb centred on the coarse / amplitude-probe winner
+    /// (or on the legacy `initial_tenths` when no coarse / amp set
+    /// is configured).
     Fine,
     /// Terminal — controller has settled or bailed.
     Done,
@@ -182,6 +205,42 @@ pub struct AgcConfig {
     /// controls phase-entry and snapshot labeling. Default `false`,
     /// matching all the cache-miss code paths.
     pub seeded_from_cache: bool,
+
+    // --- v0.6.0 amplitude-first AGC pre-stage knobs --------------------
+    //
+    // The amplitude pre-stage binary-searches the gain table to drive
+    // RMS dBFS to `amp_target_dbfs` in ~5 probes, before any
+    // MER telemetry is consulted. Each probe applies a candidate gain,
+    // flushes the SDR USB transfer pipeline for `amp_flush_ms`, then
+    // measures peak amplitude over `amp_probe_ms` of fresh samples. The
+    // amplitude winner seeds the existing MER hill-climb, so cold-start
+    // tune-to-decode drops from 5–15 s (legacy coarse-then-fine) to
+    // sub-second on strong stations.
+    /// Target peak amplitude for the pre-stage in dBFS. Default `-6.0`
+    /// matches argilo's choice in upstream nrsc5: leaves comfortable
+    /// headroom for transients while keeping the SNR floor low
+    /// enough that the digital sidebands ride well above quantization
+    /// noise. Per-profile overridable (see
+    /// [`crate::sdr::profile::DeviceProfile::amp_target_dbfs`]).
+    pub amp_target_dbfs: f32,
+    /// Number of samples (complex pairs) to scan when measuring peak
+    /// amplitude at a candidate gain. Default 16384 samples ≈ 11 ms at
+    /// the cu8 sample rate of 1.488 Msps — long enough to catch peaks
+    /// in a typical FM broadcast envelope, short enough that 5 probes
+    /// total well under 100 ms of measurement time.
+    pub amp_probe_samples: u32,
+    /// Flush window (milliseconds) between writing a candidate gain
+    /// and starting the amplitude measurement. Discards in-flight USB
+    /// chunks so the measured peak reflects the new gain, not the
+    /// previous one. Default 80 ms (RTL-SDR-tuned). SDRplay needs
+    /// longer per its startup-grace evidence (see
+    /// [`crate::sdr::profile::DeviceProfile::amp_flush_ms`]).
+    pub amp_flush_ms: u32,
+    /// Master switch for the amplitude pre-stage. When `false` the
+    /// controller falls back to the legacy Coarse-then-Fine algorithm
+    /// (preserved for tests and as a kill switch if the pre-stage
+    /// ever misbehaves on an exotic station). Default `true`.
+    pub amp_enable: bool,
 }
 
 impl Default for AgcConfig {
@@ -195,6 +254,10 @@ impl Default for AgcConfig {
             initial_direction: -1,
             coarse_probe_tenths: &[],
             seeded_from_cache: false,
+            amp_target_dbfs: -20.0,
+            amp_probe_samples: 16384,
+            amp_flush_ms: 250,
+            amp_enable: true,
         }
     }
 }
@@ -280,6 +343,30 @@ pub struct AgcController {
     /// means "probed but no MER reading available" (no sync at that
     /// gain). Real EMA values are recorded for the stability shortcut.
     explored: BTreeMap<usize, f32>,
+
+    // --- v0.6.0 amplitude-first AGC pre-stage state -------------------
+    /// Live binary-search window over `table` indices. `lo` and `hi`
+    /// bracket the highest-safe-gain index; `mid` is the candidate
+    /// being measured. Only meaningful while `phase == AmpProbe`.
+    amp_lo: usize,
+    amp_hi: usize,
+    /// Index whose amplitude is currently being measured. `None` until
+    /// the first probe is dispatched.
+    amp_probing: Option<usize>,
+    /// `true` once at least one amp-probe came back at or below the
+    /// target dBFS. Used at termination to distinguish "`amp_lo` is
+    /// genuinely the highest confirmed-safe gain" from "`amp_lo`
+    /// never advanced because every probe was too hot" (e.g. a strong
+    /// signal combined with a profile whose minimum gain still
+    /// over-drives the target). When false at termination, we abort
+    /// the amplitude pre-stage and fall through to Coarse seeded from
+    /// the profile's default initial gain, rather than committing the
+    /// (unprobed) `idx 0` as the "winner".
+    amp_ever_safe: bool,
+    /// MER frames remaining in `MerQualityCheck` before the handoff
+    /// decision (settle vs. fall through to Fine). Counted down via
+    /// `on_event` each MER event.
+    mer_check_remaining: u32,
 }
 
 impl AgcController {
@@ -312,13 +399,24 @@ impl AgcController {
         // introspection but `coarse_pos` is parked at the end so
         // `tick()` never advances into it. Cache miss = legacy
         // behavior (Coarse if non-empty, else Fine).
+        //
+        // v0.6.0: cold-start cache miss now enters `AmpProbe` first
+        // when `amp_enable` is true and the table is wide enough for a
+        // binary search to be worthwhile (2+ steps). The amplitude
+        // pre-stage tracks its own `amp_lo` / `amp_hi` window over the
+        // full table; the coarse / fine fall-through is preserved as
+        // the `amp_enable = false` path so tests and emergency kill
+        // switch stay deterministic.
         let (phase, coarse_pos) = if cfg.seeded_from_cache {
             (SearchPhase::Fine, coarse_table.len())
+        } else if cfg.amp_enable && table.len() >= 2 {
+            (SearchPhase::AmpProbe, 0)
         } else if coarse_table.is_empty() {
             (SearchPhase::Fine, 0)
         } else {
             (SearchPhase::Coarse, 0)
         };
+        let amp_hi = table.len().saturating_sub(1);
         Self {
             table: table.to_vec(),
             cfg,
@@ -338,6 +436,11 @@ impl AgcController {
             probes_done: 0,
             last_reason: "initial start gain".to_string(),
             explored: BTreeMap::new(),
+            amp_lo: 0,
+            amp_hi,
+            amp_probing: None,
+            amp_ever_safe: false,
+            mer_check_remaining: 0,
         }
     }
 
@@ -397,6 +500,15 @@ impl AgcController {
                 // saturating is free and explicit).
                 self.mer_samples_since_change =
                     self.mer_samples_since_change.saturating_add(1);
+                // v0.6.0: drive the MerQualityCheck countdown so the
+                // amplitude-pre-stage handoff fires after `n` MER
+                // frames at the amplitude winner, regardless of how
+                // often the driver calls `tick`.
+                if self.phase == SearchPhase::MerQualityCheck
+                    && self.mer_check_remaining > 0
+                {
+                    self.mer_check_remaining -= 1;
+                }
             }
             // BER, LostSync, audio events, metadata — informational only
             // for now. A future version may use sustained high BER as a
@@ -414,6 +526,81 @@ impl AgcController {
     pub fn tick(&mut self) -> Option<AgcAction> {
         if self.status != AgcStatus::Probing {
             return None;
+        }
+
+        // v0.6.0: AmpProbe phase is driven by `tick_amp`, not this
+        // method. The driver picks the right entry per phase. Silently
+        // no-op here so a tick during AmpProbe doesn't stomp state.
+        if self.phase == SearchPhase::AmpProbe {
+            return None;
+        }
+
+        // v0.6.0: MerQualityCheck is the bridge between AmpProbe and
+        // the legacy state machine. Block in this phase until either
+        // (a) enough MER frames have arrived to trust the reading, or
+        // (b) the soft `probe_period` ceiling fires (no-MER case).
+        // Once unblocked, settle if MER meets target, otherwise hand
+        // off to Fine seeded from the amplitude-probe winner.
+        if self.phase == SearchPhase::MerQualityCheck {
+            let elapsed = self.last_change_at.elapsed();
+            let samples_ok =
+                self.mer_samples_since_change >= self.cfg.min_mer_samples_post_change
+                    && self.mer_check_remaining == 0;
+            let timeout_ok = elapsed >= self.cfg.probe_period;
+            if !samples_ok && !timeout_ok {
+                return None;
+            }
+            // Decide settle vs. fall-through to Fine.
+            self.probes_done += 1;
+            let current_ema = self.ema_mer_min;
+            if let Some(e) = current_ema {
+                // Mirror the bookkeeping `tick`'s main path does so
+                // the snapshot / explored map stay consistent.
+                let prev = self
+                    .explored
+                    .get(&self.gain_idx)
+                    .copied()
+                    .unwrap_or(f32::NEG_INFINITY);
+                if e > prev {
+                    self.explored.insert(self.gain_idx, e);
+                }
+                if e > self.best_mer_seen {
+                    self.best_mer_seen = e;
+                    self.best_gain_idx = self.gain_idx;
+                }
+                if e >= self.cfg.mer_target_db {
+                    self.last_reason = format!(
+                        "amp+mer: ema {:.2} dB >= target {:.1} dB; settled",
+                        e, self.cfg.mer_target_db
+                    );
+                    self.status = AgcStatus::Settled;
+                    self.phase = SearchPhase::Done;
+                    return None;
+                }
+            }
+            // MER below target (or no MER): hand off to Fine seeded
+            // from the amplitude winner. Reset the explored map so the
+            // Fine ±1 walk can examine the amplitude winner's
+            // neighbours without "already explored" short-circuits.
+            self.phase = SearchPhase::Fine;
+            self.last_dir = 1;
+            self.explored.clear();
+            self.probes_without_improvement = 0;
+            self.last_reason = match current_ema {
+                Some(e) => format!(
+                    "amp+mer: ema {:.2} dB below target; handing off to fine from idx {} ({:.1} dB)",
+                    e,
+                    self.gain_idx,
+                    self.table[self.gain_idx] as f32 / 10.0,
+                ),
+                None => format!(
+                    "amp+mer: no MER lock; handing off to fine from idx {} ({:.1} dB)",
+                    self.gain_idx,
+                    self.table[self.gain_idx] as f32 / 10.0,
+                ),
+            };
+            // Fall through into the main tick logic so Fine makes its
+            // first move immediately rather than waiting another tick.
         }
 
         // -- 0. Phase 2b adaptive settle gate. -------------------------
@@ -438,31 +625,49 @@ impl AgcController {
 
         self.probes_done += 1;
 
+        // v0.6.0 placeholder-skip guard: on the very first Coarse tick
+        // the current gain reflects the profile's placeholder
+        // `initial_tenths`, NOT a deliberate probe. Anchoring
+        // `best_gain_idx` to that placeholder measurement wedges the
+        // search when none of the coarse probes happen to beat it
+        // (SDRplay on 97.1 MHz, June 2026: initial idx 19 MER 3.88
+        // dB held the crown through the entire coarse sweep, then
+        // Fine bracketed at idx 19 with both neighbours falsely
+        // marked "explored" by the coarse pass). The placeholder
+        // also doesn't belong in `explored` for the same reason — if
+        // it coincides with a coarse point the coarse sweep will
+        // probe it for real and record the result then. Fine-only
+        // configs (empty coarse table → phase starts as Fine) are
+        // unaffected.
+        let skip_record = self.probes_done == 1 && self.phase == SearchPhase::Coarse;
+
         // -- 1. Record what we observed at the current gain. -------------
         let current_ema = self.ema_mer_min;
-        match current_ema {
-            Some(e) => {
-                let prev = self
-                    .explored
-                    .get(&self.gain_idx)
-                    .copied()
-                    .unwrap_or(f32::NEG_INFINITY);
-                if e > prev {
-                    self.explored.insert(self.gain_idx, e);
+        if !skip_record {
+            match current_ema {
+                Some(e) => {
+                    let prev = self
+                        .explored
+                        .get(&self.gain_idx)
+                        .copied()
+                        .unwrap_or(f32::NEG_INFINITY);
+                    if e > prev {
+                        self.explored.insert(self.gain_idx, e);
+                    }
+                    if e > self.best_mer_seen {
+                        self.best_mer_seen = e;
+                        self.best_gain_idx = self.gain_idx;
+                        self.probes_without_improvement = 0;
+                    } else {
+                        self.probes_without_improvement += 1;
+                    }
                 }
-                if e > self.best_mer_seen {
-                    self.best_mer_seen = e;
-                    self.best_gain_idx = self.gain_idx;
-                    self.probes_without_improvement = 0;
-                } else {
+                None => {
+                    self.explored
+                        .entry(self.gain_idx)
+                        .or_insert(f32::NEG_INFINITY);
                     self.probes_without_improvement += 1;
                 }
-            }
-            None => {
-                self.explored
-                    .entry(self.gain_idx)
-                    .or_insert(f32::NEG_INFINITY);
-                self.probes_without_improvement += 1;
             }
         }
 
@@ -707,6 +912,186 @@ impl AgcController {
         })
     }
 
+    /// v0.6.0 amplitude pre-stage entry point. The driver thread calls
+    /// this while `phase == AmpProbe`:
+    ///
+    /// 1. With `rms_dbfs = None` on first entry — the controller
+    ///    seeds the binary-search midpoint and returns an
+    ///    [`AgcAction`] to write that gain.
+    /// 2. With `rms_dbfs = Some(reading)` on every subsequent call,
+    ///    where `reading` is the measured **RMS** dBFS over a fresh
+    ///    `cfg.amp_probe_samples` window taken *after* a
+    ///    drain → `cfg.amp_flush_ms` sleep → drain sequence (the
+    ///    drain-sleep-drain pattern is what guarantees no
+    ///    pre-gain-change samples leak into the measurement; see
+    ///    `sdr::iq_bus::rms_dbfs_cu8` for why RMS instead of peak).
+    ///    The controller compares the reading to
+    ///    `cfg.amp_target_dbfs`, narrows the window, and either
+    ///    returns the next probe action or transitions to
+    ///    [`SearchPhase::MerQualityCheck`] (returning `Some` to write
+    ///    the amplitude winner one last time so the table-index and
+    ///    the applied gain are in sync).
+    ///
+    /// Returns `None` when the controller has nothing for the driver
+    /// to do (which today means the phase is no longer `AmpProbe`).
+    /// Idempotent once `phase` advances past `AmpProbe`.
+    ///
+    /// Binary-search bias: we hunt for the **highest** index whose
+    /// RMS is still ≤ target (i.e. the loudest non-clipping gain).
+    /// On "too hot" we shrink `hi = mid - 1`; on "safe" we expand
+    /// `lo = mid` (NOT `mid + 1` — `mid` itself is now a confirmed
+    /// safe value, and we want to consider it the floor while
+    /// continuing to probe higher).
+    pub fn tick_amp(&mut self, rms_dbfs: Option<f32>) -> Option<AgcAction> {
+        if self.status != AgcStatus::Probing || self.phase != SearchPhase::AmpProbe {
+            return None;
+        }
+
+        // Score the last probe (if any) and tighten the window.
+        if let (Some(probed), Some(reading)) = (self.amp_probing, rms_dbfs) {
+            if reading > self.cfg.amp_target_dbfs {
+                // Too hot — lower bound stays, upper bound contracts.
+                // saturating_sub at probed=0 collapses the window
+                // (`hi = 0` even though idx 0 is NOT safe); the
+                // `amp_ever_safe` check at termination catches that
+                // case and aborts cleanly rather than committing
+                // the unprobed default to `MerQualityCheck`.
+                self.amp_hi = probed.saturating_sub(1);
+            } else {
+                // Safe — `probed` is now the highest confirmed-safe
+                // index. Bias high: keep `mid` as the new floor.
+                self.amp_lo = probed;
+                self.amp_ever_safe = true;
+            }
+            self.probes_done += 1;
+        }
+
+        // Abort path: window collapsed but no probe was ever safe.
+        // Every gain in the table over-drives the target dBFS —
+        // typically means the antenna is hot enough that even the
+        // minimum gain is above target, OR (more commonly on SDRplay)
+        // the profile's amp_target is unreachable because the
+        // aggregate-gain floor sits well above the real ADC noise
+        // floor. Bail out of the amp pre-stage and let the legacy
+        // Coarse-then-Fine search take over from the profile's
+        // default initial gain. The Coarse set is biased toward each
+        // family's HD sweet spot, so this fallback lands in a
+        // useful place without an MER-blind probe sweep.
+        if self.amp_lo >= self.amp_hi && !self.amp_ever_safe {
+            let seed_idx = nearest_idx(&self.table, self.cfg.initial_tenths);
+            let seed_tenths = self.table[seed_idx];
+            // Pick Coarse if the profile has a non-empty set,
+            // otherwise Fine. Mirrors the cold-start path in `new`.
+            self.phase = if self.coarse_table.is_empty() {
+                SearchPhase::Fine
+            } else {
+                SearchPhase::Coarse
+            };
+            self.amp_probing = None;
+            self.best_gain_idx = seed_idx;
+            self.best_mer_seen = f32::NEG_INFINITY;
+            self.explored.clear();
+            self.probes_without_improvement = 0;
+            self.last_dir = if self.cfg.initial_direction >= 1 { 1 } else { -1 };
+            self.last_reason = format!(
+                "amp-probe: every gain above target {:.1} dBFS; aborting amp \
+                 pre-stage and seeding {} from idx {} ({:.1} dB)",
+                self.cfg.amp_target_dbfs,
+                match self.phase {
+                    SearchPhase::Coarse => "coarse",
+                    SearchPhase::Fine => "fine",
+                    _ => "search",
+                },
+                seed_idx,
+                seed_tenths as f32 / 10.0,
+            );
+            self.gain_idx = seed_idx;
+            self.last_change_at = Instant::now();
+            self.ema_mer_min = None;
+            self.mer_samples_since_change = 0;
+            return Some(AgcAction {
+                new_idx: seed_idx,
+                new_tenths: seed_tenths,
+                reason: self.last_reason.clone(),
+            });
+        }
+
+        // Termination: window collapsed. The amplitude winner is
+        // `amp_lo` (highest confirmed safe). Transition to
+        // MerQualityCheck and emit one final gain write so the
+        // applied gain matches the winner index (the last probe may
+        // have been the over-hot `mid` that triggered the `hi` cut).
+        if self.amp_lo >= self.amp_hi {
+            let winner = self.amp_lo;
+            let winner_tenths = self.table[winner];
+            let already_here = self.gain_idx == winner;
+            self.phase = SearchPhase::MerQualityCheck;
+            // Wait 3 MER frames (~750 ms at nrsc5's 4 Hz cadence)
+            // for the EMA to stabilize before settle/handoff.
+            self.mer_check_remaining = 3;
+            self.amp_probing = None;
+            self.last_reason = format!(
+                "amp-probe converged: idx {} ({:.1} dB, rms {:.2} dBFS); awaiting mer",
+                winner,
+                winner_tenths as f32 / 10.0,
+                rms_dbfs.unwrap_or(f32::NAN),
+            );
+            if already_here {
+                // Driver still needs the gain refreshed so EMA reset
+                // semantics match a normal phase change. Reset the
+                // settle gate clocks even when not writing gain.
+                self.last_change_at = Instant::now();
+                self.mer_samples_since_change = 0;
+                self.ema_mer_min = None;
+                return None;
+            }
+            self.gain_idx = winner;
+            self.last_change_at = Instant::now();
+            self.ema_mer_min = None;
+            self.mer_samples_since_change = 0;
+            return Some(AgcAction {
+                new_idx: winner,
+                new_tenths: winner_tenths,
+                reason: self.last_reason.clone(),
+            });
+        }
+
+        // Otherwise pick the next midpoint. Bias high: round the
+        // midpoint up so a 2-element window probes the upper element,
+        // matching our "highest safe gain wins" rule.
+        let mid = self.amp_lo + (self.amp_hi - self.amp_lo + 1) / 2;
+        let mid_tenths = self.table[mid];
+        self.amp_probing = Some(mid);
+        self.gain_idx = mid;
+        self.last_change_at = Instant::now();
+        self.ema_mer_min = None;
+        self.mer_samples_since_change = 0;
+        self.last_reason = match rms_dbfs {
+            Some(p) => format!(
+                "amp-probe [{}..{}] -> idx {} ({:.1} dB) target {:.1} dBFS, last rms {:.2} dBFS",
+                self.amp_lo,
+                self.amp_hi,
+                mid,
+                mid_tenths as f32 / 10.0,
+                self.cfg.amp_target_dbfs,
+                p,
+            ),
+            None => format!(
+                "amp-probe seed [{}..{}] -> idx {} ({:.1} dB) target {:.1} dBFS",
+                self.amp_lo,
+                self.amp_hi,
+                mid,
+                mid_tenths as f32 / 10.0,
+                self.cfg.amp_target_dbfs,
+            ),
+        };
+        Some(AgcAction {
+            new_idx: mid,
+            new_tenths: mid_tenths,
+            reason: self.last_reason.clone(),
+        })
+    }
+
     // (Phase 2c: removed `next_unexplored` — the Fine walk now
     // queries `best_gain_idx ± 1` directly, see step 5 in `tick`.
     // Kept this comment as a tombstone so a future "why no
@@ -754,6 +1139,13 @@ mod tests {
             // Phase 3 default: cache-miss path (fresh search). The
             // dedicated cache-hit tests opt in explicitly.
             seeded_from_cache: false,
+            // v0.6.0: disable the amplitude pre-stage in the legacy
+            // tests so the Coarse/Fine state machine is exercised
+            // directly. AmpProbe gets its own dedicated tests below.
+            amp_target_dbfs: -20.0,
+            amp_probe_samples: 16384,
+            amp_flush_ms: 120,
+            amp_enable: false,
         }
     }
 
@@ -858,8 +1250,10 @@ mod tests {
         // R820T2 table. After initial_action() each subsequent tick
         // should step to the NEXT coarse point in declaration order,
         // marking each in `explored`. The initial idx (snapped from
-        // initial_tenths) is independently recorded by the first
-        // tick's observation step.
+        // initial_tenths) is intentionally NOT recorded on the first
+        // tick (v0.6.0 placeholder-skip guard) so it does not
+        // contaminate `best_gain_idx` before any real coarse probe
+        // has run.
         //
         // Coarse points chosen to land on exact R820T table entries
         // so the index assertion is unambiguous:
@@ -913,13 +1307,14 @@ mod tests {
 
         // Each `drive()` call FIRST records an observation at the
         // current gain (set by the previous tick), THEN steps to the
-        // next coarse point. So the MER sequence is offset by one
-        // step from the visit sequence:
-        //   drive 1 records initial idx 11, steps -> idx 5
+        // next coarse point. The v0.6.0 "skip placeholder record"
+        // guard drops the first record entirely (the initial gain
+        // was not a deliberate probe), so the recorded sequence is:
+        //   drive 1 records nothing,         steps -> idx 5
         //   drive 2 records idx 5,           steps -> idx 14
         //   drive 3 records idx 14,          steps -> idx 20  <- winner observed here
         //   drive 4 records idx 20,          coarse done -> recenter to 14
-        let _ = drive(&mut agc, 2.0); // records initial idx 11 (mediocre)
+        let _ = drive(&mut agc, 2.0); // placeholder reading discarded
         let _ = drive(&mut agc, 2.0); // records idx 5 (poor)
         let _ = drive(&mut agc, 9.5); // records idx 14 (GREAT -> winner)
         assert_eq!(agc.snapshot().best_idx, 14, "winner should be idx 14");
@@ -943,6 +1338,52 @@ mod tests {
             phase == SearchPhase::Fine || phase == SearchPhase::Done,
             "expected Fine or Done after coarse handoff, got {:?}",
             phase
+        );
+    }
+
+    #[test]
+    fn placeholder_initial_reading_does_not_anchor_best() {
+        // v0.6.0 regression guard for SDRplay 97.1 MHz wedge: the
+        // initial gain produced a mediocre-but-finite MER (~4 dB)
+        // and every coarse probe came back worse. Pre-fix, the
+        // placeholder reading anchored `best_gain_idx` at the initial
+        // index and Fine subsequently bracketed and bailed because
+        // both ±1 neighbours had been marked "explored" by the
+        // coarse pass. Post-fix, the initial reading is discarded
+        // and the best coarse probe wins outright.
+        //
+        // Setup: 3-point coarse table; initial gain at idx 11 sees
+        // EMA 4.0 (the "placeholder mediocre" reading); every coarse
+        // probe sees EMA 1.0 (worse). Expectation: best_idx winds up
+        // at one of the coarse points (5, 14, or 20), NOT at the
+        // initial idx 11.
+        let cfg = AgcConfig {
+            coarse_probe_tenths: &[77, 254, 372],
+            mer_target_db: 99.0, // never hit target shortcut
+            ..cfg_fast()
+        };
+        let mut agc = AgcController::new(R820T_GAINS_TENTHS, cfg);
+        let _ = agc.initial_action();
+
+        // drive 1: would have recorded initial idx 11 EMA 4.0 (pre-fix bug).
+        //          post-fix: skip record, advance coarse to idx 5.
+        let _ = drive(&mut agc, 4.0);
+        // drive 2..4: each coarse probe gets EMA 1.0 — worse than the
+        // initial 4.0. Pre-fix, best stayed at idx 11. Post-fix,
+        // idx 5 becomes best on drive 2 (first real measurement).
+        for _ in 0..3 {
+            let _ = drive(&mut agc, 1.0);
+        }
+        let snap = agc.snapshot();
+        assert_ne!(
+            snap.best_idx, 11,
+            "placeholder initial idx 11 must not be the winner after coarse \
+             sweep (pre-fix regression: best_idx == 11)",
+        );
+        assert!(
+            matches!(snap.best_idx, 5 | 14 | 20),
+            "expected best_idx at a coarse point (5/14/20), got {}",
+            snap.best_idx
         );
     }
 
@@ -1082,5 +1523,198 @@ mod tests {
         assert_eq!(snap.status, AgcStatus::Settled);
         assert!(snap.from_cache, "still from_cache after SETTLED");
         assert_eq!(snap.best_idx, 14, "settled at the cached idx");
+    }
+
+    // === v0.6.0 amplitude-pre-stage tests ============================
+    //
+    // These exercise `tick_amp` directly: the algorithm is a plain
+    // binary search over `agc_tenths_table` indices, biased to the
+    // high (loud) side, terminating when the window collapses. The
+    // driver thread will plumb real `rms_dbfs` readings from the
+    // IqBus; these tests fake them so the search is deterministic.
+
+    /// Returns an `AgcConfig` with `amp_enable = true` and the other
+    /// timing knobs set to zero so each `tick_amp` returns a decision
+    /// immediately. `bail_after_changes` is high enough that 5+ probes
+    /// don't trip it.
+    fn cfg_amp() -> AgcConfig {
+        AgcConfig {
+            amp_enable: true,
+            amp_target_dbfs: -20.0,
+            ..cfg_fast()
+        }
+    }
+
+    #[test]
+    fn amp_probe_enters_when_enabled() {
+        let agc = AgcController::new(R820T_GAINS_TENTHS, cfg_amp());
+        // Cold-start with amp_enable=true → controller MUST be in
+        // AmpProbe phase. Regression guard for the constructor.
+        assert_eq!(agc.snapshot().phase, SearchPhase::AmpProbe);
+    }
+
+    #[test]
+    fn amp_probe_skipped_when_disabled() {
+        // amp_enable=false (the cfg_fast default) → legacy phase
+        // entry. Empty coarse table = Fine; non-empty = Coarse.
+        let agc = AgcController::new(R820T_GAINS_TENTHS, cfg_fast());
+        assert_eq!(agc.snapshot().phase, SearchPhase::Fine);
+    }
+
+    #[test]
+    fn amp_probe_skipped_when_seeded_from_cache() {
+        // Cache hit beats amplitude pre-stage: the Phase 3 fast path
+        // must still skip straight to Fine regardless of amp_enable.
+        let cfg = AgcConfig {
+            seeded_from_cache: true,
+            ..cfg_amp()
+        };
+        let agc = AgcController::new(R820T_GAINS_TENTHS, cfg);
+        assert_eq!(agc.snapshot().phase, SearchPhase::Fine);
+    }
+
+    #[test]
+    fn amp_probe_first_call_picks_mid_high() {
+        let mut agc = AgcController::new(R820T_GAINS_TENTHS, cfg_amp());
+        let _ = agc.initial_action();
+        // First call: peak=None (no measurement yet). Expect the
+        // controller to seed the binary search at the upper mid:
+        // mid = 0 + (28-0+1)/2 = 14.
+        let action = agc
+            .tick_amp(None)
+            .expect("first amp probe should emit an action");
+        assert_eq!(action.new_idx, 14);
+        assert_eq!(action.new_tenths, R820T_GAINS_TENTHS[14]);
+        assert_eq!(agc.snapshot().phase, SearchPhase::AmpProbe);
+    }
+
+    #[test]
+    fn amp_probe_binary_search_converges_high_safe_gain() {
+        // Imagine a station where indices 0..=18 are safe (peak ≤
+        // -6 dBFS) and 19..=28 clip (peak > -6 dBFS). The binary
+        // search should converge on idx 18 in O(log N) probes (≤ 5
+        // for the 29-step table) and transition to MerQualityCheck.
+        let mut agc = AgcController::new(R820T_GAINS_TENTHS, cfg_amp());
+        let _ = agc.initial_action();
+        let mut last_idx = None;
+        for probe_num in 0..10 {
+            let measurement = last_idx.map(|idx: usize| {
+                if idx <= 18 { -25.0 } else { -10.0 } // -25 = safe, -10 = hot (target -20)
+            });
+            let action = agc.tick_amp(measurement);
+            if agc.snapshot().phase == SearchPhase::MerQualityCheck {
+                // Final action (if any) must land at the safe winner.
+                if let Some(a) = action {
+                    assert_eq!(
+                        a.new_idx, 18,
+                        "expected winner=18, got {} after {} probes",
+                        a.new_idx, probe_num
+                    );
+                }
+                assert_eq!(agc.snapshot().current_idx, 18);
+                return;
+            }
+            last_idx = action.map(|a| a.new_idx);
+        }
+        panic!(
+            "amp probe failed to converge in 10 iterations, phase = {:?}",
+            agc.snapshot().phase
+        );
+    }
+
+    #[test]
+    fn amp_probe_window_collapses_at_index_zero() {
+        // Pathological "everything clips" station: every probe
+        // returns "too hot" and `amp_lo` never advances off idx 0.
+        // v0.6.0 behaviour: instead of committing the never-confirmed
+        // idx 0 to MerQualityCheck (which used to bail at the table
+        // edge with a bogus seed), the controller MUST abort the amp
+        // pre-stage and hand off to the legacy Coarse/Fine search
+        // seeded from `initial_tenths`. `cfg_amp` inherits `cfg_fast`'s
+        // empty coarse table, so the fallback target phase is Fine.
+        let mut agc = AgcController::new(R820T_GAINS_TENTHS, cfg_amp());
+        let _ = agc.initial_action();
+        let seed_idx = nearest_idx(R820T_GAINS_TENTHS, 197);
+        let mut last_idx = None;
+        for _ in 0..20 {
+            let measurement = last_idx.map(|_: usize| -5.0); // always hot vs -20 dBFS target
+            let _ = agc.tick_amp(measurement);
+            if agc.snapshot().phase == SearchPhase::Fine {
+                assert_eq!(
+                    agc.snapshot().current_idx,
+                    seed_idx,
+                    "amp abort must reset to initial gain, not park at the floor"
+                );
+                return;
+            }
+            last_idx = Some(agc.snapshot().current_idx);
+        }
+        panic!("amp probe failed to abort on the always-hot station");
+    }
+
+    #[test]
+    fn amp_probe_handoff_settles_when_mer_meets_target() {
+        // Convergence into MerQualityCheck, then good MER → Settled.
+        let mut agc = AgcController::new(R820T_GAINS_TENTHS, cfg_amp());
+        let _ = agc.initial_action();
+        // One probe + "safe" report → window expands; second probe at
+        // top of table is safe too → converges to idx 28.
+        for _ in 0..10 {
+            let measurement = Some(-25.0); // always safe vs -20 dBFS target
+            let _ = agc.tick_amp(measurement);
+            if agc.snapshot().phase == SearchPhase::MerQualityCheck {
+                break;
+            }
+        }
+        assert_eq!(agc.snapshot().phase, SearchPhase::MerQualityCheck);
+        // Now feed good MER. `drive()` pumps 5 events which is enough
+        // to clear `mer_check_remaining=3` and trigger settle.
+        let _ = drive(&mut agc, 14.0);
+        assert_eq!(agc.snapshot().status, AgcStatus::Settled);
+        assert_eq!(agc.snapshot().phase, SearchPhase::Done);
+    }
+
+    #[test]
+    fn amp_probe_handoff_falls_through_to_fine_when_mer_bad() {
+        // Convergence into MerQualityCheck, then bad MER → Fine.
+        let mut agc = AgcController::new(R820T_GAINS_TENTHS, cfg_amp());
+        let _ = agc.initial_action();
+        for _ in 0..10 {
+            let _ = agc.tick_amp(Some(-25.0));
+            if agc.snapshot().phase == SearchPhase::MerQualityCheck {
+                break;
+            }
+        }
+        // Feed bad MER → controller should hand off to Fine and
+        // continue probing instead of settling.
+        let _ = drive(&mut agc, 2.0);
+        assert!(
+            matches!(agc.snapshot().phase, SearchPhase::Fine | SearchPhase::Done),
+            "expected Fine handoff (or Done bail), got {:?}",
+            agc.snapshot().phase
+        );
+        // Must still be in Probing (not Settled) — the amp winner
+        // wasn't good enough on its own.
+        assert_ne!(
+            agc.snapshot().status,
+            AgcStatus::Settled,
+            "amp+mer should not settle on bad MER"
+        );
+    }
+
+    #[test]
+    fn tick_amp_is_no_op_outside_amp_phase() {
+        // Defensive: tick_amp called while phase is Fine (cache hit
+        // path) MUST do nothing, not crash or stomp gain.
+        let cfg = AgcConfig {
+            seeded_from_cache: true,
+            ..cfg_amp()
+        };
+        let mut agc = AgcController::new(R820T_GAINS_TENTHS, cfg);
+        let _ = agc.initial_action();
+        let before = agc.snapshot().current_idx;
+        let action = agc.tick_amp(Some(-3.0));
+        assert!(action.is_none(), "tick_amp must no-op outside AmpProbe");
+        assert_eq!(agc.snapshot().current_idx, before);
     }
 }

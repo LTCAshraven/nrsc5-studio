@@ -1,4 +1,4 @@
-//! Raw FFI bindings for `libnrsc5` (upstream `theori-io/nrsc5` v3.1.0).
+//! Raw FFI bindings for `libnrsc5` (upstream `theori-io/nrsc5` v3.2.0).
 //!
 //! Hand-curated mirror of [`res/nrsc5.h`](../../../res/nrsc5.h) — kept in
 //! sync with the upstream tag that [`scripts/build-nrsc5-msys2.ps1`] builds.
@@ -52,6 +52,7 @@ pub const NRSC5_MIME_TTN_TPEG_3: u32 = 0x52103469;
 pub const NRSC5_MIME_TTN_STM_TRAFFIC: u32 = 0xFF8422D7;
 pub const NRSC5_MIME_TTN_STM_WEATHER: u32 = 0xEF042E96;
 pub const NRSC5_MIME_UNKNOWN_00000000: u32 = 0x00000000;
+pub const NRSC5_MIME_UNKNOWN_1C7D0E29: u32 = 0x1C7D0E29;
 pub const NRSC5_MIME_UNKNOWN_B81FFAA8: u32 = 0xB81FFAA8;
 pub const NRSC5_MIME_UNKNOWN_FFFFFFFF: u32 = 0xFFFFFFFF;
 
@@ -60,6 +61,10 @@ pub const NRSC5_SAMPLE_RATE_CU8: u32 = 1488375;
 pub const NRSC5_SAMPLE_RATE_CS16_FM: f64 = 744187.5;
 pub const NRSC5_SAMPLE_RATE_CS16_AM: f64 = 46511.71875;
 pub const NRSC5_SAMPLE_RATE_AUDIO: u32 = 44100;
+
+/// Length of Core Version & Manufacturer Version int arrays carried
+/// on `EXCITER_INFO` / `IMPORTER_INFO` events (new in v3.2.0).
+pub const NRSC5_DEVICE_VERSION_LENGTH: usize = 4;
 
 // Modes (anonymous enum in nrsc5.h)
 pub const NRSC5_MODE_FM: c_int = 0;
@@ -78,7 +83,8 @@ pub const NRSC5_AAS_TYPE_LOT: u8 = 3;
 pub const NRSC5_SIG_SERVICE_AUDIO: u8 = 0;
 pub const NRSC5_SIG_SERVICE_DATA: u8 = 1;
 
-// Event tags (anonymous enum, values are 0..=26 in declaration order).
+// Event tags (anonymous enum, values are 0..=30 in declaration order;
+// 27..=30 added in libnrsc5 v3.2.0).
 pub const NRSC5_EVENT_LOST_DEVICE: c_uint = 0;
 pub const NRSC5_EVENT_IQ: c_uint = 1;
 pub const NRSC5_EVENT_SYNC: c_uint = 2;
@@ -106,6 +112,15 @@ pub const NRSC5_EVENT_HERE_IMAGE: c_uint = 23;
 pub const NRSC5_EVENT_LOT_HEADER: c_uint = 24;
 pub const NRSC5_EVENT_LOT_FRAGMENT: c_uint = 25;
 pub const NRSC5_EVENT_AGC: c_uint = 26;
+pub const NRSC5_EVENT_EXCITER_INFO: c_uint = 27;
+pub const NRSC5_EVENT_IMPORTER_INFO: c_uint = 28;
+pub const NRSC5_EVENT_LEAP_SECOND_OFFSET: c_uint = 29;
+pub const NRSC5_EVENT_LOCAL_TIME: c_uint = 30;
+
+// HDC packet flags (new in v3.2.0). Not consumed today — our pipeline
+// reads `audio` events (decoded PCM), not `hdc` (raw codec bytes).
+pub const NRSC5_PKT_FLAGS_NONE: c_uint = 0;
+pub const NRSC5_PKT_FLAGS_CRC_ERROR: c_uint = 1 << 0;
 
 // Access flags
 pub const NRSC5_ACCESS_PUBLIC: c_uint = 0;
@@ -315,6 +330,14 @@ pub struct nrsc5_event_iq {
 pub struct nrsc5_event_sync {
     pub freq_offset: c_float,
     pub psmi: c_int,
+    /// Power Level Indicator (AM only; set to -1 for FM). New in v3.2.0.
+    pub pli: c_int,
+    /// High-Power PIDS Indicator (AM only; set to -1 for FM). New in v3.2.0.
+    pub hppi: c_int,
+    /// Analog Audio Bandwidth Indicator (AM only; set to -1 for FM). New in v3.2.0.
+    pub aabi: c_int,
+    /// Reduced Digital Bandwidth Indicator (AM only; set to -1 for FM). New in v3.2.0.
+    pub rdbi: c_int,
 }
 
 #[repr(C)]
@@ -336,6 +359,8 @@ pub struct nrsc5_event_hdc {
     pub program: c_uint,
     pub data: *const u8,
     pub count: usize,
+    /// Bitfield of `NRSC5_PKT_FLAGS_*` (new in v3.2.0).
+    pub flags: c_uint,
 }
 
 #[repr(C)]
@@ -547,6 +572,70 @@ pub struct nrsc5_event_agc {
     pub is_final: c_int,
 }
 
+/// Exciter equipment metadata (new in libnrsc5 v3.2.0). Reported
+/// once per L1 frame when SIS Parameter messages carrying exciter info
+/// have been received.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct nrsc5_event_exciter_info {
+    /// Manufacturer ID string, e.g. "GG" (Continental) or "L7" (Nautel).
+    /// Always 2 ASCII characters in practice, NUL-terminated.
+    pub manufacturer_id: *const c_char,
+    /// Core firmware version, 4 ints.
+    pub core_version: [c_int; NRSC5_DEVICE_VERSION_LENGTH],
+    /// 0 = Commercial Release, 1 = Engineering Release, 2 = Patch.
+    pub core_status: c_int,
+    /// Manufacturer-assigned firmware version, 4 ints.
+    pub manufacturer_version: [c_int; NRSC5_DEVICE_VERSION_LENGTH],
+    /// Same scale as `core_status`.
+    pub manufacturer_status: c_int,
+    /// 1 if an importer is wired to this exciter, otherwise 0.
+    pub importer_connected: c_int,
+}
+
+/// Importer equipment metadata (new in libnrsc5 v3.2.0). Same shape
+/// as `exciter_info` minus `importer_connected`.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct nrsc5_event_importer_info {
+    pub manufacturer_id: *const c_char,
+    pub core_version: [c_int; NRSC5_DEVICE_VERSION_LENGTH],
+    pub core_status: c_int,
+    pub manufacturer_version: [c_int; NRSC5_DEVICE_VERSION_LENGTH],
+    pub manufacturer_status: c_int,
+}
+
+/// Leap-second offset broadcast (new in libnrsc5 v3.2.0). The current
+/// GPS-UTC offset (always 18 seconds as of 2026), plus any pending
+/// adjustment.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct nrsc5_event_leap_second_offset {
+    /// Future GPS-UTC offset in seconds (broadcast in advance of a
+    /// scheduled leap second).
+    pub pending_offset: c_int,
+    /// Current GPS-UTC offset in seconds.
+    pub current_offset: c_int,
+    /// ALFN representing the GPS time of a pending leap second
+    /// adjustment, or 0 if a leap second is not pending.
+    pub pending_alfn: c_uint,
+}
+
+/// Broadcaster local-time metadata (new in libnrsc5 v3.2.0). Conveys
+/// the broadcaster's local UTC offset and DST schedule.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct nrsc5_event_local_time {
+    /// Local Time Zone UTC Offset in minutes.
+    pub utc_offset: c_int,
+    /// 1 if DST is currently in effect regionally, otherwise 0.
+    pub dst_regional: c_int,
+    /// 1 if DST is practiced locally, otherwise 0.
+    pub dst_local: c_int,
+    /// 0 = DST not practiced, 1 = U.S./Canada schedule, 2 = EU schedule.
+    pub dst_schedule: c_int,
+}
+
 /// The anonymous union inside `nrsc5_event_t`. The active variant
 /// matches the `event` tag on the enclosing struct
 /// (`NRSC5_EVENT_*`). Reading any other variant is undefined
@@ -577,6 +666,10 @@ pub union nrsc5_event_payload {
     pub emergency_alert: nrsc5_event_emergency_alert,
     pub here_image: nrsc5_event_here_image,
     pub agc: nrsc5_event_agc,
+    pub exciter_info: nrsc5_event_exciter_info,
+    pub importer_info: nrsc5_event_importer_info,
+    pub leap_second_offset: nrsc5_event_leap_second_offset,
+    pub local_time: nrsc5_event_local_time,
 }
 
 /// Top-level event passed to the user callback. The `event` field is
@@ -676,9 +769,9 @@ mod tests {
         // Windows that's 8 bytes per pointer.
         assert_eq!(size_of::<*mut nrsc5_t>(), size_of::<usize>());
 
-        // nrsc5_event_sync = float + int = 8 bytes (with 4-byte
-        // alignment). If someone widens c_int we want a failure.
-        assert_eq!(size_of::<nrsc5_event_sync>(), 8);
+        // nrsc5_event_sync = float + psmi + 4 AM ints = 6 * 4 = 24 bytes
+        // (with 4-byte alignment). v3.2.0 added pli/hppi/aabi/rdbi.
+        assert_eq!(size_of::<nrsc5_event_sync>(), 24);
         assert_eq!(align_of::<nrsc5_event_sync>(), 4);
 
         // nrsc5_event_agc = 2 floats + 1 int = 12 bytes

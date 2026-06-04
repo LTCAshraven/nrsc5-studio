@@ -35,7 +35,7 @@
 //! will retire `ffi::decoder::DecoderInstance` and route the existing
 //! [`NrscEvent`] channel through this wrapper instead.
 
-use std::ffi::{c_char, c_void, CStr};
+use std::ffi::{c_char, c_int, c_void, CStr};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
 use std::slice;
@@ -377,7 +377,21 @@ unsafe fn translate_event(tag: u32, payload: &sys::nrsc5_event_payload) -> Vec<N
     let mut out: Vec<NrscEvent> = Vec::new();
     match tag {
         sys::NRSC5_EVENT_LOST_DEVICE => out.push(NrscEvent::LostDevice),
-        sys::NRSC5_EVENT_SYNC => out.push(NrscEvent::Sync),
+        sys::NRSC5_EVENT_SYNC => {
+            out.push(NrscEvent::Sync);
+            // v3.2.0 AM-mode supplementary indicators. libnrsc5 sets
+            // all four to -1 in FM mode — emit `SyncAm` only when at
+            // least one carries real data, so FM consumers stay clean.
+            let s = unsafe { payload.sync };
+            if s.pli != -1 || s.hppi != -1 || s.aabi != -1 || s.rdbi != -1 {
+                out.push(NrscEvent::SyncAm {
+                    pli: s.pli,
+                    hppi: s.hppi,
+                    aabi: s.aabi,
+                    rdbi: s.rdbi,
+                });
+            }
+        }
         sys::NRSC5_EVENT_LOST_SYNC => out.push(NrscEvent::LostSync),
         sys::NRSC5_EVENT_MER => {
             // SAFETY: union access; tag matches.
@@ -571,6 +585,46 @@ unsafe fn translate_event(tag: u32, payload: &sys::nrsc5_event_payload) -> Vec<N
             let a = unsafe { payload.agc };
             out.push(NrscEvent::Agc { gain_db: a.gain_db });
         }
+        sys::NRSC5_EVENT_EXCITER_INFO => {
+            let e = unsafe { payload.exciter_info };
+            out.push(NrscEvent::ExciterInfo {
+                manufacturer_id: unsafe { cstr_to_string(e.manufacturer_id) },
+                core_version: e.core_version,
+                core_status: e.core_status,
+                manufacturer_version: e.manufacturer_version,
+                manufacturer_status: e.manufacturer_status,
+                importer_connected: e.importer_connected != 0,
+            });
+        }
+        sys::NRSC5_EVENT_IMPORTER_INFO => {
+            let i = unsafe { payload.importer_info };
+            out.push(NrscEvent::ImporterInfo {
+                manufacturer_id: unsafe { cstr_to_string(i.manufacturer_id) },
+                core_version: i.core_version,
+                core_status: i.core_status,
+                manufacturer_version: i.manufacturer_version,
+                manufacturer_status: i.manufacturer_status,
+            });
+        }
+        sys::NRSC5_EVENT_LEAP_SECOND_OFFSET => {
+            let l = unsafe { payload.leap_second_offset };
+            out.push(NrscEvent::LeapSecondOffset {
+                pending_offset: l.pending_offset,
+                current_offset: l.current_offset,
+                pending_alfn: l.pending_alfn,
+            });
+        }
+        sys::NRSC5_EVENT_LOCAL_TIME => {
+            let t = unsafe { payload.local_time };
+            // dst_schedule is 0..=2; clamp defensively for the u8 cast.
+            let dst_schedule = t.dst_schedule.clamp(0, u8::MAX as c_int) as u8;
+            out.push(NrscEvent::LocalTime {
+                utc_offset_minutes: t.utc_offset,
+                dst_regional: t.dst_regional != 0,
+                dst_local: t.dst_local != 0,
+                dst_schedule,
+            });
+        }
         // Not surfaced:
         //   IQ, HDC, STREAM, PACKET — internal / raw.
         //   AUDIO — handled by the PCM sink path in `trampoline`.
@@ -710,16 +764,68 @@ mod tests {
     #[test]
     fn translates_sync() {
         let (mut ctx, out) = capture();
+        let mut payload = zeroed_payload();
+        // FM mode: libnrsc5 sets all four AM-only indicators to -1.
+        // Without these sentinels, the v3.2.0 `Sync` arm would also
+        // emit a `SyncAm` event from the zeroed AM fields.
+        payload.sync = sys::nrsc5_event_sync {
+            freq_offset: 0.0,
+            psmi: 0,
+            pli: -1,
+            hppi: -1,
+            aabi: -1,
+            rdbi: -1,
+        };
         dispatch(
             sys::nrsc5_event_t {
                 event: sys::NRSC5_EVENT_SYNC,
-                payload: zeroed_payload(),
+                payload,
             },
             &mut ctx,
         );
         let got = out.lock().unwrap();
         assert_eq!(got.len(), 1);
         assert!(matches!(got[0], NrscEvent::Sync));
+    }
+
+    #[test]
+    fn translates_sync_am() {
+        // AM mode: libnrsc5 reports real values for pli/hppi/aabi/rdbi.
+        // Translation should emit Sync followed by SyncAm.
+        let (mut ctx, out) = capture();
+        let mut payload = zeroed_payload();
+        payload.sync = sys::nrsc5_event_sync {
+            freq_offset: 0.0,
+            psmi: 0,
+            pli: 3,
+            hppi: 1,
+            aabi: 2,
+            rdbi: 0,
+        };
+        dispatch(
+            sys::nrsc5_event_t {
+                event: sys::NRSC5_EVENT_SYNC,
+                payload,
+            },
+            &mut ctx,
+        );
+        let got = out.lock().unwrap();
+        assert_eq!(got.len(), 2);
+        assert!(matches!(got[0], NrscEvent::Sync));
+        match got[1] {
+            NrscEvent::SyncAm {
+                pli,
+                hppi,
+                aabi,
+                rdbi,
+            } => {
+                assert_eq!(pli, 3);
+                assert_eq!(hppi, 1);
+                assert_eq!(aabi, 2);
+                assert_eq!(rdbi, 0);
+            }
+            ref other => panic!("expected SyncAm, got {other:?}"),
+        }
     }
 
     #[test]

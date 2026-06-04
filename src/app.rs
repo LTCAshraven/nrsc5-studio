@@ -296,6 +296,7 @@ impl Nrsc5App {
                 muted: config.muted,
                 gain_mode: config.gain_mode,
                 manual_gain_tenths: config.manual_gain_tenths,
+                agc_amp_target_dbfs_override: config.agc_amp_target_dbfs_override,
                 show_hd5_hd8: config.show_hd5_hd8,
                 preset_slot_count: config.preset_slot_count.clamp(1, 48),
                 recording_mode: config.recording_mode,
@@ -2092,6 +2093,86 @@ impl Nrsc5App {
                 self.app_state.station_info.alert = Some(text);
                 self.app_state.station_info.last_updated = Some(Instant::now());
             }
+            NrscEvent::ExciterInfo {
+                manufacturer_id,
+                core_version,
+                core_status,
+                manufacturer_version,
+                manufacturer_status,
+                importer_connected,
+            } => {
+                self.app_state.station_info.exciter =
+                    Some(crate::station_info::EquipmentInfo {
+                        manufacturer_id,
+                        core_version,
+                        core_status,
+                        manufacturer_version,
+                        manufacturer_status,
+                        importer_connected: Some(importer_connected),
+                    });
+                self.app_state.station_info.last_updated = Some(Instant::now());
+            }
+            NrscEvent::ImporterInfo {
+                manufacturer_id,
+                core_version,
+                core_status,
+                manufacturer_version,
+                manufacturer_status,
+            } => {
+                self.app_state.station_info.importer =
+                    Some(crate::station_info::EquipmentInfo {
+                        manufacturer_id,
+                        core_version,
+                        core_status,
+                        manufacturer_version,
+                        manufacturer_status,
+                        importer_connected: None,
+                    });
+                self.app_state.station_info.last_updated = Some(Instant::now());
+            }
+            NrscEvent::LocalTime {
+                utc_offset_minutes,
+                dst_regional,
+                dst_local,
+                dst_schedule,
+            } => {
+                self.app_state.station_info.local_time =
+                    Some(crate::station_info::LocalTimeInfo {
+                        utc_offset_minutes,
+                        dst_regional,
+                        dst_local,
+                        dst_schedule,
+                    });
+                self.app_state.station_info.last_updated = Some(Instant::now());
+            }
+            NrscEvent::LeapSecondOffset {
+                pending_offset,
+                current_offset,
+                pending_alfn,
+            } => {
+                self.app_state.station_info.leap_second =
+                    Some(crate::station_info::LeapSecondInfo {
+                        current_offset,
+                        pending_offset,
+                        pending_alfn,
+                    });
+                self.app_state.station_info.last_updated = Some(Instant::now());
+            }
+            NrscEvent::SyncAm {
+                pli,
+                hppi,
+                aabi,
+                rdbi,
+            } => {
+                // Plumbed for diagnostics; not rendered today.
+                self.app_state.station_info.am_sync =
+                    Some(crate::station_info::AmSyncIndicators {
+                        pli,
+                        hppi,
+                        aabi,
+                        rdbi,
+                    });
+            }
             _ => {}
         }
     }
@@ -2162,6 +2243,7 @@ impl Nrsc5App {
                     self.config.gain_mode,
                     self.config.manual_gain_tenths,
                     antenna,
+                    self.config.agc_amp_target_dbfs_override,
                 );
 
                 if let Err(err) = result {
@@ -2498,6 +2580,23 @@ impl Nrsc5App {
                 }
                 self.config.gain_mode = mode;
                 self.app_state.gain_mode = mode;
+                save_config(&self.config);
+            }
+            UiCommand::SetAgcAmpTargetDbfs(target) => {
+                // Clamp at the boundary so a hand-edited config can't
+                // sneak past the UI's [-30, -10] window. None clears
+                // the override and reverts to the per-device profile
+                // default on the next tune. No hot-apply: the override
+                // only matters during the AmpProbe phase which runs
+                // exactly once per cold-start tune, so this lands in
+                // config + AppState and the next TuneMhz picks it up.
+                let normalized = target.map(|t| t.clamp(-30.0, -10.0));
+                if self.config.agc_amp_target_dbfs_override == normalized {
+                    self.app_state.agc_amp_target_dbfs_override = normalized;
+                    return;
+                }
+                self.config.agc_amp_target_dbfs_override = normalized;
+                self.app_state.agc_amp_target_dbfs_override = normalized;
                 save_config(&self.config);
             }
             UiCommand::SetManualGainTenths(tenths) => {
@@ -3514,6 +3613,122 @@ impl Nrsc5App {
             .small()
             .color(egui::Color32::from_gray(140)),
         );
+
+        // ---- v0.6.0 Advanced AGC tuning ------------------------------
+        // The amplitude pre-stage's RMS target is normally set by the
+        // per-device profile (e.g. -20 dBFS for RTL-SDR, -22 dBFS for
+        // SDRplay), but power users with unusual antennas / noise
+        // floors / preamps benefit from being able to nudge it. The
+        // override only takes effect on the next cold-start tune
+        // (cache hits skip AmpProbe entirely), so a Re-tune is needed
+        // for changes to be visible in the agc-trace log.
+        ui.add_space(12.0);
+        ui.separator();
+        ui.add_space(6.0);
+        egui::CollapsingHeader::new("Advanced AGC tuning")
+            .default_open(self.app_state.agc_amp_target_dbfs_override.is_some())
+            .show(ui, |ui| {
+                let profile_default = crate::sdr::profile::lookup(active_driver)
+                    .map(|p| p.amp_target_dbfs)
+                    .unwrap_or(-20.0);
+
+                ui.label("Initial signal strength target");
+                ui.label(
+                    egui::RichText::new(
+                        "When you tune to a new station, the AGC quickly picks \
+                         a starting gain that aims for this signal level, then \
+                         fine-tunes from there. The default works well for most \
+                         antennas \u{2014} you only need this if HD lock is \
+                         unreliable in your specific RF environment.",
+                    )
+                    .small()
+                    .color(egui::Color32::from_gray(150)),
+                );
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Default for {}: {:.1} dBFS",
+                        active_driver, profile_default,
+                    ))
+                    .small()
+                    .color(egui::Color32::from_gray(140)),
+                );
+                ui.add_space(6.0);
+
+                let mut override_enabled =
+                    self.app_state.agc_amp_target_dbfs_override.is_some();
+                let mut override_value = self
+                    .app_state
+                    .agc_amp_target_dbfs_override
+                    .unwrap_or(profile_default);
+
+                let checkbox_resp = ui.checkbox(
+                    &mut override_enabled,
+                    "Use a custom target",
+                );
+                if checkbox_resp.changed() {
+                    if override_enabled {
+                        commands.push(UiCommand::SetAgcAmpTargetDbfs(Some(
+                            override_value,
+                        )));
+                    } else {
+                        commands.push(UiCommand::SetAgcAmpTargetDbfs(None));
+                    }
+                }
+
+                ui.add_enabled_ui(override_enabled, |ui| {
+                    let slider_resp = ui.add(
+                        egui::Slider::new(&mut override_value, -30.0..=-10.0)
+                            .step_by(0.5)
+                            .suffix(" dBFS")
+                            .text("Target"),
+                    );
+                    if override_enabled
+                        && (slider_resp.drag_stopped()
+                            || slider_resp.lost_focus()
+                            || slider_resp.changed())
+                    {
+                        let prev = self.app_state.agc_amp_target_dbfs_override;
+                        if prev.map_or(true, |p| (p - override_value).abs() > 1e-3) {
+                            commands.push(UiCommand::SetAgcAmpTargetDbfs(Some(
+                                override_value,
+                            )));
+                        }
+                    }
+                });
+
+                ui.add_space(8.0);
+                ui.label(egui::RichText::new("When to adjust this:").strong().small());
+                ui.label(
+                    egui::RichText::new(
+                        "\u{2022} Stations near you bail out or take a long time \
+                         to lock (MER stuck low) \u{2014} try a lower (more \
+                         negative) value like \u{2212}2 from the default. The AGC \
+                         will pick a gentler gain that's less likely to overload \
+                         the receiver on strong signals.\n\
+                         \u{2022} Distant or fringe stations never lock \u{2014} \
+                         try a higher (less negative) value. The AGC will start \
+                         at a hotter gain to pull weak signals up. But don't \
+                         push too far or strong local stations may distort.\n\
+                         \u{2022} Most users should leave this alone. The \
+                         per-device default is conservative and works for \
+                         typical indoor / outdoor antennas.",
+                    )
+                    .small()
+                    .color(egui::Color32::from_gray(150)),
+                );
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(
+                        "Changes apply on the next Re-tune. Stations already in \
+                         the gain cache use their stored gain and ignore this \
+                         setting until you clear the cache.",
+                    )
+                    .small()
+                    .italics()
+                    .color(egui::Color32::from_gray(130)),
+                );
+            });
     }
 
     /// Display tab: UI preferences that aren't tied to the SDR — HD5\u{2013}HD8

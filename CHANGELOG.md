@@ -6,6 +6,125 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-06-03
+
+The **amplitude-first AGC + libnrsc5 v3.2.0** release. Cold-start tunes
+now bracket the gain choice in well under a second via an
+amplitude-directed binary search, then hand off to the existing MER
+hill-climb seeded at that bracket. The bundled `libnrsc5` jumps from
+v3.1.0 to v3.2.0, picking up an FFTW alignment perf bump and four new
+SIS events that surface broadcaster equipment + time-zone metadata in
+the Station Info panel.
+
+Thanks to **argilo** (upstream `nrsc5` maintainer) for both the
+amplitude-AGC algorithm we lifted from `theori-io/nrsc5#385` and the
+v3.2.0 release that this build picks up.
+
+### Added
+
+- **AGC amplitude pre-stage (`SearchPhase::AmpProbe`).** Runs ahead of
+  the existing MER coarse/fine controller. Binary-searches the device
+  gain table against a per-profile RMS-dBFS target (−20 dBFS for
+  RTL-SDR, −22 dBFS for SDRplay), picking the highest safe gain that
+  doesn't push the ADC into clipping. The MER hill-climb then starts
+  from that bracket instead of from a fixed mid-table guess. On
+  RTL-SDR Blog V3 with a real OTA antenna, end-to-end cold-start tune
+  times are 13–17 s; the amplitude bracket is picked in under a
+  second.
+- **`src/sdr/iq_bus.rs` helpers:** `rms_dbfs_cu8` (RMS over a window)
+  and `drain_now` (non-blocking try-recv to flush stale chunks). The
+  AGC driver thread now does drain → sleep → drain → measure around
+  each probe so leftover USB chunks at the old gain don't poison the
+  RMS reading at the new gain.
+- **Cache-hit fast path.** When the gain cache has a fresh entry for
+  the current `(driver, antenna, frequency, ppm)` key, the controller
+  skips `AmpProbe` entirely and resumes `Fine` at the cached gain.
+  Cuts retune time on previously-tuned stations.
+- **Settings → Gain → "Advanced AGC tuning".** Collapsing section
+  with a checkbox + slider (−30 to −10 dBFS, 0.5 dB steps) that lets
+  power users override the per-device amplitude target without a
+  rebuild. The override is persisted to `config.toml` and takes
+  effect on the next Re-tune. Cache hits ignore the override (they
+  skip AmpProbe entirely); clear the gain cache to force a fresh
+  amplitude probe.
+- **Station Info: Equipment block.** New rows for `EXCITER_INFO` and
+  `IMPORTER_INFO` events (libnrsc5 v3.2.0). Shows manufacturer ID
+  (e.g. "GG" = Continental, "L7" = Nautel), core firmware version +
+  status (release / engineering / patch), manufacturer firmware
+  version + status, and whether the exciter reports an importer
+  connected.
+- **Station Info: Time block.** New rows for `LOCAL_TIME` and
+  `LEAP_SECOND_OFFSET` events (libnrsc5 v3.2.0). Shows the
+  broadcaster's UTC offset, DST regional/local flags, DST schedule
+  (US/Canada vs EU), and a GPS-UTC offset row with a hover tooltip
+  for any pending leap-second adjustment.
+
+### Changed
+
+- **Bundled `libnrsc5` upgraded from v3.1.0 to v3.2.0.** Picks up
+  FFTW input/output alignment ([theori-io/nrsc5#482](https://github.com/theori-io/nrsc5/pull/482)) —
+  a measurable CPU reduction in the synchronizer FFT path — and the
+  audio output queue refactor from
+  [#500](https://github.com/theori-io/nrsc5/pull/500). The per-program
+  `PcmRing` drop counter is verified clean under steady-state load.
+  `scripts/build-nrsc5-msys2.ps1` defaults to the v3.2.0 tag; the
+  built DLL ships in `bin/libnrsc5.dll`.
+- **`res/nrsc5.h` refreshed** against the v3.2.0 header. Four new
+  event constants (`NRSC5_EVENT_EXCITER_INFO`, `IMPORTER_INFO`,
+  `LEAP_SECOND_OFFSET`, `LOCAL_TIME`), the AM-mode telemetry fields
+  on `sync` events (`pli`, `hppi`, `aabi`, `rdbi` — all -1 in FM
+  mode and not currently rendered), and a new `NRSC5_DEVICE_VERSION_LENGTH`
+  constant for the exciter/importer version strings.
+
+### Fixed
+
+- **AGC: placeholder initial-gain reading no longer wedges the
+  search.** On the very first `Coarse` tick the controller used to
+  record the MER it observed at the profile's `initial_tenths`
+  placeholder gain — the gain the radio sat at while nrsc5 booted —
+  as if it were a deliberate probe. If every coarse probe came back
+  worse than that placeholder (SDRplay 97.1 MHz, June 2026: initial
+  idx 19 held MER 3.88 dB; all five coarse probes scored lower),
+  `best_gain_idx` stayed pinned to the initial index. Fine then
+  bracketed at idx 19 with both ±1 neighbours falsely marked
+  "explored" by the coarse sweep, and bailed at the start. v0.6.0
+  now discards the first-tick observation when we entered `Coarse`,
+  so the best coarse probe wins outright and Fine starts from a real
+  measurement. Fine-only configs (empty coarse table → controller
+  enters `Fine` directly) are unaffected.
+- **SDRplay: amp-probe no longer parks the gain at the floor.**
+  Real-world testing on an RSPdx with an outdoor antenna (103.7 MHz)
+  showed amp-probe driving the aggregate `Gain` element to 20 dB
+  (the bottom of the SDRplay table), where MER never climbed above
+  ~2 dB and the controller bailed. SDRplay's aggregate gain wraps an
+  internal LNA + IFGR split where the HD sweet spot is dominated by
+  IF-chain noise figure — "loudest non-clipping" is the wrong target
+  on that hardware. v0.6.0 disables `amp_enable` in the SDRplay
+  profile so the legacy Coarse `[26, 32, 38, 43, 47]` → Fine pipeline
+  runs directly; manual testing produced 14 dB MER at 40.7 dB on the
+  same station. RTL-SDR keeps the amplitude pre-stage enabled (its
+  single-stage R820T2 has the opposite tradeoff: ADC clipping is the
+  binding constraint).
+- **AGC: graceful abort when no probe is ever safe.** Even with the
+  SDRplay profile fix, the controller now defends against the
+  "everything clips" edge case generically: if the amplitude binary
+  search collapses without ever confirming a safe gain, the
+  controller hands off to Coarse/Fine seeded from the profile's
+  default `initial_tenths` instead of committing the never-confirmed
+  table-floor index as a winner.
+
+### Packaging
+
+- **Linux: `install-nrsc5-helper.sh` is gone for real this time.** The
+  v0.5.1 changelog claimed the helper script was dropped, but
+  `debian/rules` was still installing it, the lintian-overrides file
+  still referenced it, the Fedora spec still shipped it, and the
+  AppStream metainfo + `docs/linux-install.md` still pointed users at
+  it. v0.6.0 finishes the cleanup: the script is deleted, every
+  packaging file is updated, and `linux-install.md` is rewritten
+  to reflect the in-process `libnrsc5` reality (one line: install
+  the package, you're done).
+
 ## [0.5.1] - 2026-06-03
 
 The **single-session-per-station-tuned** correction release. Many thanks to

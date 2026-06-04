@@ -113,6 +113,37 @@ pub struct DeviceProfile {
     /// convergence on real hardware. Used to drive the "Not
     /// bench-validated" banner in the SDR Settings modal.
     pub bench_validated: bool,
+
+    // --- v0.6.0 amplitude-first AGC pre-stage knobs --------------------
+    //
+    // The amplitude pre-stage binary-searches `agc_tenths_table` to
+    // drive RMS dBFS to `amp_target_dbfs` in ~5 probes before any MER
+    // telemetry is consulted. RMS (not peak) is the metric — see
+    // `sdr::iq_bus::rms_dbfs_cu8` for why — so the target values are
+    // in the conservative −18 to −24 dBFS range typical for
+    // broadcast FM at the antenna (peak is ~10 dB higher than RMS
+    // for FM-style modulation, so an RMS target of −20 dBFS
+    // corresponds to roughly −10 dBFS peak — comfortable headroom).
+    /// Target RMS dBFS for the amplitude pre-stage. RTL-SDR's R820T2
+    /// tracks well at −20 dBFS RMS on a real over-the-air antenna;
+    /// SDRplay benefits from a slightly lower target because its IF
+    /// chain has more gain-noise mileage to make up.
+    pub amp_target_dbfs: f32,
+    /// Sample count (complex pairs) measured per amplitude probe.
+    /// `16384` (≈11 ms at 1.488 Msps) is enough for a stable RMS
+    /// reading on broadcast FM; going higher just slows the search.
+    pub amp_probe_samples: u32,
+    /// USB-flush window (milliseconds) between writing a candidate
+    /// gain and starting the RMS measurement. The driver thread does
+    /// a drain-now → sleep → drain-now → measure sequence; this is
+    /// the sleep duration. RTL-SDR's kernel-side USB buffer settles
+    /// in ~120 ms on the reference RTL-SDR Blog V3; SDRplay needs
+    /// longer (cf. the 1500 ms startup grace in soapy.rs).
+    pub amp_flush_ms: u32,
+    /// Master switch for the amplitude pre-stage. Default `true`;
+    /// per-profile `false` falls back to the legacy Coarse-then-Fine
+    /// algorithm without touching the IqBus.
+    pub amp_enable: bool,
 }
 
 impl DeviceProfile {
@@ -178,6 +209,22 @@ pub const RTLSDR: DeviceProfile = DeviceProfile {
     // the target-MER shortcut without a coarse sweep.
     coarse_probe_tenths: &[77, 137, 197, 257, 328],
     bench_validated: true,
+    // RTL-SDR R820T2 empirics (4 stations on real OTA antenna,
+    // June 2026): −20 dBFS RMS target keeps amp safely below the
+    // 8-bit ADC clipping zone on broadcast FM (PAPR ~10 dB means
+    // peak stays around −10 dBFS at this target). A more
+    // aggressive −16 target pushed amp into hard clipping on
+    // medium-strength stations — RMS compresses once peaks pin
+    // and the binary search loses its monotonicity. 250 ms flush
+    // is overkill on paper (USB pipeline ~126 ms) but anything
+    // shorter let stale chunks bleed into the measurement and
+    // produced inverted dB-vs-RMS readings between adjacent probes.
+    // Fine climbing +2 to +4 dB from amp's pick is normal and
+    // by design — amp is the cheap conservative bracket.
+    amp_target_dbfs: -20.0,
+    amp_probe_samples: 16384,
+    amp_flush_ms: 250,
+    amp_enable: true,
 };
 
 /// SDRplay (RSP1 / RSP1A / RSP2 / RSPdx / RSPduo). AGC drives the
@@ -256,6 +303,23 @@ pub const SDRPLAY: DeviceProfile = DeviceProfile {
     // pathological strong-station-over-an-active-LNA case.
     coarse_probe_tenths: &[260, 320, 380, 430, 470],
     bench_validated: true,
+    // SDRplay's aggregate "Gain" element wraps an internal LNA+IFGR
+    // split, and the HD-Radio sweet spot is dominated by IF-chain
+    // noise figure (which is best in the upper half of the 20..48 dB
+    // table), NOT by ADC headroom. "Loudest non-clipping gain" --
+    // which is what amp-probe optimizes for -- is the wrong
+    // objective on SDRplay: real-world test (103.7 MHz on RSPdx with
+    // outdoor antenna, June 2026) drove amp-probe to the 20 dB floor
+    // where MER never exceeded 2 dB, while manually setting 40.7 dB
+    // gave 14 dB MER. The legacy Coarse [26, 32, 38, 43, 47] -> Fine
+    // pipeline finds the right sweet spot reliably and is the
+    // documented v0.5.x behaviour. RTL-SDR keeps amp_enable = true
+    // because its single-stage R820T2 tuner has the opposite
+    // tradeoff (ADC clipping is the binding constraint).
+    amp_target_dbfs: -22.0,
+    amp_probe_samples: 16384,
+    amp_flush_ms: 300,
+    amp_enable: false,
 };
 
 /// Synthesized AGC table for SDRplay's aggregate `"Gain"` element --
@@ -310,6 +374,15 @@ pub const HACKRF: DeviceProfile = DeviceProfile {
     // documented HD-Radio starting point per the notes above.
     coarse_probe_tenths: &[160, 240, 320],
     bench_validated: false,
+    // HackRF is bench-unvalidated; amp pre-stage off until a
+    // contributor confirms the LNA table responds linearly enough to
+    // a binary search at HD-Radio frequencies. Defaults match
+    // RTL-SDR so flipping `amp_enable = true` here later is a
+    // one-line change.
+    amp_target_dbfs: -20.0,
+    amp_probe_samples: 16384,
+    amp_flush_ms: 250,
+    amp_enable: false,
 };
 
 /// Synthesized AGC table for HackRF's `LNA` — six 8 dB steps from

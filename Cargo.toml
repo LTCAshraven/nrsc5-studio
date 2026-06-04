@@ -1,6 +1,6 @@
 [package]
 name = "nrsc5-studio"
-version = "0.5.1"
+version = "0.6.0"
 edition = "2021"
 authors = ["LTCAshraven"]
 license = "MIT"
@@ -124,10 +124,8 @@ opt-level = 3
 #   - librtlsdr0 / rtl-sdr: required, SoapyRTLSDR module loads it
 #   - libasound2 / alsa-lib: required, cpal speaks to PulseAudio/PipeWire
 #     through ALSA's PCM abstraction on Linux
-#   - nrsc5 helper: declared as Recommends/Suggests (not Requires) because
-#     Fedora doesn't ship it in the default repos; the binary itself
-#     surfaces a clear "nrsc5 not found on PATH" status if the user
-#     hasn't installed it yet.
+#   The nrsc5 HD Radio decoder is statically linked into the binary
+#   (no separate helper process or library required at runtime).
 # ---------------------------------------------------------------------------
 
 [package.metadata.deb]

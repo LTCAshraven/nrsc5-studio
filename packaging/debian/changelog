@@ -1,3 +1,34 @@
+nrsc5-studio (0.6.0-1) unstable; urgency=medium
+
+  * AGC: amplitude-first pre-stage. New SearchPhase::AmpProbe runs
+    ahead of the MER coarse/fine controller, binary-searching the
+    device gain table against an RMS-dBFS target (per-profile:
+    -20 dBFS for RTL-SDR, -22 dBFS for SDRplay), then hands off
+    to the existing MER hill-climb seeded at the amplitude
+    bracket. Bounds the initial gain choice in <1 s on cold-start
+    tunes; cache hits skip AmpProbe entirely. Settings -> Gain
+    grew an "Advanced AGC tuning" section with a slider to
+    override the per-profile target for unusual antennas /
+    preamps.
+  * libnrsc5 bumped from v3.1.0 to v3.2.0. Picks up FFTW
+    input/output alignment (perf bump in the synchronizer FFT)
+    and an audio output queue refactor for free. Four new
+    libnrsc5 events are wired through:
+      - EXCITER_INFO / IMPORTER_INFO -> "Equipment" block in
+        Station Info (manufacturer ID, core + manufacturer
+        firmware version, importer-connected flag).
+      - LOCAL_TIME -> "Time" block in Station Info (broadcaster
+        UTC offset, DST regional/local flags, DST schedule).
+      - LEAP_SECOND_OFFSET -> GPS-UTC offset row with hover
+        tooltip for pending leap-second adjustments.
+  * Packaging: stop shipping install-nrsc5-helper.sh from
+    /usr/share/nrsc5-studio/. v0.5.1's changelog claimed this
+    was done, but the script was still installed by debian/rules
+    and the lintian-overrides + AppStream metainfo still
+    referenced it. v0.6.0 finishes the cleanup.
+
+ -- LTCAshraven <ltcashraven@users.noreply.github.com>  Wed, 03 Jun 2026 18:00:00 +0000
+
 nrsc5-studio (0.5.1-1) unstable; urgency=medium
 
   * Decode pipeline now runs ONE libnrsc5 session per station tuned.

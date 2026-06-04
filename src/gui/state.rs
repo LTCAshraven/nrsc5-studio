@@ -289,6 +289,12 @@ pub struct AppState {
     /// stream. Compared against `manual_gain_tenths` for the same
     /// "restart to apply" purpose.
     pub active_manual_gain_tenths: Option<i32>,
+    /// v0.6.0 amplitude pre-stage RMS target override (dBFS). Mirrors
+    /// `AppConfig::agc_amp_target_dbfs_override`. `None` means "use
+    /// per-device profile default"; `Some(x)` overrides on the next
+    /// cold-start tune. The Settings → Gain tab renders a checkbox +
+    /// slider bound to this field.
+    pub agc_amp_target_dbfs_override: Option<f32>,
     /// Set when the hamburger-menu's "SDR Settings" item is clicked.
     /// The modal is rendered as long as this is true; closed by the
     /// modal's own dismiss button or Esc key.

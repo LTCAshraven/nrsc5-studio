@@ -69,12 +69,8 @@ constellation, MER and BER signal-quality readout, closed-loop
 automatic gain control, TPEG traffic-tile decoding, and animated
 weather radar overlay.
 
-NRSC5 Studio requires the separate nrsc5 helper binary
-(https://github.com/theori-io/nrsc5) at runtime. In Fedora, nrsc5
-is provided by the third-party RPM Fusion Free repository. A
-convenience installer is shipped at
-/usr/share/nrsc5-studio/install-nrsc5-helper.sh that builds it from
-source if RPM Fusion is not enabled.
+The nrsc5 HD Radio decoder is statically linked into the binary;
+no separate helper installation is required.
 
 %prep
 %autosetup -n %{name}-%{version}
@@ -101,9 +97,6 @@ done
 install -D -m 0644 packaging/linux/%{appname}.1 \
     %{buildroot}%{_mandir}/man1/%{appname}.1
 
-install -D -m 0755 scripts/install-nrsc5-helper.sh \
-    %{buildroot}%{_datadir}/%{appname}/install-nrsc5-helper.sh
-
 install -D -m 0644 README.md \
     %{buildroot}%{_docdir}/%{appname}/README.md
 install -D -m 0644 docs/linux-install.md \
@@ -126,8 +119,6 @@ appstream-util validate-relax --nonet \
 %{_metainfodir}/%{appid}.metainfo.xml
 %{_datadir}/icons/hicolor/*/apps/%{appname}.png
 %{_mandir}/man1/%{appname}.1*
-%dir %{_datadir}/%{appname}
-%{_datadir}/%{appname}/install-nrsc5-helper.sh
 
 %changelog
 * Sun May 24 2026 LTCAshraven <LTCAshraven@users.noreply.github.com> - 0.3.7-1

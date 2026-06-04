@@ -133,6 +133,15 @@ pub struct AppConfig {
     /// 197 (19.7 dB), the mid-range starting point inherited from the AGC.
     #[serde(default = "default_manual_gain_tenths")]
     pub manual_gain_tenths: i32,
+    /// v0.6.0 amplitude-pre-stage RMS target override (dBFS). `None`
+    /// lets the per-device profile pick (e.g. −20 dBFS for RTL-SDR,
+    /// −22 dBFS for SDRplay). `Some(x)` overrides for the next tune
+    /// (cold-start cache-miss path only — cache HITs skip AmpProbe).
+    /// Range −30 to −10 dBFS at the UI; values outside that are
+    /// clamped at apply time. Persisted so users can pin a value
+    /// across restarts without rebuilding.
+    #[serde(default)]
+    pub agc_amp_target_dbfs_override: Option<f32>,
     /// Rolling-window retention for the play log, in hours. The UI
     /// offers preset choices (1, 6, 12, 24, 48, 72, 168); manual edits
     /// outside [1, 168] are clamped on load. The on-disk `HARD_CAP`
@@ -427,6 +436,7 @@ impl Default for AppConfig {
             collage_max_tiles: 64,
             gain_mode: GainMode::Auto,
             manual_gain_tenths: 197,
+            agc_amp_target_dbfs_override: None,
             play_log_retention_hours: 24,
             sdr: SdrConfigSection::default(),
             show_hd5_hd8: false,

@@ -34,11 +34,10 @@
       <li>Persistent dock layout with dark and light themes.</li>
     </ul>
     <p>
-      NRSC5 Studio requires the separate nrsc5 helper binary
-      (https://github.com/theori-io/nrsc5) to be installed on the
-      system. See /usr/share/doc/nrsc5-studio/linux-install.md for
-      instructions, or run the bundled helper installer at
-      /usr/share/nrsc5-studio/install-nrsc5-helper.sh.
+      The nrsc5 HD Radio decoder is statically linked into the binary;
+      no separate helper installation is required. See
+      /usr/share/doc/nrsc5-studio/linux-install.md for SDR driver setup
+      and udev permissions.
     </p>
   </description>
 

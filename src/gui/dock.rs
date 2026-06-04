@@ -52,6 +52,13 @@ pub enum UiCommand {
     /// R820T2 step at apply time. Persisted to config; takes effect on
     /// the next piped Start.
     SetManualGainTenths(i32),
+    /// v0.6.0 — override the amplitude pre-stage RMS target (dBFS).
+    /// `None` clears the override and reverts to the per-device profile
+    /// default. `Some(x)` is clamped to [−30, −10] on apply. Takes
+    /// effect on the next cold-start tune (cache-miss path); cache hits
+    /// skip AmpProbe entirely so the override is irrelevant there.
+    /// Persisted via `AppConfig::agc_amp_target_dbfs_override`.
+    SetAgcAmpTargetDbfs(Option<f32>),
     /// Re-enumerate attached SoapySDR devices and refresh the device
     /// picker list shown in the SDR Settings modal. Triggered by the
     /// "Refresh" button there and once when the modal is first opened.
@@ -1075,6 +1082,110 @@ impl DockViewer<'_> {
             }
         }
 
+        // Equipment block — exciter / importer manufacturer + firmware
+        // versions (libnrsc5 v3.2.0). Only rendered when SIS has
+        // surfaced at least one of them.
+        if info.exciter.is_some() || info.importer.is_some() {
+            ui.add_space(6.0);
+            ui.separator();
+            ui.add_space(4.0);
+            ui.label(RichText::new("Equipment").color(muted).small());
+
+            if let Some(eq) = &info.exciter {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Exciter:").color(muted));
+                    let mut txt = format!(
+                        "{}  core {} ({})  mfr {} ({})",
+                        if eq.manufacturer_id.is_empty() {
+                            "—"
+                        } else {
+                            eq.manufacturer_id.as_str()
+                        },
+                        eq.core_version_string(),
+                        crate::station_info::EquipmentInfo::status_label(eq.core_status),
+                        eq.manufacturer_version_string(),
+                        crate::station_info::EquipmentInfo::status_label(
+                            eq.manufacturer_status
+                        ),
+                    );
+                    if let Some(connected) = eq.importer_connected {
+                        txt.push_str(if connected {
+                            "  · importer connected"
+                        } else {
+                            "  · no importer"
+                        });
+                    }
+                    ui.label(RichText::new(txt).monospace().color(dim));
+                });
+            }
+
+            if let Some(eq) = &info.importer {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Importer:").color(muted));
+                    let txt = format!(
+                        "{}  core {} ({})  mfr {} ({})",
+                        if eq.manufacturer_id.is_empty() {
+                            "—"
+                        } else {
+                            eq.manufacturer_id.as_str()
+                        },
+                        eq.core_version_string(),
+                        crate::station_info::EquipmentInfo::status_label(eq.core_status),
+                        eq.manufacturer_version_string(),
+                        crate::station_info::EquipmentInfo::status_label(
+                            eq.manufacturer_status
+                        ),
+                    );
+                    ui.label(RichText::new(txt).monospace().color(dim));
+                });
+            }
+        }
+
+        // Local Time / Leap-second block (libnrsc5 v3.2.0).
+        if info.local_time.is_some() || info.leap_second.is_some() {
+            ui.add_space(6.0);
+            ui.separator();
+            ui.add_space(4.0);
+            ui.label(RichText::new("Time").color(muted).small());
+
+            if let Some(lt) = info.local_time {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Local time:").color(muted));
+                    let dst_txt = if lt.dst_local && lt.dst_regional {
+                        "DST in effect"
+                    } else if lt.dst_local || lt.dst_regional {
+                        "DST partial"
+                    } else {
+                        "no DST"
+                    };
+                    let txt = format!(
+                        "{}  ·  {} ({} schedule)",
+                        lt.offset_string(),
+                        dst_txt,
+                        lt.dst_schedule_label(),
+                    );
+                    ui.label(RichText::new(txt).monospace().color(dim));
+                });
+            }
+
+            if let Some(ls) = info.leap_second {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("GPS-UTC:").color(muted));
+                    let mut txt = format!("{}s", ls.current_offset);
+                    if ls.has_pending() {
+                        txt.push_str(&format!(
+                            "  ·  pending {}s @ ALFN {}",
+                            ls.pending_offset, ls.pending_alfn
+                        ));
+                    }
+                    let resp = ui.label(RichText::new(txt).monospace().color(dim));
+                    resp.on_hover_text(
+                        "Current GPS-to-UTC offset in seconds, plus any leap-second\nadjustment scheduled by the broadcaster (ALFN = absolute L1 frame number).",
+                    );
+                });
+            }
+        }
+
         if let Some(ts) = info.last_updated {
             ui.add_space(8.0);
             let txt = format!("SIS updated {}", Self::fmt_elapsed_bucketed(ts.elapsed().as_secs()));
@@ -1599,6 +1710,8 @@ impl DockViewer<'_> {
             let (status_text, status_color) = match snap.status {
                 AgcStatus::Probing => {
                     let phase_suffix = match snap.phase {
+                        SearchPhase::AmpProbe => " (amp)",
+                        SearchPhase::MerQualityCheck => " (mer)",
                         SearchPhase::Coarse => " (coarse)",
                         SearchPhase::Fine => " (fine)",
                         SearchPhase::Done => "",

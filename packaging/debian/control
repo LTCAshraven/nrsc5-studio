@@ -49,8 +49,5 @@ Description: HD Radio FM receiver and station explorer
  automatic gain control, TPEG traffic-tile decoding, and animated
  weather radar overlay.
  .
- NRSC5 Studio requires the separate nrsc5 helper binary
- (https://github.com/theori-io/nrsc5) at runtime. The nrsc5 helper is
- not packaged in Debian or Ubuntu and must be built from source. A
- convenience installer is shipped at
- /usr/share/nrsc5-studio/install-nrsc5-helper.sh.
+ The nrsc5 HD Radio decoder is statically linked into the binary;
+ no separate helper installation is required.

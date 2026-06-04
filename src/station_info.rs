@@ -83,6 +83,129 @@ pub struct Location {
     pub altitude_m: i32,
 }
 
+/// Exciter or importer equipment metadata (libnrsc5 v3.2.0).
+/// Reported once SIS Parameter messages carrying equipment info land.
+#[derive(Debug, Clone)]
+pub struct EquipmentInfo {
+    /// Manufacturer ID string, typically 2 ASCII characters
+    /// (e.g. "GG" for Continental, "L7" for Nautel).
+    pub manufacturer_id: String,
+    /// Core firmware version as a 4-element int array.
+    pub core_version: [i32; 4],
+    /// 0 = Commercial Release, 1 = Engineering Release, 2 = Patch.
+    pub core_status: i32,
+    /// Manufacturer-assigned firmware version, 4 elements.
+    pub manufacturer_version: [i32; 4],
+    /// Same scale as `core_status`.
+    pub manufacturer_status: i32,
+    /// Whether an importer is wired to this exciter. Only meaningful
+    /// for `exciter` slots (always `None` for `importer`).
+    pub importer_connected: Option<bool>,
+}
+
+impl EquipmentInfo {
+    /// Format the core version array as "a.b.c.d".
+    pub fn core_version_string(&self) -> String {
+        format!(
+            "{}.{}.{}.{}",
+            self.core_version[0],
+            self.core_version[1],
+            self.core_version[2],
+            self.core_version[3],
+        )
+    }
+
+    /// Format the manufacturer version array as "a.b.c.d".
+    pub fn manufacturer_version_string(&self) -> String {
+        format!(
+            "{}.{}.{}.{}",
+            self.manufacturer_version[0],
+            self.manufacturer_version[1],
+            self.manufacturer_version[2],
+            self.manufacturer_version[3],
+        )
+    }
+
+    /// Map a `core_status` / `manufacturer_status` value to its label.
+    pub fn status_label(status: i32) -> &'static str {
+        match status {
+            0 => "Commercial",
+            1 => "Engineering",
+            2 => "Patch",
+            _ => "Unknown",
+        }
+    }
+}
+
+/// Broadcaster local-time metadata (libnrsc5 v3.2.0).
+#[derive(Debug, Clone, Copy)]
+pub struct LocalTimeInfo {
+    /// Local Time Zone UTC offset in minutes.
+    pub utc_offset_minutes: i32,
+    /// DST currently in effect at the broadcaster's region.
+    pub dst_regional: bool,
+    /// DST practiced locally.
+    pub dst_local: bool,
+    /// 0 = not practiced, 1 = U.S./Canada schedule, 2 = EU schedule.
+    pub dst_schedule: u8,
+}
+
+impl LocalTimeInfo {
+    /// Format the UTC offset as e.g. "UTC-05:00" or "UTC+09:30".
+    pub fn offset_string(&self) -> String {
+        let total = self.utc_offset_minutes;
+        let sign = if total < 0 { '-' } else { '+' };
+        let abs = total.unsigned_abs();
+        let h = abs / 60;
+        let m = abs % 60;
+        format!("UTC{}{:02}:{:02}", sign, h, m)
+    }
+
+    /// Short label for `dst_schedule`.
+    pub fn dst_schedule_label(&self) -> &'static str {
+        match self.dst_schedule {
+            0 => "none",
+            1 => "US/Canada",
+            2 => "EU",
+            _ => "unknown",
+        }
+    }
+}
+
+/// GPS leap-second offset broadcast (libnrsc5 v3.2.0).
+#[derive(Debug, Clone, Copy)]
+pub struct LeapSecondInfo {
+    /// Current GPS-UTC offset in seconds (18 as of 2026).
+    pub current_offset: i32,
+    /// Pending GPS-UTC offset (equals `current_offset` when no
+    /// adjustment is scheduled).
+    pub pending_offset: i32,
+    /// ALFN representing the GPS time of a pending leap second
+    /// adjustment, or 0 when no adjustment is pending.
+    pub pending_alfn: u32,
+}
+
+impl LeapSecondInfo {
+    /// True if a leap-second adjustment is scheduled.
+    pub fn has_pending(&self) -> bool {
+        self.pending_alfn != 0 && self.pending_offset != self.current_offset
+    }
+}
+
+/// AM-mode SYNC supplementary indicators (libnrsc5 v3.2.0). Stored
+/// for diagnostics; not rendered in Phase A.
+#[derive(Debug, Clone, Copy)]
+pub struct AmSyncIndicators {
+    /// Power Level Indicator.
+    pub pli: i32,
+    /// High-Power PIDS Indicator.
+    pub hppi: i32,
+    /// Analog Audio Bandwidth Indicator.
+    pub aabi: i32,
+    /// Reduced Digital Bandwidth Indicator.
+    pub rdbi: i32,
+}
+
 /// HD Radio service mode (P1/P3/P4 partition layout). nrsc5 does not
 /// print this directly in normal stderr output, so the value is *inferred*
 /// from the highest audio program number observed in SIG Service lines:
@@ -141,6 +264,17 @@ pub struct StationInfo {
     pub programs: [Option<ProgramInfo>; 8],
     /// Non-audio data services advertised in SIS.
     pub data_services: Vec<DataService>,
+    /// Exciter equipment metadata (libnrsc5 v3.2.0).
+    pub exciter: Option<EquipmentInfo>,
+    /// Importer equipment metadata (libnrsc5 v3.2.0).
+    pub importer: Option<EquipmentInfo>,
+    /// Broadcaster local-time metadata (libnrsc5 v3.2.0).
+    pub local_time: Option<LocalTimeInfo>,
+    /// GPS leap-second offset broadcast (libnrsc5 v3.2.0).
+    pub leap_second: Option<LeapSecondInfo>,
+    /// AM-mode SYNC supplementary indicators (libnrsc5 v3.2.0).
+    /// Plumbed for diagnostics; not rendered in Phase A.
+    pub am_sync: Option<AmSyncIndicators>,
     /// Wall-clock time of the most recent SIS-derived update, used by
     /// the panel's "last updated Xs ago" hint. `None` until the first
     /// field is populated post-retune.

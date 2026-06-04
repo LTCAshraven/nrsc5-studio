@@ -1,7 +1,7 @@
-# Build nrsc5 v3.1.0 for Windows via MSYS2 / MinGW-w64.
+# Build nrsc5 v3.2.0 for Windows via MSYS2 / MinGW-w64.
 #
 # Produces statically-linked nrsc5.exe + libnrsc5.dll at
-#   C:\msys64\home\<user>\nrsc5-v3.1.0\build\src\
+#   C:\msys64\home\<user>\nrsc5-v3.2.0\build\src\
 # which depend only on Windows system DLLs (KERNEL32, msvcrt, WINMM, WS2_32).
 # Copy them into bin/ to upgrade the toolchain.
 #
@@ -21,13 +21,13 @@
 #     scripts\build-nrsc5-msys2.ps1
 #
 # Optional environment overrides:
-#     $env:NRSC5_TAG = "v3.1.0"       # which upstream tag to build
+#     $env:NRSC5_TAG = "v3.2.0"       # which upstream tag to build
 #     $env:NRSC5_JOBS = "8"            # make -j N
 #     $env:MSYS2_ROOT = "C:\msys64"    # MSYS2 install location
 
 [CmdletBinding()]
 param(
-    [string]$Tag = ($env:NRSC5_TAG, "v3.1.0" -ne $null)[0],
+    [string]$Tag = ($env:NRSC5_TAG, "v3.2.0" -ne $null)[0],
     [int]$Jobs = [int]($env:NRSC5_JOBS, "0" -ne $null)[0],
     [string]$Msys2Root = ($env:MSYS2_ROOT, "C:\msys64" -ne $null)[0]
 )
@@ -152,6 +152,7 @@ $expectedSymbols = @(
     "nrsc5_open_pipe",
     "nrsc5_set_callback",
     "nrsc5_pipe_samples_cu8",
+    "nrsc5_pipe_samples_cs16",
     "nrsc5_start",
     "nrsc5_stop",
     "nrsc5_close",

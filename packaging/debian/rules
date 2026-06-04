@@ -32,8 +32,6 @@ override_dh_auto_install:
 			packaging/linux/icons/hicolor/$${size}x$${size}/apps/nrsc5-studio.png \
 			debian/nrsc5-studio/usr/share/icons/hicolor/$${size}x$${size}/apps/nrsc5-studio.png ; \
 	done
-	install -D -m 0755 scripts/install-nrsc5-helper.sh \
-		debian/nrsc5-studio/usr/share/nrsc5-studio/install-nrsc5-helper.sh
 
 override_dh_auto_clean:
 	cargo clean || true
