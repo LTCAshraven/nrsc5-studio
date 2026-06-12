@@ -71,15 +71,36 @@ if (Test-Path $BinSrc) {
     #    the `SoapySDR\modules0.8\` subfolder structure that
     #    `paths::bundled_soapy_modules_dir()` looks for).
     Copy-Item -Path $BinSrc -Destination $OutDir -Recurse -Force
-    # 2) Promote the load-time DLLs up to the exe root. Each is
-    #    *also* left in `bin\` as a copy so a flat `bin\` lookup
-    #    from any future helper still finds them.
+    # 2) Promote the load-time DLLs up to the exe root. Windows
+    #    resolves load-time imports next to the exe, so the copy in
+    #    `bin\` is redundant -- delete it to save space.
     foreach ($dll in $LoadTimeDlls) {
         $src = Join-Path $BinSrc $dll
         if (Test-Path $src) {
             Copy-Item -Path $src -Destination $OutDir -Force
+            $dup = Join-Path $BinDst $dll
+            if (Test-Path $dup) {
+                Remove-Item -Path $dup -Force
+            }
         } else {
             Write-Warning "Expected load-time DLL '$dll' not found in bin\ -- exe may fail to start on a clean machine."
+        }
+    }
+
+    # 3) Strip extras that are not used by the GUI:
+    #    - nrsc5.exe / SoapySDRUtil.exe: CLI tools, not invoked by the app
+    #    - libsdrPlaySupport.so: Linux SoapySDR module mistakenly staged
+    #    - libnrsc5.dll in bin\: redundant copy (load-time import sits at root)
+    $StripFromBin = @(
+        "nrsc5.exe",
+        "SoapySDRUtil.exe",
+        "libsdrPlaySupport.so",
+        "libnrsc5.dll"
+    )
+    foreach ($name in $StripFromBin) {
+        $p = Join-Path $BinDst $name
+        if (Test-Path $p) {
+            Remove-Item -Path $p -Force
         }
     }
 }

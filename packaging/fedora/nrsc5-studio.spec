@@ -25,7 +25,7 @@
 %global debug_package %{nil}
 
 Name:           %{appname}
-Version:        0.5.0
+Version:        0.6.1
 Release:        1%{?dist}
 Summary:        HD Radio FM receiver and station explorer built on nrsc5 and SoapySDR
 
@@ -121,6 +121,12 @@ appstream-util validate-relax --nonet \
 %{_mandir}/man1/%{appname}.1*
 
 %changelog
+* Wed Jun 12 2026 LTCAshraven <LTCAshraven@users.noreply.github.com> - 0.6.1-1
+- Collage image block list with persistent storage (content-hash keyed)
+- Station logo rendering in SIS header and Now Playing tab
+- Dynamic Now Playing mode switching on XHDR param (0 = cover art, 1 = logo)
+- Linux right-click collage interaction fallback when context menus suppressed
+
 * Sun May 24 2026 LTCAshraven <LTCAshraven@users.noreply.github.com> - 0.3.7-1
 - Linux packaging debut. .deb and .rpm now built from the same Rust
   source tree as the Windows portable zip. No DSP/SDR behavior change

@@ -1,10 +1,26 @@
+<div align="center">
+
+![NRSC5 Studio Icon](packaging\linux\icons\hicolor\64x64\apps\nrsc5-studio.png)
+
 # NRSC5 Studio
 
-A native Windows and Linux desktop app for listening to **HD Radio** broadcasts with an RTL-SDR, SDRplay, or HackRF receiver. Built in Rust with [egui](https://www.egui.rs/), wrapped around the excellent [`nrsc5`](https://github.com/theori-io/nrsc5) HD Radio decoder, with a unified [SoapySDR](https://github.com/pothosware/SoapySDR) device layer underneath.
+**HD Radio reception, decoded and visualized in real time.**
 
-NRSC5 Studio gives you everything the upstream `nrsc5` command-line decoder already does — tuning, demodulating, decoding HD1–HD4 subchannels, pulling album art and station logos — and adds a polished, persistent GUI on top, with a few extras the command line never had.
+A native Windows and Linux desktop app for listening to **HD Radio** broadcasts with an RTL-SDR, SDRplay, or HackRF receiver. Built in Rust with [egui](https://www.egui.rs/), wrapped around the excellent [`nrsc5`](https://github.com/theori-io/nrsc5) HD Radio decoder.
 
-> **Status:** stable on Windows 10/11 x64 and Linux x86_64 (Debian/Ubuntu via `.deb`, Fedora via `.rpm`). macOS isn't supported yet.
+![Stars](https://img.shields.io/github/stars/LTCAshraven/nrsc5-studio?style=flat-square)
+![Forks](https://img.shields.io/github/forks/LTCAshraven/nrsc5-studio?style=flat-square)
+![Watchers](https://img.shields.io/github/watchers/LTCAshraven/nrsc5-studio?style=flat-square)
+
+![Version](https://img.shields.io/badge/version-0.6.1-blue?style=flat-square)
+![License](https://img.shields.io/badge/license-GPL--3.0-green?style=flat-square)
+![Platform](https://img.shields.io/badge/platform-windows%20%7C%20linux-lightgrey?style=flat-square)
+
+**[📖 Quick Start](#quick-start)** • **[✨ Features](#features)** • **[📡 Hardware](#hardware-requirements)** • **[🔧 Building](#building-from-source)** • **[📥 Install](#install-portable)**
+
+<small>If you find this project useful, please consider giving it a [star on GitHub](https://github.com/LTCAshraven/nrsc5-studio) — it helps others discover it and keeps the feedback and development flowing! ⭐</small>
+
+</div>
 
 ---
 
@@ -46,6 +62,7 @@ NRSC5 Studio gives you everything the upstream `nrsc5` command-line decoder alre
 - An installed and working **SDR** with an antenna suitable for FM (87.5–108 MHz). Generic RTL2832U + R820T2 dongles are still the cheapest, most-tested option.
 - A nearby HD Radio FM broadcaster. (Most U.S. metro areas have several.)
 - Windows 10 or 11 (x86_64), or a Linux distribution recent enough to run a modern egui app (Debian 12+, Ubuntu 22.04+, Fedora 40+) on x86_64.
+- **Have a different SDR you'd like supported?** If it has a [SoapySDR](https://github.com/pothosware/SoapySDR) module, [open an issue](https://github.com/LTCAshraven/nrsc5-studio/issues) and I'll get right on it. It should be straightforward to add.
 
 ### Supported SDRs (v0.3.0)
 

@@ -2,7 +2,7 @@ use crate::collage::CollageEngine;
 use crate::config::{load_config, save_config, AppConfig};
 use crate::ffi::{Nrsc5Process, NrscEvent};
 use crate::gui::dock::{DockTab, DockViewer, UiCommand};
-use crate::gui::state::{AppState, ArtTile};
+use crate::gui::state::{AppState, ArtTile, NowPlayingImageMode};
 use crate::maps::{TrafficMap, WeatherMap};
 use chrono::Utc;
 use egui_dock::{DockArea, DockState, NodeIndex, NodePath, SurfaceIndex};
@@ -188,6 +188,10 @@ pub struct Nrsc5App {
     /// content hash so re-emissions of the same bytes — even under different
     /// LOT filenames — collapse into a single tile.
     art_history: HashMap<u64, ArtEntry>,
+    /// Set of content hashes the user has permanently blocked from the
+    /// collage. Populated from `config.art_blocklist` on startup and kept
+    /// in sync with it on every mutation.
+    art_blocklist: std::collections::HashSet<u64>,
     /// Persistent on-disk cache so the collage survives restarts. `None`
     /// only if the local data dir couldn't be resolved/created, in which
     /// case the collage falls back to in-memory-only behavior.
@@ -282,6 +286,11 @@ impl Nrsc5App {
         let (art_history, art_tiles, art_session_started) =
             restore_art_history(art_cache.as_ref(), collage_tile_cap(&config));
 
+        // Load the permanent block list from config.
+        let art_blocklist: std::collections::HashSet<u64> =
+            config.art_blocklist.iter().copied().collect();
+        let art_blocklist_count = art_blocklist.len();
+
         // Snapshot any per-field config values needed after `config` is
         // moved into the struct literal below.
         let play_log_retention_hours = config.play_log_retention_hours;
@@ -308,6 +317,9 @@ impl Nrsc5App {
                 sdrplay_service_stopped: false,
                 art_tiles,
                 art_session_started,
+                art_blocklist_count,
+                collage_secondary_click_fallback:
+                    config.collage_secondary_click_fallback,
                 collage_tile_cap: collage_tile_cap(&config) as u32,
                 spectrum_tap: Some(spectrum_tap),
                 ..AppState::default()
@@ -326,6 +338,7 @@ impl Nrsc5App {
             weather_map: WeatherMap::new(&aas_dir),
             audio_player,
             art_history,
+            art_blocklist,
             art_cache,
             last_art_prune_at: None,
             closed_tab_locations: HashMap::new(),
@@ -1188,6 +1201,12 @@ impl Nrsc5App {
         bytes.hash(&mut hasher);
         let key = hasher.finish();
 
+        // Permanently blocked — discard the AAS dump and bail immediately.
+        if self.art_blocklist.contains(&key) {
+            let _ = std::fs::remove_file(full_path);
+            return;
+        }
+
         // Per-hash cooldown. If we counted this exact image less than
         // `ART_COUNT_COOLDOWN` ago, treat this XHDR as a re-broadcast of
         // the same in-progress song rather than a new play. Still redirect
@@ -1578,21 +1597,22 @@ impl Nrsc5App {
     /// big tiles through the layout rather than clumping them to one side.
     fn rebuild_art_tiles(&mut self) {
         let cap = collage_tile_cap(&self.config);
-        let mut entries: Vec<(&ArtEntry, Instant)> = self
+        let mut entries: Vec<(u64, &ArtEntry, Instant)> = self
             .art_history
-            .values()
-            .filter_map(|e| e.plays.front().map(|t| (e, *t)))
+            .iter()
+            .filter_map(|(k, e)| e.plays.front().map(|t| (*k, e, *t)))
             .collect();
         // Step 1: keep the most-played covers within the tile cap.
-        entries.sort_by(|a, b| b.0.plays.len().cmp(&a.0.plays.len()));
+        entries.sort_by(|a, b| b.1.plays.len().cmp(&a.1.plays.len()));
         entries.truncate(cap);
         // Step 2: re-order the survivors by arrival so spatial layout
         // reflects "order they came in", not "how many plays".
-        entries.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.path.cmp(&b.0.path)));
+        entries.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| a.1.path.cmp(&b.1.path)));
         self.app_state.art_tiles = entries
             .into_iter()
-            .map(|(e, _)| ArtTile {
+            .map(|(k, e, _)| ArtTile {
                 path: e.path.clone(),
+                hash: k,
                 count: e.plays.len() as u32,
                 songs: e.songs.clone(),
                 album: e.album.clone(),
@@ -1979,6 +1999,8 @@ impl Nrsc5App {
                     if full_path.exists() {
                         let path_str = full_path.to_string_lossy().to_string();
                         if param == 0 {
+                            self.app_state.now_playing_image_mode =
+                                NowPlayingImageMode::CoverArt;
                             // Cover art. `record_album_art` sets
                             // `programs[program].cover_art_path` itself
                             // (preferring the durable cache copy) and
@@ -1988,8 +2010,12 @@ impl Nrsc5App {
                         } else if param == 1 {
                             // Station logo — stays global; one logo
                             // per station regardless of which subchannel
-                            // first transmitted it.
+                            // first transmitted it. Also temporarily takes
+                            // over the Now Playing artwork slot until the
+                            // next cover-art XHDR arrives.
                             self.app_state.station_logo_path = Some(path_str);
+                            self.app_state.now_playing_image_mode =
+                                NowPlayingImageMode::StationLogo;
                         }
                     }
                 }
@@ -2293,6 +2319,7 @@ impl Nrsc5App {
                 self.app_state.lost_sync_at = None;
                 self.lot_files.clear();
                 self.app_state.station_logo_path = None;
+                self.app_state.now_playing_image_mode = NowPlayingImageMode::CoverArt;
                 self.app_state.traffic_map_path = None;
                 self.app_state.weather_frames.clear();
                 self.app_state.weather_current_frame = 0;
@@ -2334,6 +2361,7 @@ impl Nrsc5App {
                 self.app_state.currently_synced = false;
                 self.app_state.lost_sync_at = None;
                 self.app_state.call_sign.clear();
+                self.app_state.now_playing_image_mode = NowPlayingImageMode::CoverArt;
                 // Wipe stale MER from the previous station so the Signal
                 // meters and AGC-status readout don't show last station's
                 // value during the gap between tune and first new MER
@@ -2572,6 +2600,34 @@ impl Nrsc5App {
                 self.app_state.art_session_started = None;
                 self.rebuild_art_tiles();
                 self.persist_art_history();
+            }
+            UiCommand::BlockCover(hash) => {
+                // Add to the persistent block list.
+                if self.art_blocklist.insert(hash) {
+                    self.config.art_blocklist =
+                        self.art_blocklist.iter().copied().collect();
+                    save_config(&self.config);
+                    self.app_state.art_blocklist_count = self.art_blocklist.len();
+                }
+                // Remove from history and delete the cached file on disk.
+                if let Some(entry) = self.art_history.remove(&hash) {
+                    let _ = std::fs::remove_file(&entry.path);
+                }
+                self.rebuild_art_tiles();
+                self.persist_art_history();
+            }
+            UiCommand::ClearArtBlocklist => {
+                if !self.art_blocklist.is_empty() {
+                    self.art_blocklist.clear();
+                    self.config.art_blocklist.clear();
+                    save_config(&self.config);
+                    self.app_state.art_blocklist_count = 0;
+                }
+            }
+            UiCommand::SetCollageSecondaryClickFallback(enabled) => {
+                self.app_state.collage_secondary_click_fallback = enabled;
+                self.config.collage_secondary_click_fallback = enabled;
+                save_config(&self.config);
             }
             UiCommand::SetGainMode(mode) => {
                 if self.config.gain_mode == mode {
@@ -2944,6 +3000,8 @@ impl Nrsc5App {
         let active_driver = self.config.sdr.driver.clone();
         let current_ppm = self.config.sdr.freq_correction_ppm;
         let show_hd5_hd8 = self.app_state.show_hd5_hd8;
+        let collage_secondary_click_fallback =
+            self.app_state.collage_secondary_click_fallback;
         let transport = self.config.sdr.transport;
         let is_streaming = self.app_state.is_streaming;
         let config_remote_host = self
@@ -3158,6 +3216,7 @@ impl Nrsc5App {
                                         ui,
                                         commands,
                                         show_hd5_hd8,
+                                        collage_secondary_click_fallback,
                                     );
                                 }
                                 SettingsTab::Recording => {
@@ -3738,6 +3797,7 @@ impl Nrsc5App {
         ui: &mut egui::Ui,
         commands: &mut Vec<UiCommand>,
         show_hd5_hd8: bool,
+        collage_secondary_click_fallback: bool,
     ) {
         ui.heading("Program selector");
         ui.add_space(4.0);
@@ -3795,6 +3855,61 @@ impl Nrsc5App {
             .small()
             .color(egui::Color32::from_gray(140)),
         );
+
+        ui.add_space(14.0);
+        ui.separator();
+        ui.add_space(6.0);
+        ui.heading("Collage");
+        ui.add_space(4.0);
+
+        let blocked_count = self.app_state.art_blocklist_count;
+        let status_label = if blocked_count == 0 {
+            "No images are currently blocked.".to_string()
+        } else {
+            format!(
+                "{blocked_count} image{} permanently blocked from the collage.",
+                if blocked_count == 1 { "" } else { "s" }
+            )
+        };
+        ui.label(
+            egui::RichText::new(status_label)
+                .small()
+                .color(egui::Color32::from_gray(140)),
+        );
+        ui.add_space(4.0);
+        let clear_resp = ui
+            .add_enabled(
+                blocked_count > 0,
+                egui::Button::new("\u{1F5D1} Clear Block List"),
+            )
+            .on_hover_text(
+                "Allow all previously-blocked images to appear in the \
+                 collage again on next arrival.",
+            );
+        if clear_resp.clicked() {
+            commands.push(UiCommand::ClearArtBlocklist);
+        }
+
+        ui.add_space(8.0);
+        let mut fallback = collage_secondary_click_fallback;
+        let fallback_resp = ui.checkbox(
+            &mut fallback,
+            "Linux: block immediately on right-click if menu fails",
+        );
+        ui.label(
+            egui::RichText::new(
+                "Keeps right-click blocking usable on some Ubuntu/Linux \
+                 desktop setups where context-menu popups on image tiles \
+                 can be suppressed. No effect on non-Linux builds.",
+            )
+            .small()
+            .color(egui::Color32::from_gray(140)),
+        );
+        if fallback_resp.changed() {
+            commands.push(UiCommand::SetCollageSecondaryClickFallback(
+                fallback,
+            ));
+        }
     }
 
     /// Recording tab: mode, output folder, max minutes per file, per-
@@ -4265,17 +4380,18 @@ fn restore_art_history(
 
     // Mirror `Nrsc5App::rebuild_art_tiles` so the collage paints correctly
     // on the very first frame after restore, before any new event arrives.
-    let mut entries: Vec<(&ArtEntry, Instant)> = map
-        .values()
-        .filter_map(|e| e.plays.front().map(|t| (e, *t)))
+    let mut entries: Vec<(u64, &ArtEntry, Instant)> = map
+        .iter()
+        .filter_map(|(k, e)| e.plays.front().map(|t| (*k, e, *t)))
         .collect();
-    entries.sort_by(|a, b| b.0.plays.len().cmp(&a.0.plays.len()));
+    entries.sort_by(|a, b| b.1.plays.len().cmp(&a.1.plays.len()));
     entries.truncate(cap);
-    entries.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.path.cmp(&b.0.path)));
+    entries.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| a.1.path.cmp(&b.1.path)));
     tiles = entries
         .into_iter()
-        .map(|(e, _)| ArtTile {
+        .map(|(k, e, _)| ArtTile {
             path: e.path.clone(),
+            hash: k,
             count: e.plays.len() as u32,
             songs: e.songs.clone(),
             album: e.album.clone(),

@@ -36,11 +36,26 @@ pub struct RecordingStatus {
 #[derive(Debug, Clone, Default)]
 pub struct ArtTile {
     pub path: String,
+    /// Content hash of the image bytes (same key used in `art_history`).
+    /// Carried here so the UI can issue a `BlockCover` command without
+    /// parsing the filename.
+    pub hash: u64,
     pub count: u32,
     /// Unique (title, artist) pairs that have been displayed with this cover.
     pub songs: Vec<(String, String)>,
     /// Most recently observed album name for this cover, if any.
     pub album: String,
+}
+
+/// Which image surface the Now Playing panel should prefer.
+/// Cover art is the default; a station-logo XHDR can temporarily
+/// flip the panel to the broadcaster logo until the next cover-art
+/// XHDR arrives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NowPlayingImageMode {
+    #[default]
+    CoverArt,
+    StationLogo,
 }
 
 /// Per-HD-program runtime metadata. One slot per subchannel (HD1–HD8)
@@ -180,6 +195,8 @@ pub struct AppState {
     pub last_event: String,
     /// Full path to the station logo image file, if any.
     pub station_logo_path: Option<String>,
+    /// Which image the Now Playing panel should currently display.
+    pub now_playing_image_mode: NowPlayingImageMode,
     /// Full path to the stitched traffic map image, if any.
     pub traffic_map_path: Option<String>,
     /// Ordered history of composited weather radar frames (oldest → newest).
@@ -197,6 +214,14 @@ pub struct AppState {
     /// Wall-clock time the current listening session began, used to enforce
     /// the 8-hour collage tracking horizon.
     pub art_session_started: Option<Instant>,
+    /// Number of images currently in the permanent block list. Mirrored from
+    /// `App::art_blocklist.len()` so the Settings modal can read it without
+    /// holding a reference to the full set.
+    pub art_blocklist_count: usize,
+    /// When true, Linux builds allow direct block-on-secondary-click in the
+    /// Collage tab as a fallback when context-menu popups are suppressed by
+    /// compositor/WM quirks.
+    pub collage_secondary_click_fallback: bool,
     /// Preset slot currently being edited via the popup (None = no popup).
     pub editing_preset: Option<usize>,
     /// In-progress name text for the preset editor.
@@ -452,6 +477,7 @@ impl AppState {
         for p in &mut self.programs {
             p.clear();
         }
+        self.now_playing_image_mode = NowPlayingImageMode::CoverArt;
     }
 
     /// Derived `[bool; 8]` indicating which HD subchannels should be

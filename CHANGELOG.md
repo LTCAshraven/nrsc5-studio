@@ -6,6 +6,30 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-06-10
+
+### Added
+
+- **Collage image block list.** Right-click any tile in the Collage tab and
+  choose "🚫 Block this image" to permanently suppress it. The block is
+  keyed on the image's content hash, so the same ad or logo will be rejected
+  even if the broadcaster re-sends it under a new LOT filename or after a
+  retune. Blocked images are removed from the collage immediately and their
+  cached file is deleted.
+- **"Clear Block List" button in Settings → Display.** Shows how many images
+  are currently blocked and lets you wipe the entire block list at once (the
+  only practical management option since the hashes are not human-readable).
+  Button is greyed out when the list is empty.
+- **Station logo rendering.** Station logos transmitted via XHDR now render
+  as a compact right-aligned badge in the SIS header of the Station
+  Information panel. When a station-logo XHDR (`param == 1`) arrives, the
+  Now Playing panel temporarily swaps its artwork slot to the logo; the next
+  cover-art XHDR (`param == 0`) automatically switches the panel back to
+  album art.
+- Block list is persisted in `config.toml` under `art_blocklist` so it
+  survives restarts. Old configs without this key deserialize cleanly
+  (defaults to empty).
+
 ## [0.6.0] - 2026-06-03
 
 The **amplitude-first AGC + libnrsc5 v3.2.0** release. Cold-start tunes

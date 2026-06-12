@@ -195,6 +195,16 @@ pub struct AppConfig {
     /// unmanageable fast once you've recorded from a few stations.
     #[serde(default = "default_true")]
     pub recording_subfolder_per_station: bool,
+    /// Content hashes of album-art images the user has permanently blocked
+    /// from the collage. Any image whose hash appears here is silently
+    /// rejected on arrival — the filename doesn't matter.
+    #[serde(default)]
+    pub art_blocklist: Vec<u64>,
+    /// Linux fallback: when true, a secondary-click on a collage tile can
+    /// trigger block directly even if the context-menu popup fails to appear
+    /// on some compositor/window-manager combinations.
+    #[serde(default = "default_collage_secondary_click_fallback")]
+    pub collage_secondary_click_fallback: bool,
 }
 
 /// SoapySDR-keyed configuration for the v0.3.0 in-process backend.
@@ -384,6 +394,10 @@ fn default_collage_max_tiles() -> u32 {
     64
 }
 
+fn default_collage_secondary_click_fallback() -> bool {
+    false
+}
+
 fn default_manual_gain_tenths() -> i32 {
     197
 }
@@ -445,6 +459,9 @@ impl Default for AppConfig {
             recording_dir: None,
             recording_max_minutes: 60,
             recording_subfolder_per_station: true,
+            art_blocklist: Vec::new(),
+            collage_secondary_click_fallback:
+                default_collage_secondary_click_fallback(),
         }
     }
 }

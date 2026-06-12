@@ -1,5 +1,5 @@
 use crate::config::{GainMode, Preset, SdrTransport};
-use crate::gui::state::{AppState, LogViewMode};
+use crate::gui::state::{AppState, LogViewMode, NowPlayingImageMode};
 use crate::play_log::PlayLog;
 use egui::{Color32, DragValue, RichText, Ui, Vec2, WidgetText};
 use egui_dock::TabViewer;
@@ -35,6 +35,16 @@ pub enum UiCommand {
     /// Drop every entry from the rolling album-art collage. Wipes the
     /// in-memory history, persisted manifest, and on-disk image cache.
     ClearCollage,
+    /// Permanently block the album-art image with the given content hash.
+    /// Removes it from the collage immediately and prevents any future
+    /// re-appearance regardless of the LOT filename.
+    BlockCover(u64),
+    /// Clear the persistent album-art block list so all previously-blocked
+    /// images can appear again on next arrival.
+    ClearArtBlocklist,
+    /// Toggle Linux fallback behavior for collage tile right-click blocking
+    /// when the context-menu popup is suppressed by the host compositor.
+    SetCollageSecondaryClickFallback(bool),
     /// Write the current play log to a CSV file. App resolves the path and
     /// surfaces it through `AppState::log_export_status`.
     ExportLogCsv,
@@ -727,18 +737,50 @@ impl DockViewer<'_> {
         // subchannel. Avoids the stale-callsign bug here.)
         ui.add_space(6.0);
 
-        // Album art
-        if let Some(ref path) = slot.cover_art_path {
+        let image_path = match self.app_state.now_playing_image_mode {
+            NowPlayingImageMode::StationLogo => self
+                .app_state
+                .station_logo_path
+                .as_ref()
+                .filter(|path| std::path::Path::new(path.as_str()).exists())
+                .cloned(),
+            NowPlayingImageMode::CoverArt => slot.cover_art_path.clone(),
+        };
+
+        if let Some(path) = image_path {
             let uri = format!("file:///{}", path.replace('\\', "/"));
             let available = ui.available_size();
-            let max_side = available.x.min(available.y).min(300.0);
-            ui.add(
-                egui::Image::new(&uri)
-                    .fit_to_exact_size(Vec2::new(max_side, max_side))
-                    .corner_radius(6),
-            );
+            match self.app_state.now_playing_image_mode {
+                NowPlayingImageMode::StationLogo => {
+                    let max_w = available.x.min(300.0);
+                    let max_h = available.y.min(120.0);
+                    egui::Frame::new()
+                        .fill(Color32::from_rgba_unmultiplied(255, 255, 255, 16))
+                        .corner_radius(egui::CornerRadius::same(6))
+                        .inner_margin(egui::Margin::symmetric(8, 8))
+                        .show(ui, |ui| {
+                            ui.add(
+                                egui::Image::new(&uri)
+                                    .fit_to_exact_size(Vec2::new(max_w, max_h))
+                                    .corner_radius(4),
+                            );
+                        });
+                }
+                NowPlayingImageMode::CoverArt => {
+                    let max_side = available.x.min(available.y).min(300.0);
+                    ui.add(
+                        egui::Image::new(&uri)
+                            .fit_to_exact_size(Vec2::new(max_side, max_side))
+                            .corner_radius(6),
+                    );
+                }
+            }
         } else {
-            ui.label(RichText::new("Waiting for album art...").color(dim));
+            let waiting = match self.app_state.now_playing_image_mode {
+                NowPlayingImageMode::StationLogo => "Waiting for station logo...",
+                NowPlayingImageMode::CoverArt => "Waiting for album art...",
+            };
+            ui.label(RichText::new(waiting).color(dim));
         }
     }
 
@@ -942,22 +984,53 @@ impl DockViewer<'_> {
             ui.add_space(6.0);
         }
 
-        // Header row: call sign + inferred service-mode badge.
-        if info.call_sign.is_some() || info.infer_service_mode().is_some() {
+        // Header row: call sign + inferred service-mode badge + compact
+        // right-aligned station logo when one has been transmitted.
+        let logo_path = self
+            .app_state
+            .station_logo_path
+            .as_ref()
+            .filter(|path| std::path::Path::new(path.as_str()).exists())
+            .cloned();
+        if info.call_sign.is_some() || info.infer_service_mode().is_some() || logo_path.is_some() {
             ui.horizontal(|ui| {
-                if let Some(call_sign) = info.call_sign.clone() {
-                    ui.label(RichText::new(call_sign).heading().color(accent));
+                ui.vertical(|ui| {
+                    ui.horizontal(|ui| {
+                        if let Some(call_sign) = info.call_sign.clone() {
+                            ui.label(RichText::new(call_sign).heading().color(accent));
+                        }
+                        if let Some(mode) = info.infer_service_mode() {
+                            ui.add_space(10.0);
+                            let resp = ui.label(
+                                RichText::new(format!("[{} \u{2022} inferred]", mode.label()))
+                                    .small()
+                                    .color(muted),
+                            );
+                            resp.on_hover_text(
+                                "HD Radio service mode inferred from the highest subchannel\nadvertised in SIS. nrsc5 does not report the mode directly.",
+                            );
+                        }
+                    });
+                });
+
+                let gap = ui.available_width().max(0.0);
+                if gap > 0.0 {
+                    ui.add_space(gap);
                 }
-                if let Some(mode) = info.infer_service_mode() {
-                    ui.add_space(10.0);
-                    let resp = ui.label(
-                        RichText::new(format!("[{} \u{2022} inferred]", mode.label()))
-                            .small()
-                            .color(muted),
-                    );
-                    resp.on_hover_text(
-                        "HD Radio service mode inferred from the highest subchannel\nadvertised in SIS. nrsc5 does not report the mode directly.",
-                    );
+
+                if let Some(path) = logo_path {
+                    let uri = format!("file:///{}", path.replace('\\', "/"));
+                    egui::Frame::new()
+                        .fill(Color32::from_rgba_unmultiplied(255, 255, 255, 16))
+                        .corner_radius(egui::CornerRadius::same(4))
+                        .inner_margin(egui::Margin::symmetric(6, 4))
+                        .show(ui, |ui| {
+                            ui.add(
+                                egui::Image::new(&uri)
+                                    .fit_to_exact_size(Vec2::new(112.0, 40.0))
+                                    .corner_radius(3),
+                            );
+                        });
                 }
             });
         }
@@ -2243,13 +2316,41 @@ impl DockViewer<'_> {
                 )
             };
             let uri = format!("file:///{}", path.replace('\\', "/"));
-            egui::Image::new(&uri).uv(uv).paint_at(ui, outer);
+            // Use a real clickable Image widget (with a stable per-path ID)
+            // so egui can route secondary-click context menus reliably.
+            let resp = ui
+                .push_id(path, |ui| {
+                    ui.put(
+                        outer,
+                        egui::Image::new(&uri).uv(uv).sense(egui::Sense::click()),
+                    )
+                })
+                .inner;
 
-            // Hover region with a tooltip listing the album and every unique
-            // song we've seen displayed with this cover.
+            // Right-click → block this image permanently.
+            let hash = tile.hash;
+            resp.context_menu(|ui| {
+                if ui.button("\u{1F6AB} Block this image").clicked() {
+                    self.commands.push(UiCommand::BlockCover(hash));
+                    ui.close_menu();
+                }
+            });
+
+            // Some Linux compositor/WM combinations fail to surface egui's
+            // context-menu popup for image widgets even though secondary
+            // clicks are delivered. Fall back to direct block-on-right-click
+            // so the action still works on Ubuntu hosts.
+            if cfg!(target_os = "linux")
+                && self.app_state.collage_secondary_click_fallback
+                && resp.secondary_clicked()
+                && !resp.context_menu_opened()
+            {
+                self.commands.push(UiCommand::BlockCover(hash));
+            }
+
+            // Hover tooltip listing the album and every unique song seen
+            // with this cover.
             if !tile.songs.is_empty() || !tile.album.is_empty() {
-                let id = egui::Id::new(("art_tile", path));
-                let resp = ui.interact(outer, id, egui::Sense::hover());
                 let album = tile.album.clone();
                 let songs = tile.songs.clone();
                 resp.on_hover_ui(|ui| {
