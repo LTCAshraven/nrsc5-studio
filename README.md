@@ -18,7 +18,7 @@ A native Windows and Linux desktop app for listening to **HD Radio** broadcasts 
 
 **[📖 Quick Start](#quick-start)** • **[✨ Features](#features)** • **[📡 Hardware](#hardware-requirements)** • **[🔧 Building](#building-from-source)** • **[📥 Install](#install-portable)**
 
-<small>If you find this project useful, please consider giving it a [star on GitHub](https://github.com/LTCAshraven/nrsc5-studio) — it helps others discover it and keeps the feedback and development flowing! ⭐</small>
+<sub>If you find this project useful, please consider giving it a [star on GitHub](https://github.com/LTCAshraven/nrsc5-studio) — it helps others discover it and keeps the feedback and development flowing! ⭐</sub>
 
 </div>
 
