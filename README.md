@@ -1,6 +1,6 @@
 <div align="center">
 
-![NRSC5 Studio Icon](packaging\linux\icons\hicolor\64x64\apps\nrsc5-studio.png)
+![NRSC5 Studio Icon](packaging/linux/icons/hicolor/64x64/apps/nrsc5-studio.png)
 
 # NRSC5 Studio
 
