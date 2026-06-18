@@ -65,6 +65,9 @@ pub struct AudioPlayer {
     _stream: Option<cpal::Stream>,
     /// `Some(message)` when device open failed; `None` on success.
     /// Surfaced via the status line so the user knows audio is dead.
+    // Kept: holds the cpal-open error for the (currently unwired)
+    // status-line surfacing; read only via `is_ready()`.
+    #[allow(dead_code)]
     pub init_error: Option<String>,
 }
 
@@ -125,6 +128,9 @@ impl AudioPlayer {
     /// True if the cpal output stream was opened successfully. Used by
     /// the UI to gate the volume slider; false means `init_error`
     /// carries a human-readable reason.
+    // Kept: audio-health accessor for the planned status-line surfacing
+    // of `init_error`; no current caller.
+    #[allow(dead_code)]
     pub fn is_ready(&self) -> bool {
         self.init_error.is_none()
     }

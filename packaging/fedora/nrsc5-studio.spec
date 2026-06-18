@@ -25,7 +25,7 @@
 %global debug_package %{nil}
 
 Name:           %{appname}
-Version:        0.6.1
+Version:        0.6.2
 Release:        1%{?dist}
 Summary:        HD Radio FM receiver and station explorer built on nrsc5 and SoapySDR
 
@@ -69,18 +69,30 @@ constellation, MER and BER signal-quality readout, closed-loop
 automatic gain control, TPEG traffic-tile decoding, and animated
 weather radar overlay.
 
-The nrsc5 HD Radio decoder is statically linked into the binary;
-no separate helper installation is required.
+The nrsc5 HD Radio decoder ships as a bundled, self-contained
+libnrsc5.so under %{_libdir}/%{appname}/; no separate helper
+installation is required.
 
 %prep
 %autosetup -n %{name}-%{version}
 
 %build
+# Build the self-contained libnrsc5.so (USE_STATIC=ON) and stage it at
+# bin/libnrsc5.so so the cargo link step below resolves -lnrsc5 and the
+# %install step can ship it. Requires network access to clone the
+# pinned upstream tag.
+bash scripts/build-nrsc5-linux.sh
 cargo build --release --locked
 
 %install
 install -D -m 0755 target/release/%{appname} \
     %{buildroot}%{_bindir}/%{appname}
+
+# Bundled self-contained HD Radio decoder; the binary finds it via the
+# %{_libdir}/%{appname} rpath baked in at link time (build.rs emits
+# /usr/lib/nrsc5-studio).
+install -D -m 0644 bin/libnrsc5.so \
+    %{buildroot}%{_prefix}/lib/%{appname}/libnrsc5.so
 
 install -D -m 0644 packaging/linux/%{appname}.desktop \
     %{buildroot}%{_datadir}/applications/%{appname}.desktop
@@ -115,12 +127,24 @@ appstream-util validate-relax --nonet \
 %license LICENSE
 %doc README.md CHANGELOG.md docs/linux-install.md
 %{_bindir}/%{appname}
+%{_prefix}/lib/%{appname}/libnrsc5.so
 %{_datadir}/applications/%{appname}.desktop
 %{_metainfodir}/%{appid}.metainfo.xml
 %{_datadir}/icons/hicolor/*/apps/%{appname}.png
 %{_mandir}/man1/%{appname}.1*
 
 %changelog
+* Tue Jun 16 2026 LTCAshraven <LTCAshraven@users.noreply.github.com> - 0.6.2-1
+- Per-program decoded audio bit rate in the Station Info panel, derived
+  Rust-side from the libnrsc5 v3.2.0 HDC packet stream (stock libnrsc5
+  has no bit-rate event)
+- FM tuning snapped to the US 200 kHz channel raster (87.9-107.9 MHz)
+- Linux: ship a self-contained bundled libnrsc5.so at
+  /usr/lib/nrsc5-studio/ (loaded via RUNPATH) instead of relying on a
+  system decoder; built from upstream theori-io/nrsc5 v3.2.0 by
+  scripts/build-nrsc5-linux.sh
+- Internal dead-code cleanup (no behavior change)
+
 * Wed Jun 12 2026 LTCAshraven <LTCAshraven@users.noreply.github.com> - 0.6.1-1
 - Collage image block list with persistent storage (content-hash keyed)
 - Station logo rendering in SIS header and Now Playing tab

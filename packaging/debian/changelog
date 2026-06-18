@@ -1,3 +1,16 @@
+nrsc5-studio (0.6.2-1) unstable; urgency=medium
+
+  * Per-program decoded audio bit rate in the Station Info panel,
+    derived Rust-side from the libnrsc5 v3.2.0 HDC packet stream
+    (stock libnrsc5 has no bit-rate event)
+  * FM tuning snapped to the US 200 kHz channel raster (87.9-107.9 MHz)
+  * Ship a self-contained bundled libnrsc5.so at /usr/lib/nrsc5-studio/
+    (loaded via RUNPATH) instead of relying on a system decoder; built
+    from upstream theori-io/nrsc5 v3.2.0 by scripts/build-nrsc5-linux.sh
+  * Internal dead-code cleanup (no behavior change)
+
+ -- LTCAshraven <ltcashraven@users.noreply.github.com>  Tue, 16 Jun 2026 10:00:00 +0000
+
 nrsc5-studio (0.6.1-1) unstable; urgency=medium
 
   * Collage image block list (content-hash keyed, persistent across restarts)

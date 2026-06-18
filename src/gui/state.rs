@@ -413,6 +413,9 @@ impl AppState {
     /// updated within the [`Self::PSD_STALE_AFTER`] window. Used by
     /// the Station Information panel to decide whether to show the
     /// PSD section at all.
+    // Kept: boolean freshness convenience; the panel currently uses
+    // `psd_latest_updated` instead, so this has no caller today.
+    #[allow(dead_code)]
     pub fn psd_is_fresh(&self) -> bool {
         let p = &self.programs[self.active_idx()];
         Self::is_psd_field_fresh(p.title_updated)
@@ -459,6 +462,9 @@ impl AppState {
     /// the currently-active subchannel. Convenience for the small
     /// number of call sites that need to update the displayed PSD
     /// without first computing `active_idx()`.
+    // Kept: mutable counterpart to `active_program`; no current caller
+    // mutates through it, but it completes the accessor pair.
+    #[allow(dead_code)]
     pub fn active_program_mut(&mut self) -> &mut ProgramRuntime {
         let idx = self.active_idx();
         &mut self.programs[idx]

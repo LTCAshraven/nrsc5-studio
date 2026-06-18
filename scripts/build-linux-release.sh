@@ -65,6 +65,19 @@ if ! command -v cargo-generate-rpm >/dev/null 2>&1; then
   cargo install cargo-generate-rpm
 fi
 
+# Build the self-contained libnrsc5.so and stage it at bin/libnrsc5.so.
+# This must run before the cargo build below so the link step resolves
+# -lnrsc5, and before cargo deb / generate-rpm so the .so is present to
+# bundle. Set NRSC5_SKIP_SO_BUILD=1 to reuse an already-staged copy.
+if [[ "${NRSC5_SKIP_SO_BUILD:-0}" != "1" ]]; then
+  echo "==> Building bundled libnrsc5.so"
+  bash scripts/build-nrsc5-linux.sh
+elif [[ ! -f bin/libnrsc5.so ]]; then
+  echo "ERROR: NRSC5_SKIP_SO_BUILD=1 but bin/libnrsc5.so is missing." >&2
+  echo "       Run scripts/build-nrsc5-linux.sh first." >&2
+  exit 1
+fi
+
 # Clean release build. Strip is handled by the [profile.release] section
 # in Cargo.toml so the resulting binary is small even before packaging.
 echo "==> cargo build --release"

@@ -53,8 +53,12 @@ const CHUNK_FRAMES: usize = 8192;
 pub struct IqResampler {
     /// Source sample rate the device is actually producing (e.g.
     /// 2_000_000.0 for SDRplay).
+    // Kept: records the rates the resampler was built for; exposed via
+    // the `src_rate`/`dst_rate` accessors but not read today.
+    #[allow(dead_code)]
     src_rate: f64,
     /// Destination sample rate nrsc5 expects (1_488_375.0).
+    #[allow(dead_code)]
     dst_rate: f64,
     /// `rubato` resampler. `Box`-ed because `SincFixedIn` is large
     /// (kernel + scratch buffers) and we'd rather keep
@@ -120,11 +124,14 @@ impl IqResampler {
     }
 
     /// Source sample rate this resampler was built for (Hz).
+    // Kept: informational accessor pair; no current caller.
+    #[allow(dead_code)]
     pub fn src_rate(&self) -> f64 {
         self.src_rate
     }
 
     /// Destination sample rate this resampler emits (Hz).
+    #[allow(dead_code)]
     pub fn dst_rate(&self) -> f64 {
         self.dst_rate
     }

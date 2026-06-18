@@ -149,10 +149,13 @@ pub enum UiCommand {
     /// file, and surface the saved path in the status line. Idempotent
     /// when no recording is active.
     StopRecording,
-    /// Switch the recording mode (Off / PerSong / Continuous).
-    /// Persisted via `AppConfig::recording_mode`. Doesn't stop an
-    /// in-progress recording — the new mode applies to the next
-    /// StartRecording.
+    /// Switch the recording mode (Off / On). Persisted via
+    /// `AppConfig::recording_mode`. Doesn't stop an in-progress
+    /// recording — the new mode applies to the next StartRecording.
+    // Kept: the App handles this command (see app.rs), but the dock
+    // doesn't currently emit it — the recording-mode selector is
+    // unwired, so the build flags the variant as never constructed.
+    #[allow(dead_code)]
     SetRecordingMode(crate::config::RecordingMode),
     /// Set the per-file rotation cap in minutes. Snapped server-side
     /// to [1, 240]. Persisted; applies to the next file rotation.
@@ -270,9 +273,9 @@ impl DockViewer<'_> {
             ui.label(RichText::new("Frequency").strong());
             let freq_resp = ui.add(
                 DragValue::new(&mut self.app_state.frequency_mhz)
-                    .speed(0.1)
+                    .speed(0.2)
                     .suffix(" MHz")
-                    .range(87.5..=108.0),
+                    .range(87.9..=107.9),
             );
             // Treat <Enter> in the Frequency field as a Tune click so the
             // user doesn't have to grab the mouse after typing a freq.
@@ -280,9 +283,19 @@ impl DockViewer<'_> {
             // for text-editable widgets including `DragValue`.
             let enter_pressed = freq_resp.lost_focus()
                 && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if ui.button("<").on_hover_text("Tune down 0.2 MHz").clicked() {
+                self.commands.push(UiCommand::TuneMhz(
+                    self.app_state.frequency_mhz - 0.2,
+                ));
+            }
             if ui.button("Tune").clicked() || enter_pressed {
                 self.commands
                     .push(UiCommand::TuneMhz(self.app_state.frequency_mhz));
+            }
+            if ui.button(">").on_hover_text("Tune up 0.2 MHz").clicked() {
+                self.commands.push(UiCommand::TuneMhz(
+                    self.app_state.frequency_mhz + 0.2,
+                ));
             }
         });
         ui.add_space(2.0);
@@ -1438,8 +1451,10 @@ impl DockViewer<'_> {
     ///
     /// Top half: live FFT line with a translucent gradient fill from the
     /// trace down to the baseline, painted as a per-vertex-colored
-    /// triangle strip mesh, with a faint dB grid and frequency labels
-    /// overlaid. The HD digital sidebands (±129..±199 kHz from carrier)
+    /// triangle strip mesh, with a faint dB grid and a channel-raster
+    /// frequency scale overlaid. Left-clicking the spectrum tunes to the
+    /// clicked frequency (snapped server-side to the 200 kHz FM raster via
+    /// `UiCommand::TuneMhz` handling). The HD digital sidebands (±129..±199 kHz from carrier)
     /// are highlighted as faint colored regions so the user can see the
     /// shoulders rise above the FM analog signal.
     ///
@@ -1487,6 +1502,12 @@ impl DockViewer<'_> {
                         .small()
                         .color(dim),
                 );
+            } else {
+                ui.label(
+                    RichText::new("Click to tune")
+                        .small()
+                        .color(dim),
+                );
             }
         });
         ui.add_space(2.0);
@@ -1515,7 +1536,7 @@ impl DockViewer<'_> {
         let split_y = total_rect.top() + total_rect.height() * 0.40;
         let spec_rect = Rect::from_min_max(total_rect.min, pos2(total_rect.right(), split_y));
         let wf_rect = Rect::from_min_max(pos2(total_rect.left(), split_y + 2.0), total_rect.max);
-        ui.allocate_rect(total_rect, Sense::hover());
+        let panel_resp = ui.allocate_rect(total_rect, Sense::click());
         let painter = ui.painter_at(total_rect);
 
         // Background panels (slightly different shades so the split is
@@ -1642,26 +1663,32 @@ impl DockViewer<'_> {
         // Crisp trace line on top of the fill.
         painter.add(Shape::line(trace_pts, Stroke::new(1.2, trace_color)));
 
-        // Frequency labels along the bottom of the spectrum rect.
+        // Frequency scale pinned to the FM 200 kHz raster (87.9 + n*0.2).
         let center_mhz = self.app_state.spectrum_snapshot.center_freq_hz / 1_000_000.0;
         let half_span_mhz = sample_rate as f64 / 2.0 / 1_000_000.0;
-        for slot in 0..=4 {
-            let t = slot as f32 / 4.0;
-            let x = spec_rect.left() + t * spec_rect.width();
-            let mhz = center_mhz - half_span_mhz + (t as f64) * 2.0 * half_span_mhz;
+        let view_min_mhz = center_mhz - half_span_mhz;
+        let view_max_mhz = center_mhz + half_span_mhz;
+        const FM_BASE_MHZ: f64 = 87.9;
+        const FM_STEP_MHZ: f64 = 0.2;
+        if view_max_mhz > view_min_mhz {
+            let first = ((view_min_mhz - FM_BASE_MHZ) / FM_STEP_MHZ).ceil() as i32;
+            let last = ((view_max_mhz - FM_BASE_MHZ) / FM_STEP_MHZ).floor() as i32;
+            for slot in first..=last {
+                let mhz = FM_BASE_MHZ + (slot as f64) * FM_STEP_MHZ;
+                let t = ((mhz - view_min_mhz) / (view_max_mhz - view_min_mhz)).clamp(0.0, 1.0) as f32;
+                let x = spec_rect.left() + t * spec_rect.width();
+                painter.line_segment(
+                    [pos2(x, spec_rect.top()), pos2(x, spec_rect.bottom())],
+                    Stroke::new(0.6, Color32::from_rgb(36, 48, 70)),
+                );
             painter.text(
                 pos2(x, spec_rect.bottom() - 2.0),
-                if slot == 0 {
-                    egui::Align2::LEFT_BOTTOM
-                } else if slot == 4 {
-                    egui::Align2::RIGHT_BOTTOM
-                } else {
-                    egui::Align2::CENTER_BOTTOM
-                },
-                format!("{:.3} MHz", mhz),
+                    egui::Align2::CENTER_BOTTOM,
+                    format!("{:.1}", mhz),
                 egui::FontId::monospace(10.0),
                 Color32::from_rgb(150, 170, 200),
             );
+            }
         }
 
         // ---- Waterfall ------------------------------------------------------------
@@ -1725,6 +1752,18 @@ impl DockViewer<'_> {
             [pos2(cx, wf_rect.top()), pos2(cx, wf_rect.bottom())],
             Stroke::new(0.7, Color32::from_rgba_unmultiplied(255, 60, 60, 110)),
         );
+
+        // Click-to-tune: map x-position in the spectrum pane to frequency.
+        if panel_resp.clicked() {
+            if let Some(pos) = panel_resp.interact_pointer_pos() {
+                if spec_rect.contains(pos) && sample_rate > 1.0 {
+                    let t = ((pos.x - spec_rect.left()) / spec_rect.width()).clamp(0.0, 1.0);
+                    let clicked_mhz =
+                        center_mhz - half_span_mhz + (t as f64) * 2.0 * half_span_mhz;
+                    self.commands.push(UiCommand::TuneMhz(clicked_mhz as f32));
+                }
+            }
+        }
 
         // Keep repainting while the panel is on screen so we get smooth
         // waterfall scroll even when no other UI is animating.

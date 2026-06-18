@@ -142,6 +142,9 @@ impl GainCache {
     }
 
     /// Empty cache with an explicit TTL. Mainly for tests.
+    // Kept: explicit-TTL constructor for tests / future tuning; no
+    // current caller.
+    #[allow(dead_code)]
     pub fn with_ttl(ttl: Duration) -> Self {
         Self {
             entries: HashMap::new(),
@@ -230,6 +233,8 @@ impl GainCache {
     }
 
     /// Convenience for empty-check.
+    // Kept: standard `is_empty` companion to `len`; no current caller.
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }

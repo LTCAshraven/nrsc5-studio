@@ -34,21 +34,59 @@ fn main() {
     generate_bindings();
 }
 
-/// On Unix targets, ensure the linker can find a system-installed
-/// `libnrsc5.so`. Covers the common install prefixes used by the
-/// upstream `nrsc5` build (`/usr/local/lib`) and distro packages
-/// (`/usr/lib`, `/usr/lib/<triple>`). Each path is only emitted if
-/// it actually exists so we don't add noise to the link line.
+/// On Unix targets, ensure the linker can find `libnrsc5.so` and bake
+/// in the runtime search path(s) for the bundled copy.
+///
+/// Link-time search order:
+///   1. the workspace `bin/` directory, where
+///      `scripts/build-nrsc5-linux.sh` stages the self-contained
+///      `libnrsc5.so` we ship in the `.deb` / `.rpm`;
+///   2. the common system prefixes a hand-built or distro `libnrsc5.so`
+///      lands in (`/usr/local/lib`, `/usr/lib`, the multiarch dir).
+///
+/// Runtime search path (DT_RUNPATH): the installed package puts the
+/// bundled `libnrsc5.so` in `/usr/lib/nrsc5-studio/`, so that is baked
+/// in unconditionally. For non-release (developer) builds we *also* add
+/// the workspace `bin/` directory so `cargo run` from the repo resolves
+/// the staged `.so` without `LD_LIBRARY_PATH` — that absolute dev path
+/// is intentionally omitted from release builds so it never leaks into a
+/// shipped binary's RUNPATH.
 fn emit_unix_nrsc5_link_search() {
-    let candidates = [
+    // 1. Workspace bin/ (staged libnrsc5.so) first so a locally-built
+    //    copy wins over any stale system install during development.
+    let manifest_dir = env::var_os("CARGO_MANIFEST_DIR").map(PathBuf::from);
+    if let Some(bin) = manifest_dir.as_ref().map(|d| d.join("bin")) {
+        if bin.is_dir() {
+            println!("cargo:rustc-link-search=native={}", bin.display());
+            println!("cargo:rerun-if-changed={}", bin.display());
+        }
+    }
+
+    // 2. System prefixes for a hand-built / distro libnrsc5.so.
+    for path in [
         "/usr/local/lib",
         "/usr/local/lib/x86_64-linux-gnu",
         "/usr/lib",
         "/usr/lib/x86_64-linux-gnu",
-    ];
-    for path in candidates {
+    ] {
         if Path::new(path).is_dir() {
             println!("cargo:rustc-link-search=native={path}");
+        }
+    }
+
+    // Runtime: the package installs the bundled .so here.
+    println!("cargo:rustc-link-arg=-Wl,-rpath,/usr/lib/nrsc5-studio");
+
+    // Developer convenience: let `cargo run` from the repo find the
+    // staged bin/libnrsc5.so. Release builds (what cargo-deb /
+    // cargo-generate-rpm package) deliberately skip this so the
+    // builder's absolute path never ends up in the shipped RUNPATH.
+    let is_release = env::var("PROFILE").as_deref() == Ok("release");
+    if !is_release {
+        if let Some(bin) = manifest_dir.map(|d| d.join("bin")) {
+            if bin.is_dir() {
+                println!("cargo:rustc-link-arg=-Wl,-rpath,{}", bin.display());
+            }
         }
     }
 }

@@ -19,7 +19,7 @@ pub mod gain_cache;
 pub mod rtltcp;
 
 pub use soapy::{DeviceInfo, SoapySdr};
-pub use profile::{DeviceProfile, R820T_GAINS_TENTHS};
+pub use profile::R820T_GAINS_TENTHS;
 pub use iq_bus::IqBus;
 pub use gain_cache::{GainCache, GainCacheEntry, GainCacheKey};
 pub use rtltcp::RtlTcpSdr;
@@ -31,18 +31,6 @@ use thiserror::Error;
 /// include enough context to be self-explanatory.
 #[derive(Debug, Error)]
 pub enum SdrError {
-    #[error("librtlsdr.dll not found in bin/ or alongside the executable")]
-    LibraryNotFound,
-    #[error("librtlsdr.dll failed to load: {0}")]
-    LoadFailed(String),
-    #[error("librtlsdr is missing required symbol `{0}` (DLL ABI break?)")]
-    SymbolMissing(&'static str),
-    #[error("rtlsdr_open(index={0}) failed (device in use or missing?)")]
-    OpenFailed(u32),
-    #[error("librtlsdr call `{func}` returned error code {code}")]
-    CallFailed { func: &'static str, code: i32 },
-    #[error("operation requires an open device but the SDR is not configured")]
-    NotOpen,
     #[error("stream is already running on this device")]
     AlreadyStreaming,
     // === SoapySDR backend (v0.3.0) ===
@@ -198,6 +186,9 @@ pub trait Sdr: Send + Sync {
     /// Best-effort retune to a new center frequency mid-stream. Returns
     /// without error if the stream isn't running. Used by the GUI's
     /// retune flow once the SDR backend is wired into [`ffi`](crate::ffi).
+    // Kept: backend-abstraction surface; current retune path goes
+    // through the ffi session rather than this trait method.
+    #[allow(dead_code)]
     fn set_center_freq_hz(&self, hz: u32) -> Result<(), SdrError>;
 
     /// Snapshot of every named gain element this device exposes, with
@@ -269,6 +260,9 @@ pub trait Sdr: Send + Sync {
     /// don't need to implement.
     ///
     /// [`antennas`]: Sdr::antennas
+    // Kept: backend-abstraction surface with a no-op default; the
+    // config-restart flow tears down the session rather than calling this.
+    #[allow(dead_code)]
     fn set_antenna(&self, _name: &str) -> Result<(), SdrError> {
         Ok(())
     }

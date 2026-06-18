@@ -23,6 +23,11 @@ override_dh_auto_test:
 override_dh_auto_install:
 	install -D -m 0755 target/release/nrsc5-studio \
 		debian/nrsc5-studio/usr/bin/nrsc5-studio
+	# Bundled self-contained HD Radio decoder. Must be pre-staged at
+	# bin/libnrsc5.so by scripts/build-nrsc5-linux.sh before debuild;
+	# the binary finds it via the /usr/lib/nrsc5-studio rpath (build.rs).
+	install -D -m 0644 bin/libnrsc5.so \
+		debian/nrsc5-studio/usr/lib/nrsc5-studio/libnrsc5.so
 	install -D -m 0644 packaging/linux/nrsc5-studio.desktop \
 		debian/nrsc5-studio/usr/share/applications/nrsc5-studio.desktop
 	install -D -m 0644 packaging/linux/io.github.ltcashraven.Nrsc5Studio.metainfo.xml \

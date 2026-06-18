@@ -34,8 +34,9 @@
       <li>Persistent dock layout with dark and light themes.</li>
     </ul>
     <p>
-      The nrsc5 HD Radio decoder is statically linked into the binary;
-      no separate helper installation is required. See
+      The nrsc5 HD Radio decoder ships bundled with the application
+      (libnrsc5.so installed alongside the binary); no separate helper
+      installation is required. See
       /usr/share/doc/nrsc5-studio/linux-install.md for SDR driver setup
       and udev permissions.
     </p>
@@ -80,6 +81,44 @@
   <content_rating type="oars-1.1" />
 
   <releases>
+    <release version="0.6.2" date="2026-06-16">
+      <description>
+        <p>Per-program decoded audio bit rate in the Station Info
+        panel, derived in-app from the libnrsc5 v3.2.0 HDC packet
+        stream (stock libnrsc5 has no decoded-bit-rate event). FM
+        tuning is snapped to the US 200 kHz channel raster
+        (87.9-107.9 MHz). Linux packages now ship a self-contained
+        bundled libnrsc5.so at /usr/lib/nrsc5-studio/ (resolved via
+        RUNPATH) instead of relying on a system-installed decoder,
+        fixing a "library not found" failure on a clean install; the
+        library is built from upstream theori-io/nrsc5 v3.2.0 by
+        scripts/build-nrsc5-linux.sh. Internal dead-code cleanup with
+        no user-facing behavior change.</p>
+      </description>
+    </release>
+    <release version="0.6.1" date="2026-06-10">
+      <description>
+        <p>Collage image block list (content-hash keyed, persistent
+        across restarts) with a right-click "Block this image" action
+        and a "Clear Block List" button in Settings. Station logos
+        transmitted via XHDR now render as a badge in the SIS header,
+        and the Now Playing panel switches between cover art and
+        station logo based on the XHDR param.</p>
+      </description>
+    </release>
+    <release version="0.6.0" date="2026-06-03">
+      <description>
+        <p>Amplitude-first AGC pre-stage that brackets the gain choice
+        in under a second before the existing MER hill-climb takes
+        over, cutting cold-start tune times. The bundled libnrsc5
+        jumps from v3.1.0 to v3.2.0, picking up an FFTW alignment
+        perf bump and four new SIS events (exciter/importer equipment
+        info, broadcaster local time, GPS-UTC leap-second offset)
+        surfaced in the Station Info panel. Settings -> Gain grew an
+        "Advanced AGC tuning" section to override the per-profile
+        amplitude target.</p>
+      </description>
+    </release>
     <release version="0.5.0" date="2026-06-02">
       <description>
         <p>libnrsc5 in-process cutover. NRSC5 Studio no longer ships

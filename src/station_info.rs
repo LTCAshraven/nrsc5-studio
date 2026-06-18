@@ -39,6 +39,9 @@ pub struct ProgramInfo {
     pub bit_rate_kbps: Option<f32>,
     /// Wall-clock time the slot was first observed. Used by the panel to
     /// show "seen Xs ago" hints and by `reset_stale` heuristics.
+    // Kept: "first observed" timestamp populated for the planned
+    // "seen Xs ago" panel hint; not read today.
+    #[allow(dead_code)]
     pub seen_at: Instant,
 }
 
@@ -69,8 +72,12 @@ pub struct DataService {
     pub name: String,
     /// Mime hash as printed by nrsc5 (e.g. `"BE4B7536"`), if a
     /// `Component:` line was observed for this service.
+    // Kept: parsed from `Component:` lines for a future data-service
+    // panel; not rendered today.
+    #[allow(dead_code)]
     pub mime: Option<String>,
     /// `service_data_type=N`, if a `Component:` line was observed.
+    #[allow(dead_code)]
     pub service_data_type: Option<u32>,
 }
 
@@ -195,6 +202,7 @@ impl LeapSecondInfo {
 /// AM-mode SYNC supplementary indicators (libnrsc5 v3.2.0). Stored
 /// for diagnostics; not rendered in Phase A.
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 pub struct AmSyncIndicators {
     /// Power Level Indicator.
     pub pli: i32,

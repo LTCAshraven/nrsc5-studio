@@ -35,6 +35,13 @@ struct SdrProbeResult {
 /// snapped to a power of two) and may be lower than this.
 const ART_TILES_HARD_MAX: usize = 512;
 
+/// FM channel raster used by tuner inputs and tune commands.
+/// US HD/FM centers are 200 kHz spaced and anchored to 87.9 MHz.
+const FM_TUNE_MIN_MHZ: f32 = 87.9;
+const FM_TUNE_MAX_MHZ: f32 = 107.9;
+const FM_TUNE_STEP_MHZ: f32 = 0.2;
+const FM_TUNE_BASE_MHZ: f32 = 87.9;
+
 /// Resolve the user's preferred collage tile cap from config, clamping to
 /// the supported range and snapping to the nearest power of two. The UI
 /// only emits exact powers of two, so this only matters for hand-edited
@@ -44,6 +51,14 @@ fn collage_tile_cap(cfg: &AppConfig) -> usize {
         .min(ART_TILES_HARD_MAX)
         .next_power_of_two()
         .min(ART_TILES_HARD_MAX)
+}
+
+/// Clamp + snap an FM frequency to the 200 kHz channel raster.
+fn snap_fm_tune_mhz(mhz: f32) -> f32 {
+    let clamped = mhz.clamp(FM_TUNE_MIN_MHZ, FM_TUNE_MAX_MHZ);
+    let slots = ((clamped - FM_TUNE_BASE_MHZ) / FM_TUNE_STEP_MHZ).round();
+    let snapped = FM_TUNE_BASE_MHZ + slots * FM_TUNE_STEP_MHZ;
+    (snapped * 10.0).round() / 10.0
 }
 
 /// Snap an arbitrary tenths-of-dB gain value to the nearest entry in
@@ -233,7 +248,12 @@ impl Nrsc5App {
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         egui_extras::install_image_loaders(&_cc.egui_ctx);
         Self::install_fonts(&_cc.egui_ctx);
-        let config = load_config();
+        let mut config = load_config();
+        let snapped_boot_freq = snap_fm_tune_mhz(config.frequency_mhz);
+        if (config.frequency_mhz - snapped_boot_freq).abs() > f32::EPSILON {
+            config.frequency_mhz = snapped_boot_freq;
+            save_config(&config);
+        }
         Self::apply_theme(&_cc.egui_ctx, config.dark_mode);
         let dock_state = _cc
             .storage
@@ -2339,6 +2359,7 @@ impl Nrsc5App {
                 self.app_state.nrsc5_status = "stream stopped".to_string();
             }
             UiCommand::TuneMhz(mhz) => {
+                let mhz = snap_fm_tune_mhz(mhz);
                 self.app_state.frequency_mhz = mhz;
                 // Phase 4: a tune is a station change — the recording's
                 // station-identity metadata (and the per-station
@@ -2515,7 +2536,7 @@ impl Nrsc5App {
                 };
                 let preset = crate::config::Preset {
                     name,
-                    frequency_mhz: self.app_state.frequency_mhz,
+                    frequency_mhz: snap_fm_tune_mhz(self.app_state.frequency_mhz),
                     program: self.app_state.selected_program,
                 };
                 // Extend the vec if needed.
@@ -2528,6 +2549,8 @@ impl Nrsc5App {
                     format!("saved preset {}", slot + 1);
             }
             UiCommand::SetPreset(slot, preset) => {
+                let mut preset = preset;
+                preset.frequency_mhz = snap_fm_tune_mhz(preset.frequency_mhz);
                 // Extend the vec if needed so editing an empty slot works.
                 while self.config.presets.len() <= slot {
                     self.config.presets.push(crate::config::Preset::default());
@@ -2547,17 +2570,18 @@ impl Nrsc5App {
             }
             UiCommand::RecallPreset(slot) => {
                 if let Some(preset) = self.config.presets.get(slot).cloned() {
-                    self.app_state.frequency_mhz = preset.frequency_mhz;
+                    let tuned = snap_fm_tune_mhz(preset.frequency_mhz);
+                    self.app_state.frequency_mhz = tuned;
                     self.app_state.selected_program = preset.program;
                     self.app_state.nrsc5_status = format!(
                         "preset {}: {:.1} HD{}",
                         slot + 1,
-                        preset.frequency_mhz,
+                        tuned,
                         preset.program + 1
                     );
                     // If streaming, retune to the new station.
                     if self.app_state.is_streaming {
-                        self.handle_command(UiCommand::TuneMhz(preset.frequency_mhz));
+                        self.handle_command(UiCommand::TuneMhz(tuned));
                     }
                 }
             }

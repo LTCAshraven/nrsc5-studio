@@ -84,6 +84,7 @@ pub enum NrscEvent {
     /// Kept for forward-compat with libnrsc5 versions that may tag
     /// the LOT with a real service / component id.
     LotFile {
+        #[allow(dead_code)]
         program: u32,
         lot: String,
         name: String,
@@ -151,6 +152,9 @@ pub enum NrscEvent {
     /// freshen the "last changed" timestamp on the gain readout.
     AgcDecision {
         tenths: i32,
+        // Kept: human-readable rationale for the gain change, carried
+        // for the AGC trace log / future UI tooltip; not read today.
+        #[allow(dead_code)]
         reason: String,
     },
     /// AM-mode SYNC supplementary indicators (libnrsc5 v3.2.0). Emitted
@@ -420,36 +424,10 @@ pub struct Nrsc5Process {
     aas_dir: PathBuf,
 }
 
-/// Append one line to the AGC trace log (Phase 2c). Best-effort:
-/// open failure or write failure is silently ignored so the AGC
-/// driver thread never blocks or panics on a disk hiccup. The file
-/// is created on first call if missing; truncation happens via
-/// [`agc_log_start`] at the top of each `start_piped` so each tune's
-/// trace stands alone.
-///
-/// v0.6.0: every line is prefixed with a `HH:MM:SS.mmm` wall-clock
-/// timestamp so amplitude-pre-stage probes (sub-second cadence) can
-/// be correlated with `[lot]` / `[map]` events and with whatever the
-/// user observed on the UI at the same moment.
-fn agc_log_append(line: &str) {
-    let Some(path) = crate::paths::agc_trace_path() else {
-        return;
-    };
-    use std::io::Write;
-    let ts = chrono::Local::now().format("%H:%M:%S%.3f");
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-    {
-        let _ = writeln!(f, "{} {}", ts, line);
-    }
-}
-
 /// Emit one AGC trace line to BOTH stderr and the log file with a
 /// matching `HH:MM:SS.mmm` prefix. Saves every caller from typing
-/// `eprintln!` + `agc_log_append` + remembering to format the
-/// timestamp the same way in both places. v0.6.0 amplitude-pre-stage
+/// `eprintln!` + the file-append boilerplate + remembering to format
+/// the timestamp the same way in both places. v0.6.0 amplitude-pre-stage
 /// probes happen sub-second so the timestamp must come from one
 /// source-of-truth call site, not be looked up twice.
 fn agc_trace(line: &str) {
@@ -996,16 +974,6 @@ impl Nrsc5Process {
 
     pub fn aas_dir(&self) -> &std::path::Path {
         &self.aas_dir
-    }
-
-    /// PID of the running nrsc5 process. Phase 3 cutover (0.5.0)
-    /// retired the external `nrsc5.exe` child in favor of in-process
-    /// `libnrsc5` calls, so there's no separate PID to report
-    /// anymore. Always returns `None`; callers that previously
-    /// displayed a PID in the status bar can fall back to
-    /// `version()` for a "decoder is alive" indicator.
-    pub fn pid(&self) -> Option<u32> {
-        None
     }
 
     /// Build the single libnrsc5 session that drives the current

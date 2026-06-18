@@ -82,6 +82,9 @@ pub struct DeviceProfile {
     /// render as a manual knob, in display order. Always includes the
     /// AGC target. Devices may expose extra elements (e.g. SDRplay's
     /// `RFGR`) that the modal renders alongside.
+    // Kept: per-profile manual-knob list for the SDR Settings modal,
+    // which doesn't consume it yet.
+    #[allow(dead_code)]
     pub manual_elements: &'static [&'static str],
     /// Free-form notes shown in the SDR Settings modal under an
     /// "HD Radio notes" disclosure. Cite specific HD Radio-relevant
@@ -406,6 +409,10 @@ pub fn lookup(driver: &str) -> Option<&'static DeviceProfile> {
 /// All known profiles, in display order. Surfaced to the SDR Settings
 /// modal's "Supported devices" section even when no device of that
 /// kind is currently plugged in.
+// Kept: covered by the profile round-trip test and retained as the
+// canonical profile registry for the settings UI; no production caller
+// today, so the non-test build flags it dead.
+#[allow(dead_code)]
 pub const ALL_PROFILES: &[&DeviceProfile] = &[&RTLSDR, &SDRPLAY, &HACKRF];
 
 /// R820T2 tuner discrete gain steps in tenths of dB, as reported by

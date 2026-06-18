@@ -35,6 +35,7 @@
 //! will retire `ffi::decoder::DecoderInstance` and route the existing
 //! [`NrscEvent`] channel through this wrapper instead.
 
+use std::cell::Cell;
 use std::ffi::{c_char, c_int, c_void, CStr};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
@@ -53,6 +54,10 @@ use super::NrscEvent;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Fm,
+    // Kept: the AM half of the nrsc5 mode mapping. The app only tunes
+    // FM HD today, but this completes the FFI surface against
+    // `NRSC5_MODE_AM` so adding AM HD support is a one-line UI change.
+    #[allow(dead_code)]
     Am,
 }
 
@@ -210,7 +215,11 @@ impl Nrsc5Session {
         pcm_sink: Option<PcmSink>,
     ) -> Result<(), Nrsc5ApiError> {
         if self.ctx.is_null() {
-            let ctx = Box::into_raw(Box::new(CallbackCtx { event_cb, pcm_sink }));
+            let ctx = Box::into_raw(Box::new(CallbackCtx {
+                event_cb,
+                pcm_sink,
+                bitrate: BitrateAccum::default(),
+            }));
             // SAFETY: `ctx` is freshly leaked from a Box, so the pointer
             // is valid; `trampoline` matches the C ABI declared by
             // `nrsc5_callback_t`.
@@ -248,6 +257,10 @@ impl Nrsc5Session {
 
     /// Stop the worker and wait for it to become idle. Pending
     /// callbacks complete before this returns.
+    // Kept: lifecycle pair to `start()` completing the safe FFI
+    // wrapper. Session teardown currently routes through Drop/close,
+    // so no production caller invokes this directly.
+    #[allow(dead_code)]
     pub fn stop(&self) {
         // SAFETY: `self.st` is a valid session pointer.
         unsafe { sys::nrsc5_stop(self.st) };
@@ -306,11 +319,74 @@ impl Drop for Nrsc5Session {
 type EventCallback = Box<dyn Fn(NrscEvent) + Send + Sync + 'static>;
 type PcmSink = Box<dyn Fn(u32, &[i16]) + Send + Sync + 'static>;
 
-/// Boxed and handed to libnrsc5 as `opaque`. Both fields are optional
-/// so a caller can install only the sink they care about.
+/// Boxed and handed to libnrsc5 as `opaque`. Both callback fields are
+/// optional so a caller can install only the sink they care about.
 struct CallbackCtx {
     event_cb: Option<EventCallback>,
     pcm_sink: Option<PcmSink>,
+    /// Per-program accumulator used to derive the decoded audio bit
+    /// rate from the raw HDC packet stream. Mutated only on libnrsc5's
+    /// single worker thread inside [`trampoline`], so `Cell` interior
+    /// mutability is sound without locking.
+    bitrate: BitrateAccum,
+}
+
+/// Number of CRC-valid HDC frames to average over before emitting a
+/// bit-rate estimate. Matches the upstream nrsc5 CLI's window.
+const BITRATE_FRAME_WINDOW: u32 = 32;
+
+/// Per-program HDC accumulator that reproduces the nrsc5 CLI's
+/// `Audio bit rate:` calculation on stock libnrsc5 (v3.2.0 has no
+/// decoded-bit-rate event). For each complete HDC packet we add its
+/// byte count, and for each CRC-valid packet we count a frame; every
+/// [`BITRATE_FRAME_WINDOW`] valid frames we emit
+///
+/// ```text
+/// kbps = bytes * 8 * SAMPLE_RATE_AUDIO / AUDIO_FRAME_SAMPLES / frames / 1000
+/// ```
+///
+/// and reset that program's counters. Indexed by 0-based program;
+/// libnrsc5 caps the program count at 8.
+///
+/// Thanks to **TheDaChicken**, **argilo**, and **pclov3r** on the
+/// upstream `theori-io/nrsc5` repo for pointing us at the right place
+/// to hook the HDC packet stream and how the CLI derives the rate.
+#[derive(Default)]
+struct BitrateAccum {
+    bytes: [Cell<u64>; 8],
+    frames: [Cell<u32>; 8],
+}
+
+impl BitrateAccum {
+    /// Feed one HDC packet. `bytes` is the packet size, `crc_ok` is
+    /// `true` when the CRC-error flag is clear. Returns `Some(kbps)`
+    /// once a full window of CRC-valid frames has accumulated (and
+    /// resets that program's counters), otherwise `None`.
+    fn push(&self, program: usize, bytes: usize, crc_ok: bool) -> Option<f32> {
+        if program >= self.bytes.len() {
+            return None;
+        }
+        // Every complete packet contributes its bytes (mirrors the
+        // CLI, which sums packet size before the CRC check).
+        let total_bytes = self.bytes[program].get() + bytes as u64;
+        self.bytes[program].set(total_bytes);
+        if !crc_ok {
+            return None;
+        }
+        let frames = self.frames[program].get() + 1;
+        if frames < BITRATE_FRAME_WINDOW {
+            self.frames[program].set(frames);
+            return None;
+        }
+        // Window complete — compute, then reset for the next window.
+        let kbps = total_bytes as f64 * 8.0 * sys::NRSC5_SAMPLE_RATE_AUDIO as f64
+            / sys::NRSC5_AUDIO_FRAME_SAMPLES as f64
+            / frames as f64
+            / 1000.0;
+        self.bytes[program].set(0);
+        self.frames[program].set(0);
+        Some(kbps as f32)
+    }
 }
 
 /// The single C-ABI entry point libnrsc5 invokes. Splits the wire-level
@@ -353,7 +429,7 @@ unsafe extern "C" fn trampoline(evt: *const sys::nrsc5_event_t, opaque: *mut c_v
                     // SAFETY: `translate_event` is only allowed to
                     // read the variant matching `tag`; matched per-arm
                     // inside the function.
-                    let events = unsafe { translate_event(tag, &evt.payload) };
+                    let events = unsafe { translate_event(tag, &evt.payload, &ctx.bitrate) };
                     for ev in events {
                         cb(ev);
                     }
@@ -373,7 +449,11 @@ unsafe extern "C" fn trampoline(evt: *const sys::nrsc5_event_t, opaque: *mut c_v
 /// `tag` must be the live discriminant of `payload`. The caller in
 /// [`trampoline`] obtains both fields from the same event struct so
 /// this invariant is upheld.
-unsafe fn translate_event(tag: u32, payload: &sys::nrsc5_event_payload) -> Vec<NrscEvent> {
+unsafe fn translate_event(
+    tag: u32,
+    payload: &sys::nrsc5_event_payload,
+    bitrate: &BitrateAccum,
+) -> Vec<NrscEvent> {
     let mut out: Vec<NrscEvent> = Vec::new();
     match tag {
         sys::NRSC5_EVENT_LOST_DEVICE => out.push(NrscEvent::LostDevice),
@@ -625,8 +705,24 @@ unsafe fn translate_event(tag: u32, payload: &sys::nrsc5_event_payload) -> Vec<N
                 dst_schedule,
             });
         }
+        sys::NRSC5_EVENT_HDC => {
+            // Stock libnrsc5 (v3.2.0) has no decoded-bit-rate event, so
+            // derive it here from the raw HDC packet stream exactly like
+            // the nrsc5 CLI: sum packet bytes, count CRC-valid frames,
+            // and emit a per-program estimate every
+            // `BITRATE_FRAME_WINDOW` valid frames.
+            // SAFETY: union access; tag matches.
+            let h = unsafe { payload.hdc };
+            let crc_ok = h.flags & sys::NRSC5_PKT_FLAGS_CRC_ERROR == 0;
+            if let Some(kbps) = bitrate.push(h.program as usize, h.count, crc_ok) {
+                out.push(NrscEvent::AudioBitRate {
+                    program: h.program,
+                    kbps,
+                });
+            }
+        }
         // Not surfaced:
-        //   IQ, HDC, STREAM, PACKET — internal / raw.
+        //   IQ, STREAM, PACKET — internal / raw.
         //   AUDIO — handled by the PCM sink path in `trampoline`.
         //   AUDIO_SERVICE (codec/blend/latency) — no consumer today;
         //     bit rate is computed differently (Phase 3 may add a
@@ -756,6 +852,7 @@ mod tests {
             CallbackCtx {
                 event_cb: Some(cb),
                 pcm_sink: None,
+                bitrate: BitrateAccum::default(),
             },
             captured,
         )
@@ -826,6 +923,121 @@ mod tests {
             }
             ref other => panic!("expected SyncAm, got {other:?}"),
         }
+    }
+
+    /// Feed an HDC event. `bytes` is the packet size, `crc_ok` clears
+    /// the CRC-error flag.
+    fn dispatch_hdc(ctx: &mut CallbackCtx, program: u32, bytes: usize, crc_ok: bool) {
+        let mut payload = zeroed_payload();
+        payload.hdc = sys::nrsc5_event_hdc {
+            program,
+            data: ptr::null(),
+            count: bytes,
+            flags: if crc_ok {
+                sys::NRSC5_PKT_FLAGS_NONE
+            } else {
+                sys::NRSC5_PKT_FLAGS_CRC_ERROR
+            },
+        };
+        dispatch(
+            sys::nrsc5_event_t {
+                event: sys::NRSC5_EVENT_HDC,
+                payload,
+            },
+            ctx,
+        );
+    }
+
+    #[test]
+    fn hdc_emits_bitrate_after_full_window() {
+        let (mut ctx, out) = capture();
+        // A constant 1024-byte packet over a full 32-frame window.
+        // kbps = 1024*32 * 8 * 44100 / 2048 / 32 / 1000 = 176.4
+        let bytes = 1024usize;
+        for _ in 0..BITRATE_FRAME_WINDOW {
+            dispatch_hdc(&mut ctx, 0, bytes, true);
+        }
+        let got = out.lock().unwrap();
+        assert_eq!(got.len(), 1, "exactly one bit-rate event per window");
+        match got[0] {
+            NrscEvent::AudioBitRate { program, kbps } => {
+                assert_eq!(program, 0);
+                assert!(
+                    (kbps - 176.4).abs() < 0.05,
+                    "expected ~176.4 kbps, got {kbps}"
+                );
+            }
+            ref other => panic!("expected AudioBitRate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hdc_no_emit_before_window() {
+        let (mut ctx, out) = capture();
+        for _ in 0..(BITRATE_FRAME_WINDOW - 1) {
+            dispatch_hdc(&mut ctx, 0, 1024, true);
+        }
+        assert!(
+            out.lock().unwrap().is_empty(),
+            "no event until a full window of CRC-valid frames"
+        );
+    }
+
+    #[test]
+    fn hdc_crc_error_counts_bytes_not_frames() {
+        // CRC-error packets add bytes but don't advance the frame
+        // counter, so they inflate the averaged byte total without
+        // shortening the window — mirroring the nrsc5 CLI.
+        let (mut ctx, out) = capture();
+        // One CRC-error packet, then a full window of valid 1024-byte
+        // packets. Total bytes = 1024*33, frames = 32.
+        // kbps = 1024*33 * 8 * 44100 / 2048 / 32 / 1000 = 181.9125
+        dispatch_hdc(&mut ctx, 0, 1024, false);
+        for _ in 0..BITRATE_FRAME_WINDOW {
+            dispatch_hdc(&mut ctx, 0, 1024, true);
+        }
+        let got = out.lock().unwrap();
+        assert_eq!(got.len(), 1);
+        match got[0] {
+            NrscEvent::AudioBitRate { program, kbps } => {
+                assert_eq!(program, 0);
+                assert!(
+                    (kbps - 181.9125).abs() < 0.05,
+                    "expected ~181.9 kbps, got {kbps}"
+                );
+            }
+            ref other => panic!("expected AudioBitRate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hdc_windows_are_per_program() {
+        // Program 0 completes a window; program 1 does not. Only the
+        // program-0 estimate should be emitted, tagged with program 0.
+        let (mut ctx, out) = capture();
+        for _ in 0..BITRATE_FRAME_WINDOW {
+            dispatch_hdc(&mut ctx, 0, 512, true);
+        }
+        for _ in 0..(BITRATE_FRAME_WINDOW - 1) {
+            dispatch_hdc(&mut ctx, 1, 512, true);
+        }
+        let got = out.lock().unwrap();
+        assert_eq!(got.len(), 1);
+        assert!(matches!(
+            got[0],
+            NrscEvent::AudioBitRate { program: 0, .. }
+        ));
+    }
+
+    #[test]
+    fn hdc_program_out_of_range_is_ignored() {
+        // libnrsc5 caps programs at 8; a stray program index must not
+        // panic or emit.
+        let (mut ctx, out) = capture();
+        for _ in 0..BITRATE_FRAME_WINDOW {
+            dispatch_hdc(&mut ctx, 99, 1024, true);
+        }
+        assert!(out.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -1092,6 +1304,7 @@ mod tests {
         let mut ctx = CallbackCtx {
             event_cb: Some(cb),
             pcm_sink: None,
+            bitrate: BitrateAccum::default(),
         };
         // If this propagates, the test harness will catch the panic and
         // fail. Required behaviour: trampoline absorbs it so libnrsc5's
@@ -1113,6 +1326,7 @@ mod tests {
         let mut ctx = CallbackCtx {
             event_cb: None,
             pcm_sink: Some(sink),
+            bitrate: BitrateAccum::default(),
         };
         let samples: [i16; 4] = [1, 2, -3, 4];
         let mut payload = zeroed_payload();

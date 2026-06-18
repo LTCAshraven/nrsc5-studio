@@ -1,9 +1,10 @@
 # Installing NRSC5 Studio on Linux
 
 NRSC5 Studio ships as a `.deb` (Debian / Ubuntu) and a `.rpm` (Fedora)
-on every GitHub Release. The `nrsc5` HD Radio decoder is statically
-linked into the binary, so no separate decoder install is required —
-just install the package and you're ready to tune.
+on every GitHub Release. The `nrsc5` HD Radio decoder is bundled with
+the package as `libnrsc5.so` (installed to `/usr/lib/nrsc5-studio/`),
+so no separate decoder install is required — just install the package
+and you're ready to tune.
 
 > **Historical note:** Releases before v0.5.0 shipped `nrsc5` as a
 > separate subprocess and required a one-shot
@@ -13,8 +14,6 @@ just install the package and you're ready to tune.
 > on disk, it's safe to delete.
 
 ## Installing NRSC5 Studio
-
-Once `nrsc5` is on `PATH`, install NRSC5 Studio itself:
 
 ### Debian / Ubuntu
 

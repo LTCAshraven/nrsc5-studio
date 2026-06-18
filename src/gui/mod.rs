@@ -1,6 +1,5 @@
 pub mod dock;
 pub mod state;
-pub mod widgets;
 
 /// App accent color, picked to remain legible in both themes.
 ///

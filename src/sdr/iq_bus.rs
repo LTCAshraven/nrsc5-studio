@@ -249,6 +249,10 @@ pub fn drain_now(rx: &Receiver<Arc<[u8]>>) -> usize {
 /// Returns the number of chunks actually drained — useful for the
 /// trace log to confirm the flush window matched the device's
 /// transfer pipeline depth.
+// Kept: exercised by `discard_for_drains_existing_queue` and retained as
+// the canonical AGC post-gain-write flush helper; no production caller
+// today, so the non-test build flags it dead.
+#[allow(dead_code)]
 pub fn discard_for(rx: &Receiver<Arc<[u8]>>, flush: Duration) -> usize {
     let start = Instant::now();
     let mut dropped: usize = 0;

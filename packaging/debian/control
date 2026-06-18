@@ -49,5 +49,6 @@ Description: HD Radio FM receiver and station explorer
  automatic gain control, TPEG traffic-tile decoding, and animated
  weather radar overlay.
  .
- The nrsc5 HD Radio decoder is statically linked into the binary;
- no separate helper installation is required.
+ The nrsc5 HD Radio decoder ships bundled with the application
+ (libnrsc5.so installed alongside the binary); no separate helper
+ installation is required.

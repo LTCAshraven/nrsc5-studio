@@ -62,6 +62,8 @@ pub struct SoapySdr {
     driver: String,
     /// Human-readable label for status display ("Realtek, RTL2838UHIDIR,
     /// SN: 00000001"). Cached from the args we opened with.
+    // Kept: cached open-time label for status display; not read today.
+    #[allow(dead_code)]
     label: String,
     /// Set by `cancel_stream`; read by the `run_stream` loop on each
     /// iteration. Atomic so the control thread can flip it without
@@ -92,6 +94,8 @@ pub struct DeviceInfo {
     pub label: String,
     /// Serial number if the device exposes one — used to disambiguate
     /// multiple dongles of the same model.
+    // Kept: parsed device serial for picker disambiguation; not read today.
+    #[allow(dead_code)]
     pub serial: Option<String>,
     /// Args string suitable for `SoapySdr::open` to reproduce this device.
     pub device_args: String,
@@ -147,6 +151,9 @@ impl SoapySdr {
     ///
     /// Returns an empty `Vec` if no devices are present — that is NOT
     /// an error, just "nothing to listen to."
+    // Kept: used by examples/soapy_probe.rs (not compiled by a plain
+    // `cargo check`); the app calls `enumerate_devices_with_diagnostics`.
+    #[allow(dead_code)]
     pub fn enumerate_devices() -> Vec<DeviceInfo> {
         Self::enumerate_devices_with_diagnostics().0
     }
@@ -318,6 +325,9 @@ impl SoapySdr {
     }
 
     /// Human-readable label.
+    // Kept: status-display accessor for the cached open-time label;
+    // no current caller.
+    #[allow(dead_code)]
     pub fn label(&self) -> &str {
         &self.label
     }
@@ -326,6 +336,9 @@ impl SoapySdr {
     /// For RTL-SDR this is `["TUNER"]`. For SDRplay it's
     /// `["IFGR", "RFGR"]`. For Airspy it's `["LNA", "MIX", "VGA"]`.
     /// Used by the SDR Settings modal (Phase 3.3) to drive its layout.
+    // Kept: gain-element enumeration for the SDR Settings modal, which
+    // doesn't consume it yet.
+    #[allow(dead_code)]
     pub fn gain_element_names(&self) -> Vec<String> {
         self.device.list_gains(RX, CH).unwrap_or_default()
     }
@@ -333,6 +346,9 @@ impl SoapySdr {
     /// Get the value of a specific named gain element. Falls back to 0
     /// if the call fails — the SDR Settings modal treats this as a
     /// display-only readout, never blocks on it.
+    // Kept: per-element gain readout for the SDR Settings modal;
+    // no current caller.
+    #[allow(dead_code)]
     pub fn get_gain_element(&self, name: &str) -> f64 {
         self.device.gain_element(RX, CH, name).unwrap_or(0.0)
     }

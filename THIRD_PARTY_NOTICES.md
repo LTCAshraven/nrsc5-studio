@@ -38,13 +38,13 @@ against `libnrsc5` directly via the platform dynamic linker
 transitively by `libnrsc5`, the SoapySDR plugin modules, or the C
 runtime.
 
-### `libnrsc5.dll` / `libnrsc5.so` — pinned at upstream tag `v3.1.0`
+### `libnrsc5.dll` / `libnrsc5.so` — pinned at upstream tag `v3.2.0`
 
 - **Project:** NRSC5 — an HD Radio (NRSC-5) receiver
 - **License:** GNU General Public License version 3.0 (GPL-3.0)
-- **Source:** <https://github.com/theori-io/nrsc5/tree/v3.1.0>
+- **Source:** <https://github.com/theori-io/nrsc5/tree/v3.2.0>
 - **Copyright:** Theori (Aiden) and contributors
-- **Statically embedded inside this DLL** (per nrsc5 v3.1.0's
+- **Statically embedded inside this DLL** (per nrsc5 v3.2.0's
   `CMakeLists.txt` `ExternalProject_Add` blocks, when the Windows
   build is run with `USE_STATIC=ON`):
   - **FFTW3** v3.3.10 — single-precision FFT library. GPL-2.0+.
@@ -136,7 +136,7 @@ long as the binary itself is hosted there.
 | Component | Version | Corresponding source |
 |---|---|---|
 | NRSC5 Studio (this project) | matches the release tag | <https://github.com/LTCAshraven/nrsc5-studio> at tag `v<version>` |
-| libnrsc5 | `v3.1.0` | <https://github.com/theori-io/nrsc5/releases/tag/v3.1.0> |
+| libnrsc5 | `v3.2.0` | <https://github.com/theori-io/nrsc5/releases/tag/v3.2.0> |
 | FFTW3 (embedded in libnrsc5) | `3.3.10` | <https://www.fftw.org/fftw-3.3.10.tar.gz> |
 | libusb (embedded in libnrsc5) | `v1.0.27` | <https://github.com/libusb/libusb/releases/tag/v1.0.27> |
 | librtlsdr (embedded in libnrsc5) | `v2.0.2` | <https://gitea.osmocom.org/sdr/rtl-sdr/src/tag/v2.0.2> |

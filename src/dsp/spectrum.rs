@@ -269,10 +269,4 @@ impl SpectrumTap {
         out.center_freq_hz = g.center_freq_hz;
         out.generation = g.generation;
     }
-
-    /// Cheap generation check; the panel uses this to decide whether to
-    /// rebuild the waterfall texture without taking a full snapshot.
-    pub fn generation(&self) -> u64 {
-        self.inner.lock().map(|g| g.generation).unwrap_or(0)
-    }
 }

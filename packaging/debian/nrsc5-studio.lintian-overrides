@@ -7,3 +7,16 @@
 # and small (under 50 KB total across the hicolor size set), and we
 # don't currently have an SVG source of the icon.
 nrsc5-studio: package-contains-no-image-but-has-icons-folder
+
+# The binary carries an rpath of /usr/lib/nrsc5-studio so the dynamic
+# loader resolves the bundled libnrsc5.so (a private, GPL-licensed
+# decoder shipped in this same package, not a public shared library).
+# This is the documented mechanism for a single-package private lib.
+nrsc5-studio: binary-or-shlib-defines-rpath *usr/bin/nrsc5-studio* /usr/lib/nrsc5-studio
+nrsc5-studio: custom-library-search-path
+
+# libnrsc5.so is built with nrsc5's USE_STATIC=ON, which embeds libusb,
+# librtlsdr, FFTW3 and FAAD2 statically (the upstream build model for a
+# self-contained HD Radio decoder). Their corresponding source is
+# documented in THIRD_PARTY_NOTICES.md per GPL-3.0 section 6.
+nrsc5-studio: embedded-library *libnrsc5.so*

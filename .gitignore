@@ -21,6 +21,13 @@
 /build/
 bin.backup-*/
 
+# Linux HD Radio decoder, built fresh on the host by
+# scripts/build-nrsc5-linux.sh (USE_STATIC, ~MBs). Staged here for the
+# cargo link step and .deb/.rpm bundling; reproducible from the script,
+# so not committed. (The Windows libnrsc5.dll *is* committed.)
+/bin/libnrsc5.so
+/bin/libnrsc5.so.bak-*
+
 # Editor & IDE ----------------------------------------------------------
 .vscode/
 .idea/

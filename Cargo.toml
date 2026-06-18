@@ -1,6 +1,6 @@
 [package]
 name = "nrsc5-studio"
-version = "0.6.1"
+version = "0.6.2"
 edition = "2021"
 authors = ["LTCAshraven"]
 license = "MIT"
@@ -124,8 +124,12 @@ opt-level = 3
 #   - librtlsdr0 / rtl-sdr: required, SoapyRTLSDR module loads it
 #   - libasound2 / alsa-lib: required, cpal speaks to PulseAudio/PipeWire
 #     through ALSA's PCM abstraction on Linux
-#   The nrsc5 HD Radio decoder is statically linked into the binary
-#   (no separate helper process or library required at runtime).
+#   The nrsc5 HD Radio decoder ships as a bundled, self-contained
+#   libnrsc5.so installed to /usr/lib/nrsc5-studio/ (built by
+#   scripts/build-nrsc5-linux.sh with USE_STATIC=ON, so libusb /
+#   librtlsdr / libao / FFTW / FAAD2 are embedded). The binary finds it
+#   via an rpath baked in at link time (see build.rs); no separate
+#   helper process or distro decoder package is required at runtime.
 # ---------------------------------------------------------------------------
 
 [package.metadata.deb]
@@ -147,6 +151,10 @@ depends = "$auto, libsoapysdr0.8, librtlsdr0, libasound2"
 changelog = "packaging/debian/changelog"
 assets = [
     ["target/release/nrsc5-studio", "usr/bin/", "755"],
+    # Bundled self-contained HD Radio decoder. Built by
+    # scripts/build-nrsc5-linux.sh and staged at bin/libnrsc5.so; the
+    # binary locates it via the /usr/lib/nrsc5-studio rpath (build.rs).
+    ["bin/libnrsc5.so", "usr/lib/nrsc5-studio/libnrsc5.so", "644"],
     ["README.md", "usr/share/doc/nrsc5-studio/README.md", "644"],
     ["LICENSE", "usr/share/doc/nrsc5-studio/copyright", "644"],
     ["COPYING.GPL-3.0", "usr/share/doc/nrsc5-studio/COPYING.GPL-3.0", "644"],
@@ -174,6 +182,8 @@ license = "MIT"
 summary = "Native desktop receiver for HD Radio (NRSC-5) broadcasts"
 assets = [
     { source = "target/release/nrsc5-studio", dest = "/usr/bin/nrsc5-studio", mode = "755" },
+    # Bundled self-contained HD Radio decoder (see build-nrsc5-linux.sh).
+    { source = "bin/libnrsc5.so", dest = "/usr/lib/nrsc5-studio/libnrsc5.so", mode = "644" },
     { source = "README.md", dest = "/usr/share/doc/nrsc5-studio/README.md", mode = "644", doc = true },
     { source = "CHANGELOG.md", dest = "/usr/share/doc/nrsc5-studio/CHANGELOG.md", mode = "644", doc = true },
     { source = "LICENSE", dest = "/usr/share/doc/nrsc5-studio/LICENSE", mode = "644", doc = true },

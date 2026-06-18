@@ -74,6 +74,10 @@ pub enum RecordingMode {
 
 impl RecordingMode {
     /// Short label for the Settings dropdown.
+    // Kept: pairs with the recording-mode Settings dropdown, which is
+    // wired in `App` but not yet emitted from the dock (see
+    // `UiCommand::SetRecordingMode`).
+    #[allow(dead_code)]
     pub fn label(self) -> &'static str {
         match self {
             RecordingMode::Off => "Off",
@@ -109,10 +113,6 @@ pub struct AppConfig {
     /// **Legacy (pre-0.5.0).** Migrated into `sdr.remote_port`.
     #[serde(default = "default_rtl_tcp_port", skip_serializing)]
     pub rtl_tcp_port: u16,
-    /// **Legacy (pre-0.3.0).** The piped path is now the only path.
-    /// Kept here only so older configs deserialize; never written back.
-    #[serde(default, skip_serializing)]
-    pub use_piped_sdr: bool,
     #[serde(default)]
     pub presets: Vec<Preset>,
     #[serde(default = "default_volume")]
@@ -436,14 +436,6 @@ impl Default for AppConfig {
             rtl_device_index: 0,
             rtl_tcp_host: "127.0.0.1".to_string(),
             rtl_tcp_port: 1234,
-            // Default to the in-process piped backend. The Spectrum
-            // panel's FFT tap and the closed-loop AGC controller are
-            // both wired only through `start_piped`; the legacy direct
-            // USB path (`nrsc5.start`) hands the dongle to nrsc5.exe
-            // and leaves us no way to observe I/Q or steer gain. We
-            // ship piped as the default so the v0.2.x features that
-            // depend on it work out-of-the-box on a fresh install.
-            use_piped_sdr: true,
             presets: Vec::new(),
             volume: 1.0,
             muted: false,
@@ -656,7 +648,6 @@ mod tests {
         let mut cfg = AppConfig::default();
         cfg.use_rtl_tcp = true;
         cfg.rtl_device_index = 7;
-        cfg.use_piped_sdr = true;
         let raw = toml::to_string_pretty(&cfg).expect("serialize default config");
         assert!(
             !raw.contains("use_rtl_tcp"),
@@ -673,10 +664,6 @@ mod tests {
         assert!(
             !raw.contains("rtl_tcp_port"),
             "rtl_tcp_port must not round-trip; raw was:\n{raw}"
-        );
-        assert!(
-            !raw.contains("use_piped_sdr"),
-            "use_piped_sdr must not round-trip; raw was:\n{raw}"
         );
     }
 

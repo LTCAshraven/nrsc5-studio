@@ -109,11 +109,15 @@ pub struct RtlTcpSdr {
     /// Surfaced via `gain_table_tenths` (synthesized for R820T) and
     /// available for future diagnostics; tuner_type currently informs
     /// only the gain-table choice.
+    // Kept: connect-time dongle-info snapshot for future diagnostics;
+    // read only via the `dongle_info` accessor.
+    #[allow(dead_code)]
     dongle: DongleInfo,
 }
 
 /// 12-byte dongle-info header sent once by `rtl_tcp` on connect.
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 pub struct DongleInfo {
     /// Tuner type as reported by `rtlsdr_get_tuner_type()` on the
     /// server side. `5` = R820T / R820T2, which is what every
@@ -285,11 +289,15 @@ impl RtlTcpSdr {
 
     /// Server address (`host:port`) this connection was opened against.
     /// Exposed so the FFI layer can log which remote a session targets.
+    // Kept: diagnostic accessors for the connect-time address and
+    // dongle-info header; no current caller.
+    #[allow(dead_code)]
     pub fn addr(&self) -> &str {
         &self.addr
     }
 
     /// Cached dongle-info header read at connect time.
+    #[allow(dead_code)]
     pub fn dongle_info(&self) -> DongleInfo {
         self.dongle
     }

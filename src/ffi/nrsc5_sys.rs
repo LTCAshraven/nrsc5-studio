@@ -117,8 +117,9 @@ pub const NRSC5_EVENT_IMPORTER_INFO: c_uint = 28;
 pub const NRSC5_EVENT_LEAP_SECOND_OFFSET: c_uint = 29;
 pub const NRSC5_EVENT_LOCAL_TIME: c_uint = 30;
 
-// HDC packet flags (new in v3.2.0). Not consumed today — our pipeline
-// reads `audio` events (decoded PCM), not `hdc` (raw codec bytes).
+// HDC packet flags (new in v3.2.0). Consumed by the safe wrapper to
+// derive the decoded audio bit rate from the raw `hdc` packet stream
+// (stock libnrsc5 has no bit-rate event).
 pub const NRSC5_PKT_FLAGS_NONE: c_uint = 0;
 pub const NRSC5_PKT_FLAGS_CRC_ERROR: c_uint = 1 << 0;
 

@@ -21,22 +21,13 @@ The application takes no command\-line arguments. Settings are persisted
 between runs in standard XDG locations (see
 .BR FILES ).
 .SH PREREQUISITES
-NRSC5 Studio requires the
-.BR nrsc5 (1)
-helper binary to be installed and available on
-.BR PATH .
-The
+The nrsc5 HD Radio decoder ships bundled with NRSC5 Studio as
+.IR libnrsc5.so ,
+installed to
+.IR /usr/lib/nrsc5\-studio/ ;
+no separate
 .B nrsc5
-helper is not packaged in Debian or Ubuntu and must be built from source.
-A convenience installer is shipped at
-.IR /usr/share/nrsc5\-studio/install\-nrsc5\-helper.sh ;
-run it once as a regular user to clone, build, and install
-.B nrsc5
-into
-.IR /usr/local/bin .
-Source code and full build instructions are available at
-.UR https://github.com/theori\-io/nrsc5
-.UE .
+helper binary or decoder package is required.
 .PP
 SoapySDR and at least one SoapySDR module package (for example
 .IR soapysdr\-module\-rtlsdr )
