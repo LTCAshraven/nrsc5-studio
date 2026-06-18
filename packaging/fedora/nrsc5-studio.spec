@@ -26,7 +26,7 @@
 
 Name:           %{appname}
 Version:        0.6.2
-Release:        1%{?dist}
+Release:        2%{?dist}
 Summary:        HD Radio FM receiver and station explorer built on nrsc5 and SoapySDR
 
 License:        MIT
@@ -52,6 +52,8 @@ Recommends:     SoapySDR
 Recommends:     SoapyRTLSDR
 Suggests:       rtl-sdr
 Suggests:       pipewire-pulseaudio
+Provides:       libnrsc5.so()(64bit)
+Provides:       libnrsc5.so(LIBNRSC5_1.0)(64bit)
 
 %description
 NRSC5 Studio is a native desktop application for listening to HD Radio
@@ -91,7 +93,7 @@ install -D -m 0755 target/release/%{appname} \
 # Bundled self-contained HD Radio decoder; the binary finds it via the
 # %{_libdir}/%{appname} rpath baked in at link time (build.rs emits
 # /usr/lib/nrsc5-studio).
-install -D -m 0644 bin/libnrsc5.so \
+install -D -m 0755 bin/libnrsc5.so \
     %{buildroot}%{_prefix}/lib/%{appname}/libnrsc5.so
 
 install -D -m 0644 packaging/linux/%{appname}.desktop \
@@ -134,6 +136,11 @@ appstream-util validate-relax --nonet \
 %{_mandir}/man1/%{appname}.1*
 
 %changelog
+* Thu Jun 18 2026 LTCAshraven <LTCAshraven@users.noreply.github.com> - 0.6.2-2
+- RPM metadata fix: explicit Provides for bundled libnrsc5.so SONAME/
+    symbol version to satisfy solver dependencies without --nodeps
+- Install bundled libnrsc5.so with executable mode (0755)
+
 * Tue Jun 16 2026 LTCAshraven <LTCAshraven@users.noreply.github.com> - 0.6.2-1
 - Per-program decoded audio bit rate in the Station Info panel, derived
   Rust-side from the libnrsc5 v3.2.0 HDC packet stream (stock libnrsc5

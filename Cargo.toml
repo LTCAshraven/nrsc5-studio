@@ -154,7 +154,7 @@ assets = [
     # Bundled self-contained HD Radio decoder. Built by
     # scripts/build-nrsc5-linux.sh and staged at bin/libnrsc5.so; the
     # binary locates it via the /usr/lib/nrsc5-studio rpath (build.rs).
-    ["bin/libnrsc5.so", "usr/lib/nrsc5-studio/libnrsc5.so", "644"],
+    ["bin/libnrsc5.so", "usr/lib/nrsc5-studio/libnrsc5.so", "755"],
     ["README.md", "usr/share/doc/nrsc5-studio/README.md", "644"],
     ["LICENSE", "usr/share/doc/nrsc5-studio/copyright", "644"],
     ["COPYING.GPL-3.0", "usr/share/doc/nrsc5-studio/COPYING.GPL-3.0", "644"],
@@ -179,11 +179,12 @@ assets = [
 
 [package.metadata.generate-rpm]
 license = "MIT"
+release = "2"
 summary = "Native desktop receiver for HD Radio (NRSC-5) broadcasts"
 assets = [
     { source = "target/release/nrsc5-studio", dest = "/usr/bin/nrsc5-studio", mode = "755" },
     # Bundled self-contained HD Radio decoder (see build-nrsc5-linux.sh).
-    { source = "bin/libnrsc5.so", dest = "/usr/lib/nrsc5-studio/libnrsc5.so", mode = "644" },
+    { source = "bin/libnrsc5.so", dest = "/usr/lib/nrsc5-studio/libnrsc5.so", mode = "755" },
     { source = "README.md", dest = "/usr/share/doc/nrsc5-studio/README.md", mode = "644", doc = true },
     { source = "CHANGELOG.md", dest = "/usr/share/doc/nrsc5-studio/CHANGELOG.md", mode = "644", doc = true },
     { source = "LICENSE", dest = "/usr/share/doc/nrsc5-studio/LICENSE", mode = "644", doc = true },
@@ -213,4 +214,8 @@ assets = [
 SoapySDR = "*"
 rtl-sdr = "*"
 "alsa-lib" = "*"
+
+[package.metadata.generate-rpm.provides]
+"libnrsc5.so()(64bit)" = "*"
+"libnrsc5.so(LIBNRSC5_1.0)(64bit)" = "*"
 
