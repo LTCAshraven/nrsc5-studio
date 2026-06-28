@@ -6,6 +6,86 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.6.3] - 2026-06-28
+
+### Added
+
+- **HERE traffic & weather data-service support.** NRSC5 Studio now decodes
+  the **HERE** map data service in addition to the **Total Traffic Network
+  (TTN)** feed it already supported. HERE traffic tiles are stitched through
+  the same traffic-map compositor (tile dimensions are inferred per grid, so
+  TTN's 200 × 200 tiles and HERE's grids share one code path), and HERE
+  weather images — which arrive as directly-displayable full frames carrying
+  a geographic bounding box — are cropped against the basemap and pushed into
+  the rolling weather-radar animation just like TTN's DWRO / DWRI overlays.
+  Stations that broadcast their traffic/weather over HERE now light up the
+  Traffic and Weather tabs where before they showed nothing.
+- **New Engineering Info panel ("Engineering Info — Decoder & RF
+  Diagnostics").** A dedicated tab for broadcast-plant and decoder
+  diagnostics, split out from the Station Information panel: RF / decoder
+  health (including the tuned carrier frequency offset in Hz), exciter /
+  importer equipment, local-time / leap-second data, live payload presence,
+  and a **rolling, timestamped payload log** that records each incoming AAS
+  object (cover art, station logo, traffic tile, weather frame) as it
+  arrives.
+- **Optional high-resolution (2×) map basemap.** Traffic and weather maps
+  can now render against `res/map2x.png` — a 12032 × 6912 basemap with four
+  times the pixels of the standard 6016 × 3456 `res/map.png`. The app prefers
+  it automatically when present and falls back to the bundled `map.png`
+  otherwise, so it's a pure drop-in upgrade. Because the file is ~57 MB it
+  ships as a **separate download on the Releases page** rather than in the
+  portable zip / `.deb` / `.rpm`; drop it into `res/` next to the executable
+  (or `/usr/share/nrsc5-studio/` on Linux) to enable it. See the README's
+  "Optional: high-resolution map basemap" section.
+- **Real service-mode badge from SYNC telemetry.** The MP1 / MP3 / MP11
+  badge in the Station Information panel is now driven by the **PSMI value in
+  the libnrsc5 `SYNC` event** instead of being inferred from the highest
+  populated program slot. AM tunes report their own service modes
+  (`MA1` / `MA3`), and the tuned **carrier frequency offset (Hz)** is now
+  surfaced as raw telemetry. The old slot-count heuristic remains only as a
+  fallback when the PSMI value is unavailable.
+- **Per-subchannel station logo, displayed and persisted across tunes**
+  ([#9](https://github.com/LTCAshraven/nrsc5-studio/issues/9)). The Station
+  Information panel now shows the broadcast **station logo** for the selected
+  subchannel, and keeps showing the correct one as you change frequency or
+  subchannel. HD Radio sends logos as LOT/AAS image files whose filename
+  encodes the target subchannel — `…SL<CALLSIGN>$$<NN>…`, where `SL` marks a
+  station logo and `$$<NN>` is the 1-based subchannel number (HD1–HD8). That
+  is parsed to route each logo to the right program slot, then cached to disk
+  keyed by frequency and subchannel (`<freq×10>_hd<N>_<hash>.<ext>`, e.g.
+  `1003_hd1_1a2b3c4d.png`), content-hashed and de-duplicated so only the
+  latest logo per (frequency, subchannel) is retained. On every retune the
+  cache is replayed into the eight per-subchannel slots, so the right logo
+  appears instantly from disk — even before the station re-broadcasts it —
+  and survives app restarts.
+
+### Changed
+
+- **Station Information panel slimmed to listener-facing identity.** With the
+  new Engineering Info panel taking over the broadcast-plant diagnostics, the
+  Station Information panel now focuses purely on *identity* — call sign,
+  slogan, rolling message, per-subchannel logos, transmitter location, FCC
+  ID, the subchannel line-up, and the station's data services. The equipment,
+  local-time / leap-second, and topology blocks that used to share space here
+  moved to Engineering, so each block now lives in exactly one panel. (MER /
+  BER intentionally remain visible in both the Engineering and Signal
+  panels.)
+- **Map projection is now resolution-independent.** The traffic/weather
+  overlay-to-basemap projection scales to the basemap's actual pixel
+  dimensions instead of assuming the standard `map.png` size, so overlays
+  land correctly on either the standard or the 2× basemap. Traffic and
+  weather maps also **bootstrap from the on-disk AAS cache on launch**,
+  replaying the most recent tiles/frames so the maps repopulate immediately
+  after a restart.
+
+### Fixed
+
+- **AAS scratch directory no longer grows unbounded.** The shared AAS
+  scratch directory (where LOT payloads — cover art, logos, traffic tiles,
+  weather frames — are staged) is now pruned automatically: files older than
+  one hour are removed on a five-minute sweep, so long listening sessions
+  don't accumulate stale broadcast objects on disk.
+
 ## [0.6.2] - 2026-06-16
 
 ### Added
@@ -18,7 +98,7 @@ adheres to [Semantic Versioning](https://semver.org/).
   32-frame window, reproducing the upstream `nrsc5` CLI's `Audio bit rate:`
   calculation. Thanks to **TheDaChicken**, **argilo**, and **pclov3r** on
   the upstream [`theori-io/nrsc5`](https://github.com/theori-io/nrsc5) repo
-  for pointing us at the right place to hook the HDC stream and how the CLI
+  for pointing out the right place to hook the HDC stream and how the CLI
   derives the rate.
 - **FM tuning snapped to the 200 kHz channel raster.** Tuner input, presets,
   and the boot frequency are clamped to 87.9–107.9 MHz and snapped to the

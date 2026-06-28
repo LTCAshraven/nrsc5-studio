@@ -1,5 +1,7 @@
 use std::time::{Duration, Instant};
 
+use chrono::Local;
+
 pub use crate::maps::WeatherFrame;
 use crate::config::GainMode;
 use crate::dsp::{AgcSnapshot, SpectrumSnapshot, SpectrumTap};
@@ -47,6 +49,15 @@ pub struct ArtTile {
     pub album: String,
 }
 
+/// One recent payload-related event surfaced in Engineering Info.
+#[derive(Debug, Clone)]
+pub struct PayloadLogEntry {
+    /// Wall-clock timestamp captured when the payload event was received.
+    pub hhmmss: String,
+    /// Human-readable one-line summary of what arrived/updated.
+    pub text: String,
+}
+
 /// Which image surface the Now Playing panel should prefer.
 /// Cover art is the default; a station-logo XHDR can temporarily
 /// flip the panel to the broadcaster logo until the next cover-art
@@ -85,8 +96,9 @@ pub struct ProgramRuntime {
     pub album_updated: Option<Instant>,
     pub genre_updated: Option<Instant>,
     /// Full path to the current cover-art image for this program,
-    /// if any. Set by `record_album_art` via
-    /// `NrscEvent::Xhdr { param: 0, .. }`. Cleared by retune / Stop.
+    /// if any. Set by `record_album_art` via a `NrscEvent::Xhdr`
+    /// whose `mime` is album art (not `NRSC5_MIME_STATION_LOGO`).
+    /// Cleared by retune / Stop.
     pub cover_art_path: Option<String>,
 }
 
@@ -193,16 +205,36 @@ pub struct AppState {
     pub silence_s: f32,
     pub nrsc5_status: String,
     pub last_event: String,
-    /// Full path to the station logo image file, if any.
-    pub station_logo_path: Option<String>,
+    /// Rolling history of payload events (LOT, XHDR, traffic/weather updates).
+    /// Shown in Engineering Info to make live data movement visible.
+    pub payload_log: Vec<PayloadLogEntry>,
+    /// Cached station-logo image path per HD subchannel (index 0 = HD1).
+    /// Populated from the `SL<callsign>$$<subchannel>…` LOT carousel and
+    /// preloaded from the durable logo cache on retune. A slot stays
+    /// `None` until that subchannel's logo arrives, so the UI shows
+    /// nothing rather than another subchannel's logo.
+    pub station_logo_paths: [Option<String>; 8],
     /// Which image the Now Playing panel should currently display.
     pub now_playing_image_mode: NowPlayingImageMode,
     /// Full path to the stitched traffic map image, if any.
     pub traffic_map_path: Option<String>,
+    /// Last traffic-map file path uploaded into `traffic_texture`.
+    pub traffic_texture_path: Option<String>,
+    /// Managed texture for the Traffic tab. Kept separate from the file path
+    /// so frequent file churn does not depend on egui's URI image cache.
+    pub traffic_texture: Option<egui::TextureHandle>,
+    /// 24-hour local timestamp of the most recent traffic composite update.
+    pub traffic_map_last_updated_hhmmss: Option<String>,
     /// Ordered history of composited weather radar frames (oldest → newest).
     /// Each entry pairs a full path to the `WeatherMap_NNNN.png` snapshot with
     /// the wall-clock time it was captured.
     pub weather_frames: Vec<WeatherFrame>,
+    /// Last weather-frame file path uploaded into `weather_texture`.
+    pub weather_texture_path: Option<String>,
+    /// Managed texture for the currently displayed Weather tab frame.
+    pub weather_texture: Option<egui::TextureHandle>,
+    /// 24-hour local timestamp of the most recent weather frame update.
+    pub weather_map_last_updated_hhmmss: Option<String>,
     /// Currently-displayed frame index into `weather_frames`.
     pub weather_current_frame: usize,
     /// True when the radar animation is auto-advancing.
@@ -397,6 +429,28 @@ impl AppState {
     /// title -> artist -> album -> genre roll-in while still hiding
     /// "stale" PSD between songs on stations that pause metadata.
     pub const PSD_STALE_AFTER: Duration = Duration::from_secs(15);
+    /// Maximum number of lines retained in [`Self::payload_log`].
+    pub const PAYLOAD_LOG_CAP: usize = 48;
+
+    /// Append one payload event to the rolling log.
+    pub fn push_payload_log(&mut self, text: impl Into<String>) {
+        self.payload_log.push(PayloadLogEntry {
+            hhmmss: Local::now().format("%H:%M:%S").to_string(),
+            text: text.into(),
+        });
+        let overflow = self
+            .payload_log
+            .len()
+            .saturating_sub(Self::PAYLOAD_LOG_CAP);
+        if overflow > 0 {
+            self.payload_log.drain(0..overflow);
+        }
+    }
+
+    /// Clear payload history on station/session boundaries.
+    pub fn clear_payload_log(&mut self) {
+        self.payload_log.clear();
+    }
 
     /// True if we've been out of sync for longer than [`Self::LOST_SYNC_GRACE`].
     /// The dock uses this to decide whether the cached SIS program list
@@ -484,6 +538,9 @@ impl AppState {
             p.clear();
         }
         self.now_playing_image_mode = NowPlayingImageMode::CoverArt;
+        // Station logos are per-subchannel but station-scoped; a full
+        // teardown (Stop / retune / LostDevice) invalidates them all.
+        self.station_logo_paths = Default::default();
     }
 
     /// Derived `[bool; 8]` indicating which HD subchannels should be

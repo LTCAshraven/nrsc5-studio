@@ -81,6 +81,23 @@
   <content_rating type="oars-1.1" />
 
   <releases>
+    <release version="0.6.3" date="2026-06-28">
+      <description>
+        <p>Traffic and weather gain HERE data-service support alongside
+        the existing Total Traffic Network (TTN) feed, so stations that
+        broadcast over HERE now populate the Traffic and Weather tabs. A
+        new "Engineering Info - Decoder &amp; RF Diagnostics" panel splits
+        the broadcast-plant and decoder internals out of the Station
+        Information panel. The MP1/MP3/MP11 service-mode badge (plus AM
+        MA1/MA3) is now read from the libnrsc5 SYNC PSMI telemetry rather
+        than inferred from program slots, and per-subchannel station logos
+        are displayed and persisted across tunes and restarts (closes
+        #9). Maps can optionally use a high-resolution 2x basemap
+        (distributed as a separate download), the map projection is now
+        resolution-independent, and traffic/weather replay from cache on
+        launch. The AAS scratch directory is now pruned automatically.</p>
+      </description>
+    </release>
     <release version="0.6.2" date="2026-06-16">
       <description>
         <p>Per-program decoded audio bit rate in the Station Info

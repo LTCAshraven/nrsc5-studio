@@ -243,6 +243,17 @@ impl ServiceMode {
             Self::Mp11 => "MP11",
         }
     }
+
+    /// Convert a raw PSMI value from the SYNC event into the closest
+    /// service-mode label we currently understand.
+    pub fn from_psmi(psmi: i32) -> Option<Self> {
+        match psmi {
+            1 => Some(Self::Mp1),
+            3 => Some(Self::Mp3),
+            11 => Some(Self::Mp11),
+            _ => None,
+        }
+    }
 }
 
 /// Aggregated SIS state for the currently tuned station. Lives on
@@ -267,6 +278,11 @@ pub struct StationInfo {
     pub alert: Option<String>,
     /// Transmitter location from `Location: …`.
     pub location: Option<Location>,
+    /// Raw SYNC telemetry. `psmi` comes directly from the upstream
+    /// SYNC event; `freq_offset_hz` is the tuned carrier offset
+    /// reported by libnrsc5.
+    pub sync_psmi: Option<i32>,
+    pub sync_freq_offset_hz: Option<f32>,
     /// HD1..HD8 audio programs, indexed 0..7. `None` for slots the
     /// station hasn't advertised in SIS yet.
     pub programs: [Option<ProgramInfo>; 8],
@@ -314,9 +330,8 @@ impl StationInfo {
     /// layout) from the highest-numbered program advertised in SIS.
     /// Returns `None` when no programs have been observed yet.
     ///
-    /// nrsc5 doesn't print a `Service mode: …` line in normal stderr
-    /// output, so this is a heuristic. The panel labels it as inferred
-    /// to be honest about that.
+    /// This is now a fallback-only heuristic; the Station/Engineering
+    /// panels prefer the raw SYNC PSMI telemetry when it is available.
     pub fn infer_service_mode(&self) -> Option<ServiceMode> {
         let highest = self
             .programs
@@ -329,5 +344,38 @@ impl StationInfo {
             1 | 2 => ServiceMode::Mp3,
             _ => ServiceMode::Mp11,
         })
+    }
+
+    /// Human-readable label for the raw SYNC PSMI value.
+    ///
+    /// For AM tunes, libnrsc5 only emits the two AM service modes
+    /// (`MA1` / `MA3`). For FM, this follows the compatibility-mode
+    /// descriptions surfaced in the DeepWiki table.
+    pub fn sync_psmi_label(&self) -> Option<&'static str> {
+        let psmi = self.sync_psmi?;
+
+        if self.am_sync.is_some() {
+            return Some(match psmi {
+                1 => "MA1",
+                2 => "MA3",
+                _ => "Unknown AM mode",
+            });
+        }
+
+        Some(match psmi {
+            1 => "Standard FM hybrid",
+            2..=4 => "Extended hybrid",
+            5..=10 => "Extended hybrid",
+            11..=16 => "All-digital",
+            17..=22 => "All-digital",
+            _ => "All-digital extended",
+        })
+    }
+
+    /// Compact badge for the Engineering / Station panels.
+    pub fn sync_psmi_badge(&self) -> Option<String> {
+        let psmi = self.sync_psmi?;
+        let label = self.sync_psmi_label().unwrap_or("Unknown");
+        Some(format!("PSMI {} • {}", psmi, label))
     }
 }

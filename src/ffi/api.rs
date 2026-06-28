@@ -348,9 +348,6 @@ const BITRATE_FRAME_WINDOW: u32 = 32;
 /// and reset that program's counters. Indexed by 0-based program;
 /// libnrsc5 caps the program count at 8.
 ///
-/// Thanks to **TheDaChicken**, **argilo**, and **pclov3r** on the
-/// upstream `theori-io/nrsc5` repo for pointing us at the right place
-/// to hook the HDC packet stream and how the CLI derives the rate.
 #[derive(Default)]
 struct BitrateAccum {
     bytes: [Cell<u64>; 8],
@@ -458,11 +455,14 @@ unsafe fn translate_event(
     match tag {
         sys::NRSC5_EVENT_LOST_DEVICE => out.push(NrscEvent::LostDevice),
         sys::NRSC5_EVENT_SYNC => {
-            out.push(NrscEvent::Sync);
             // v3.2.0 AM-mode supplementary indicators. libnrsc5 sets
             // all four to -1 in FM mode — emit `SyncAm` only when at
             // least one carries real data, so FM consumers stay clean.
             let s = unsafe { payload.sync };
+            out.push(NrscEvent::Sync {
+                freq_offset_hz: s.freq_offset,
+                psmi: s.psmi,
+            });
             if s.pli != -1 || s.hppi != -1 || s.aabi != -1 || s.rdbi != -1 {
                 out.push(NrscEvent::SyncAm {
                     pli: s.pli,
@@ -504,6 +504,7 @@ unsafe fn translate_event(
             if id3.xhdr.lot >= 0 {
                 out.push(NrscEvent::Xhdr {
                     program: id3.program,
+                    mime: id3.xhdr.mime,
                     param: id3.xhdr.param as u32,
                     lot: id3.xhdr.lot.to_string(),
                 });
@@ -531,6 +532,7 @@ unsafe fn translate_event(
                 lot: lot.lot.to_string(),
                 name: unsafe { cstr_to_string(lot.name) },
                 data,
+                mime: lot.mime,
             });
         }
         sys::NRSC5_EVENT_SIS => {
@@ -660,7 +662,30 @@ unsafe fn translate_event(
                 out.push(NrscEvent::EmergencyAlert { text });
             }
         }
-        sys::NRSC5_EVENT_HERE_IMAGE => out.push(NrscEvent::HereImage),
+        sys::NRSC5_EVENT_HERE_IMAGE => {
+            let h = unsafe { payload.here_image };
+            // Copy the HERE payload bytes out before returning; libnrsc5
+            // owns the source buffer only for the callback duration.
+            let data = if h.data.is_null() || h.size == 0 {
+                Vec::new()
+            } else {
+                unsafe { slice::from_raw_parts(h.data, h.size as usize) }.to_vec()
+            };
+            out.push(NrscEvent::HereImage {
+                image_type: h.image_type,
+                seq: h.seq,
+                n1: h.n1,
+                n2: h.n2,
+                latitude1: h.latitude1,
+                longitude1: h.longitude1,
+                latitude2: h.latitude2,
+                longitude2: h.longitude2,
+                has_time_utc: !h.time_utc.is_null(),
+                name: unsafe { cstr_to_string(h.name) },
+                size: h.size,
+                data,
+            });
+        }
         sys::NRSC5_EVENT_AGC => {
             let a = unsafe { payload.agc };
             out.push(NrscEvent::Agc { gain_db: a.gain_db });
@@ -866,8 +891,8 @@ mod tests {
         // Without these sentinels, the v3.2.0 `Sync` arm would also
         // emit a `SyncAm` event from the zeroed AM fields.
         payload.sync = sys::nrsc5_event_sync {
-            freq_offset: 0.0,
-            psmi: 0,
+            freq_offset: 1.25,
+            psmi: 11,
             pli: -1,
             hppi: -1,
             aabi: -1,
@@ -882,7 +907,16 @@ mod tests {
         );
         let got = out.lock().unwrap();
         assert_eq!(got.len(), 1);
-        assert!(matches!(got[0], NrscEvent::Sync));
+        match got[0] {
+            NrscEvent::Sync {
+                freq_offset_hz,
+                psmi,
+            } => {
+                assert_eq!(freq_offset_hz, 1.25);
+                assert_eq!(psmi, 11);
+            }
+            ref other => panic!("expected Sync, got {other:?}"),
+        }
     }
 
     #[test]
@@ -892,8 +926,8 @@ mod tests {
         let (mut ctx, out) = capture();
         let mut payload = zeroed_payload();
         payload.sync = sys::nrsc5_event_sync {
-            freq_offset: 0.0,
-            psmi: 0,
+            freq_offset: -0.75,
+            psmi: 3,
             pli: 3,
             hppi: 1,
             aabi: 2,
@@ -908,7 +942,16 @@ mod tests {
         );
         let got = out.lock().unwrap();
         assert_eq!(got.len(), 2);
-        assert!(matches!(got[0], NrscEvent::Sync));
+        match got[0] {
+            NrscEvent::Sync {
+                freq_offset_hz,
+                psmi,
+            } => {
+                assert_eq!(freq_offset_hz, -0.75);
+                assert_eq!(psmi, 3);
+            }
+            ref other => panic!("expected Sync, got {other:?}"),
+        }
         match got[1] {
             NrscEvent::SyncAm {
                 pli,
@@ -1113,7 +1156,8 @@ mod tests {
             other => panic!("expected Metadata, got {other:?}"),
         }
         match &got[1] {
-            NrscEvent::Xhdr { param, lot, .. } => {
+            NrscEvent::Xhdr { mime, param, lot, .. } => {
+                assert_eq!(*mime, sys::NRSC5_MIME_JPEG);
                 assert_eq!(*param, 1);
                 assert_eq!(lot, "42");
             }
@@ -1155,11 +1199,13 @@ mod tests {
                 name,
                 data,
                 program,
+                mime,
             } => {
                 assert_eq!(lot, "123");
                 assert_eq!(name, "123_cover.jpg");
                 assert_eq!(*program, 0); // api.rs hardcodes 0; rewritten by mod.rs.
                 assert_eq!(data, &bytes);
+                assert_eq!(*mime, sys::NRSC5_MIME_JPEG);
             }
             other => panic!("expected LotFile, got {other:?}"),
         }

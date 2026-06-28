@@ -12,7 +12,7 @@ A native Windows and Linux desktop app for listening to **HD Radio** broadcasts 
 ![Forks](https://img.shields.io/github/forks/LTCAshraven/nrsc5-studio?style=flat-square)
 ![Watchers](https://img.shields.io/github/watchers/LTCAshraven/nrsc5-studio?style=flat-square)
 
-![Version](https://img.shields.io/badge/version-0.6.1-blue?style=flat-square)
+![Version](https://img.shields.io/badge/version-0.6.3-blue?style=flat-square)
 ![License](https://img.shields.io/badge/license-GPL--3.0-green?style=flat-square)
 ![Platform](https://img.shields.io/badge/platform-windows%20%7C%20linux-lightgrey?style=flat-square)
 
@@ -40,14 +40,14 @@ A native Windows and Linux desktop app for listening to **HD Radio** broadcasts 
 
 - **Full HD Radio playback** — **HD1–HD8** subchannel selection (the full HD Radio program range), with a **SIS-aware selector grid**: subchannels the station actually advertises light up at full intensity; the rest stay dimmed-but-clickable with a tooltip explaining the station doesn't list that program (you can still probe). Automatic retune on frequency change, persistent presets you can save, recall, rename, and re-target via a double-click edit dialog.
 - **Now-Playing pane** — title / artist / album / genre from broadcast metadata, plus cover art and the station logo if the station you are listening to transmits it.
-- **Station Information pane** — a first-class home for everything the station broadcasts about *itself* via the HD Radio SIS (Station Information Service) table: call sign, slogan, rolling message banner, country and FCC facility ID (linked to the FCC public lookup), transmitter latitude / longitude / altitude, per-subchannel short name + program type + sound experience + live audio bit rate in kbps, the station's data services (Traffic, Weather, Album Art, etc.), and any active emergency alert in a red callout banner. An **MP1 / MP3 / MP11 service-mode badge** is inferred from the highest populated program slot. Fields populate progressively after sync (call sign and slogan in seconds; location and FCC ID can take a minute or two).
+- **Station Information pane** — a first-class home for everything the station broadcasts about *itself* via the HD Radio SIS (Station Information Service) table: call sign, slogan, rolling message banner, country and FCC facility ID (linked to the FCC public lookup), transmitter latitude / longitude / altitude, per-subchannel short name + program type + sound experience + live audio bit rate in kbps, the station's data services (Traffic, Weather, Album Art, etc.), and any active emergency alert in a red callout banner. An **MP1 / MP3 / MP11 service-mode badge** is also displayed. Fields populate progressively after sync (call sign and slogan in seconds; location and FCC ID can take a minute or two).
 - **Album-Art Collage** — a rolling 8-hour squarified-treemap heat-map of every unique cover seen on the station. Frequent plays grow into bigger tiles; the layout re-flows as new art comes in. **Survives restarts** — covers are cached to disk (`data\art-cache\` in portable mode, `%LOCALAPPDATA%\nrsc5-studio\art-cache\` otherwise) so the heat-map repopulates instantly on relaunch (within the 8-hour window).
 - **24-Hour Song Log** — every play the station broadcasts metadata for is captured with a timestamp and persisted across restarts. Two views: a **Timeline** of the most recent plays and a **Top Played** grouping by `(title, artist)`. Export to RFC-4180 CSV for the scrobbler crowd. Aggressive filtering keeps station IDs, slogans, and call signs out of the log.
 - **Spectrum + Waterfall** — a dedicated SDR scope tab with a 1024-bin live FFT trace (SDR#-style translucent gradient fill, ±20 dB grid, faint shading at the HD digital sidebands at ±129–199 kHz) and a 256-row scrolling waterfall underneath with a turbo colormap. Driven from a tap on the same I/Q stream that feeds the decoder, so what you see is what nrsc5 sees.
 - **QPSK Constellation** — a phosphor-green scope showing the OFDM-subcarrier constellation cloud, with cloud spread driven by live MER per sideband. Watch the cloud tighten as signal quality improves — especially satisfying while the AGC walks into its sweet spot.
 - **Closed-Loop AGC** — a host-side automatic-gain-control loop (separate from the dongle's built-in AGC) that drives the active SDR's primary gain element to maximize per-sideband MER for whatever signal you're tuned to. Profile-driven: on RTL-SDR it walks the R820T2 gain table; on SDRplay it controls IF gain reduction (with sign-flip handled automatically); on HackRF it drives the LNA. Switch between **Auto** / **Manual** / **Hardware AGC** in the Signal panel; choice persists between runs.
-- **Traffic Map** — TPEG traffic-tile decode, stitched into a single map image the moment all tiles for an area arrive. Only IHeartMedia stations transmit this. [IHeartMedia Stations](https://www.iheartmedia.com/stations)
-- **Weather Radar Animation** — every weather overlay frame from the broadcast is captured with its real wall-clock timestamp. Play / pause / scrub through up to 90 minutes of frames with a rocker slider; duplicate frames are deduplicated by content hash so the loop only advances when the station actually pushes new radar. Only IHeartMedia stations transmit this. [IHeartMedia Stations](https://www.iheartmedia.com/stations)
+- **Traffic Map** — TPEG traffic-tile decode, stitched into a single map image the moment all tiles for an area arrive. Carried by stations that broadcast the Total Traffic Network (TTN) or HERE data services.
+- **Weather Radar Animation** — every weather overlay frame from the broadcast is captured with its real wall-clock timestamp. Play / pause / scrub through up to 90 minutes of frames with a rocker slider; duplicate frames are deduplicated by content hash so the loop only advances when the station actually pushes new radar. Carried by stations that broadcast the Total Traffic Network (TTN) or HERE data services.
 - **Signal Quality** — live MER (lower / upper sidebands), BER counters, and the current AGC gain in dB with a status badge (probing / settled / bailed) and time-since-last-change.
 - **Per-app Volume** — on Windows, a COM-based per-process volume / mute control so NRSC5 Studio's volume slider only changes NRSC5 Studio's audio (not the whole system). On Linux the slider applies a software-side gain to the cpal output stream.
 - **Multi-SDR support** — RTL-SDR (R820T2 / E4000), SDRplay (RSP1A / RSPduo / RSPdx via the proprietary SDRplay API), and HackRF One out of the box. Switch devices via the hamburger menu's **📡 SDR Settings…** modal; per-element gain sliders, PPM correction, and HD-Radio-specific notes are surfaced per driver.
@@ -130,6 +130,21 @@ If you'd rather use the standard Windows convention (state under `%APPDATA%\nrsc
 4. Launch from your desktop menu or run `nrsc5-studio` from a terminal.
 
 Installed-mode state lives under `$XDG_DATA_HOME/nrsc5-studio/` (typically `~/.local/share/nrsc5-studio/`).
+
+### Optional: high-resolution map basemap
+
+The Traffic and Weather maps draw their overlays on top of a US base-map image. The portable zip and the `.deb` / `.rpm` packages ship the standard **`map.png`** (6016 × 3456). A higher-resolution **`map2x.png`** (12032 × 6912 — four times the pixels) is available for sharper maps on large windows, but at ~57 MB it's distributed as a **separate download** rather than bundled.
+
+It's a pure drop-in upgrade: the app prefers `map2x.png` when it's present and silently falls back to the standard `map.png` when it isn't. Nothing to configure.
+
+1. Download `map2x.png` from the [Releases page](https://github.com/LTCAshraven/nrsc5-studio/releases) assets (listed alongside the portable zip and Linux packages).
+2. Put it where the app looks for basemaps:
+   - **Windows (portable):** the `res\` folder next to `nrsc5-studio.exe` (i.e. `res\map2x.png`).
+   - **Linux (.deb / .rpm):** `/usr/share/nrsc5-studio/map2x.png`.
+3. Restart NRSC5 Studio. The maps now render against the high-resolution basemap.
+
+To revert, just delete `map2x.png` — the app falls back to the bundled `map.png` on the next launch.
+
 ---
 
 ## Quick start

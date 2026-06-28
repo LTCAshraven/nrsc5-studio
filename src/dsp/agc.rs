@@ -485,7 +485,7 @@ impl AgcController {
     /// from the stderr-parser thread for every event in the stream.
     pub fn on_event(&mut self, ev: &NrscEvent) {
         match ev {
-            NrscEvent::Sync => {
+            NrscEvent::Sync { .. } => {
                 self.has_ever_synced = true;
             }
             NrscEvent::Mer { lower, upper } => {

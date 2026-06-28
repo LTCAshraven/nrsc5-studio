@@ -25,7 +25,7 @@
 %global debug_package %{nil}
 
 Name:           %{appname}
-Version:        0.6.2
+Version:        0.6.3
 Release:        2%{?dist}
 Summary:        HD Radio FM receiver and station explorer built on nrsc5 and SoapySDR
 
@@ -136,6 +136,23 @@ appstream-util validate-relax --nonet \
 %{_mandir}/man1/%{appname}.1*
 
 %changelog
+* Sun Jun 28 2026 LTCAshraven <LTCAshraven@users.noreply.github.com> - 0.6.3-1
+- HERE traffic & weather data-service support alongside the existing Total
+  Traffic Network (TTN) feed: HERE traffic tiles and weather images now
+  populate the Traffic and Weather tabs
+- New "Engineering Info - Decoder & RF Diagnostics" panel split out from
+  the Station Information panel (RF/decoder health, equipment, time/leap
+  second, live payload log)
+- Service-mode badge (MP1/MP3/MP11, AM MA1/MA3) now read from the libnrsc5
+  SYNC PSMI telemetry instead of inferred from program slots
+- Per-subchannel station logo display, persisted across tunes and restarts
+  via filename-encoded subchannel routing (closes #9)
+- Optional high-resolution 2x map basemap (res/map2x.png) auto-detected
+  when present; distributed as a separate download, not packaged
+- Resolution-independent map projection + traffic/weather cache replay on
+  launch
+- AAS scratch directory is pruned automatically (1 h retention)
+
 * Thu Jun 18 2026 LTCAshraven <LTCAshraven@users.noreply.github.com> - 0.6.2-2
 - RPM metadata fix: explicit Provides for bundled libnrsc5.so SONAME/
     symbol version to satisfy solver dependencies without --nodeps

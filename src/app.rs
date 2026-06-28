@@ -4,7 +4,7 @@ use crate::ffi::{Nrsc5Process, NrscEvent};
 use crate::gui::dock::{DockTab, DockViewer, UiCommand};
 use crate::gui::state::{AppState, ArtTile, NowPlayingImageMode};
 use crate::maps::{TrafficMap, WeatherMap};
-use chrono::Utc;
+use chrono::{Local, Utc};
 use egui_dock::{DockArea, DockState, NodeIndex, NodePath, SurfaceIndex};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
@@ -101,10 +101,26 @@ fn sanitize_filename(s: &str) -> String {
     }
     out
 }
+
+fn here_image_type_label(image_type: i32) -> &'static str {
+    match image_type {
+        crate::ffi::nrsc5_sys::NRSC5_HERE_IMAGE_TRAFFIC => "traffic",
+        crate::ffi::nrsc5_sys::NRSC5_HERE_IMAGE_WEATHER => "weather",
+        _ => "other",
+    }
+}
+
 /// Rolling window for the album-art collage. Plays older than this are
 /// pruned on every new event so the heat-map keeps moving instead of
 /// freezing.
 const ART_WINDOW: Duration = Duration::from_secs(8 * 60 * 60);
+/// How long a raw LOT dump survives in the AAS scratch dir before the
+/// background sweep deletes it. Active outputs (latest traffic map, the
+/// rolling weather frames, base-map crops) are exempt regardless of age.
+const AAS_RETENTION: Duration = Duration::from_secs(60 * 60);
+/// Minimum gap between AAS scratch sweeps so we don't stat the directory
+/// every UI frame.
+const AAS_PRUNE_INTERVAL: Duration = Duration::from_secs(5 * 60);
 /// Minimum time between successive *counted* plays of the exact same cover.
 /// nrsc5 re-emits XHDR pointing at the same LOT image many times while a
 /// song plays; without this cooldown, a 4-minute song can rack up dozens
@@ -214,6 +230,9 @@ pub struct Nrsc5App {
     /// Last time we pruned expired plays from `art_history`. Throttled so
     /// we don't walk the map every UI frame.
     last_art_prune_at: Option<Instant>,
+    /// Last time we pruned stale raw LOT dumps from the AAS scratch dir.
+    /// Throttled so we don't scan the directory every UI frame.
+    last_aas_prune_at: Option<Instant>,
     /// Where each recently-closed panel used to live, so re-opening it from
     /// the toolbar restores it to (roughly) the same spot.
     closed_tab_locations: HashMap<DockTab, ClosedTabInfo>,
@@ -315,7 +334,7 @@ impl Nrsc5App {
         // moved into the struct literal below.
         let play_log_retention_hours = config.play_log_retention_hours;
 
-        Self {
+        let mut app = Self {
             app_state: AppState {
                 frequency_mhz: config.frequency_mhz,
                 selected_program: config.selected_program,
@@ -361,6 +380,7 @@ impl Nrsc5App {
             art_blocklist,
             art_cache,
             last_art_prune_at: None,
+            last_aas_prune_at: None,
             closed_tab_locations: HashMap::new(),
             prev_layout: LayoutSnapshot::default(),
             play_log: {
@@ -372,7 +392,11 @@ impl Nrsc5App {
             sdr_probe_tx,
             sdr_probe_rx,
             sdr_probe_in_flight: false,
+        };
+        if !app.weather_map.frames.is_empty() {
+            app.apply_weather_frame_update();
         }
+        app
     }
 }
 
@@ -683,6 +707,10 @@ impl eframe::App for Nrsc5App {
         // Keep the rolling 8-hour collage window honest even in quiet periods
         // by pruning expired plays roughly once a minute.
         self.maybe_prune_art_history();
+
+        // Bound the AAS scratch dir: drop raw LOT dumps older than the
+        // retention window so the folder doesn't grow without limit.
+        self.maybe_prune_aas_scratch();
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
@@ -1686,6 +1714,134 @@ impl Nrsc5App {
         }
     }
 
+    /// Throttled cleanup of the AAS scratch directory. nrsc5 dumps every
+    /// LOT payload (traffic tiles, raw radar overlays, DWRI text, HERE
+    /// weather images) to disk, and the stitched `TrafficMap_NNNN.png`
+    /// composites accumulate one per stitch. Only the *latest* traffic map
+    /// and the rolling ≤12 `WeatherMap_*` frames are still referenced;
+    /// everything older than `AAS_RETENTION` is garbage. Base-map crops and
+    /// the stable `TrafficMap.png` alias are kept regardless of age (bounded
+    /// and cheap), and anything the UI is currently displaying is exempt.
+    /// Cache one station logo for `program` (0-based subchannel) keyed by
+    /// the current tuned frequency, returning the durable path. The file
+    /// name embeds a short content hash so a genuinely updated logo lands
+    /// under a fresh path — egui caches decoded textures by URI, so reusing
+    /// a name would keep showing the stale image — while byte-identical
+    /// re-sends from the carousel reuse the existing file. Stale logos for
+    /// the same (frequency, subchannel) are removed so the cache holds at
+    /// most one file per slot.
+    fn store_station_logo(&self, program: u32, ext: &str, bytes: &[u8]) -> Option<String> {
+        let dir = crate::paths::station_logo_dir()?;
+        std::fs::create_dir_all(&dir).ok()?;
+        let freq_key = (self.config.frequency_mhz * 10.0).round() as u32;
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        bytes.hash(&mut hasher);
+        let hash = hasher.finish() as u32;
+        let target = dir.join(format!("{freq_key}_hd{}_{hash:08x}.{ext}", program + 1));
+        if !target.exists() {
+            std::fs::write(&target, bytes).ok()?;
+            let stale_prefix = format!("{freq_key}_hd{}_", program + 1);
+            if let Ok(entries) = std::fs::read_dir(&dir) {
+                for e in entries.flatten() {
+                    if e.file_name().to_string_lossy().starts_with(&stale_prefix)
+                        && e.path() != target
+                    {
+                        let _ = std::fs::remove_file(e.path());
+                    }
+                }
+            }
+        }
+        Some(target.to_string_lossy().into_owned())
+    }
+
+    /// Repopulate `station_logo_paths` from the durable logo cache for the
+    /// frequency we're (re)tuning to. Clears every slot first; slots with
+    /// no cached file stay `None`.
+    fn preload_station_logos(&mut self, mhz: f32) {
+        self.app_state.station_logo_paths = Default::default();
+        let Some(dir) = crate::paths::station_logo_dir() else {
+            return;
+        };
+        let prefix = format!("{}_hd", (mhz * 10.0).round() as u32);
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return;
+        };
+        for e in entries.flatten() {
+            let fname = e.file_name();
+            let fname = fname.to_string_lossy();
+            let Some(rest) = fname.strip_prefix(&prefix) else {
+                continue;
+            };
+            let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if let Ok(n) = digits.parse::<u32>() {
+                if (1..=8).contains(&n) {
+                    self.app_state.station_logo_paths[(n - 1) as usize] =
+                        Some(e.path().to_string_lossy().into_owned());
+                }
+            }
+        }
+    }
+
+    fn maybe_prune_aas_scratch(&mut self) {
+        let now = Instant::now();
+        let due = self
+            .last_aas_prune_at
+            .map(|t| now.duration_since(t) >= AAS_PRUNE_INTERVAL)
+            .unwrap_or(true);
+        if !due {
+            return;
+        }
+        self.last_aas_prune_at = Some(now);
+
+        let Some(cutoff) = std::time::SystemTime::now().checked_sub(AAS_RETENTION) else {
+            return;
+        };
+
+        // Files still in active use that must survive regardless of age.
+        let mut keep: std::collections::HashSet<std::path::PathBuf> =
+            std::collections::HashSet::new();
+        if let Some(p) = self.traffic_map.completed_path.as_deref() {
+            keep.insert(std::path::PathBuf::from(p));
+        }
+        for frame in &self.app_state.weather_frames {
+            keep.insert(std::path::PathBuf::from(&frame.path));
+        }
+
+        let prune_dir = |dir: &std::path::Path| {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_file() {
+                    continue;
+                }
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                // Never age-delete base-map crops or the latest-traffic alias.
+                if name.starts_with("BaseMap_") || name == "TrafficMap.png" {
+                    continue;
+                }
+                // Never delete a file the UI is currently displaying.
+                if keep.contains(&path) {
+                    continue;
+                }
+                let Ok(meta) = entry.metadata() else {
+                    continue;
+                };
+                let Ok(modified) = meta.modified() else {
+                    continue;
+                };
+                if modified < cutoff {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+        };
+
+        prune_dir(&self.aas_dir);
+        prune_dir(&self.aas_dir.join("here"));
+    }
+
     /// Serialize the in-memory `art_history` map to disk so the collage
     /// survives restarts. Converts each `Instant` play timestamp to Unix
     /// milliseconds via the wall-clock offset between `Instant::now()` and
@@ -1747,6 +1903,47 @@ impl Nrsc5App {
         cache.sweep_orphans(&keep);
     }
 
+    fn apply_traffic_composite_update(&mut self) {
+        self.app_state.traffic_map_path = self.traffic_map.completed_path.clone();
+        self.app_state.traffic_map_last_updated_hhmmss =
+            Some(Local::now().format("%H:%M:%S").to_string());
+        self.app_state.push_payload_log("Traffic composite updated");
+    }
+
+    fn apply_weather_frame_update(&mut self) {
+        let prev_len = self.app_state.weather_frames.len();
+        let prev_idx = self.app_state.weather_current_frame;
+        let new_frames = self.weather_map.frames.clone();
+        let new_last = new_frames.len().saturating_sub(1);
+        // Viewer was "following the live tail" if either the
+        // animation is playing or the viewer was already on (or
+        // past) the previous newest frame, or we had no frames
+        // at all yet.
+        let following = prev_len == 0 || self.app_state.weather_playing || prev_idx + 1 >= prev_len;
+        // If the buffer was at capacity, the new frame caused the
+        // oldest to be dropped, so every existing index shifts
+        // down by one.
+        let shifted_idx = if prev_len == crate::maps::MAX_WEATHER_FRAMES
+            && new_frames.len() == prev_len
+        {
+            prev_idx.saturating_sub(1)
+        } else {
+            prev_idx
+        };
+        self.app_state.weather_frames = new_frames;
+        self.app_state.weather_current_frame = if following {
+            new_last
+        } else {
+            shifted_idx.min(new_last)
+        };
+        self.app_state.weather_map_last_updated_hhmmss =
+            Some(Local::now().format("%H:%M:%S").to_string());
+        self.app_state.push_payload_log(format!(
+            "Weather frame buffered ({} total)",
+            self.app_state.weather_frames.len()
+        ));
+    }
+
     fn handle_nrsc5_event(&mut self, evt: NrscEvent) {
         match evt {
             NrscEvent::LostDevice => {
@@ -1794,11 +1991,16 @@ impl Nrsc5App {
                     }
                 }
             }
-            NrscEvent::Sync => {
+            NrscEvent::Sync {
+                freq_offset_hz,
+                psmi,
+            } => {
                 self.last_signal_at = Some(Instant::now());
                 self.app_state.currently_synced = true;
                 self.app_state.lost_sync_at = None;
                 self.app_state.nrsc5_status = "synced".to_string();
+                self.app_state.station_info.sync_freq_offset_hz = Some(freq_offset_hz);
+                self.app_state.station_info.sync_psmi = Some(psmi);
             }
             NrscEvent::LostSync => {
                 // Stamp the loss; the dock's `available_programs()` and
@@ -1914,7 +2116,12 @@ impl Nrsc5App {
                     }
                 }
             }
-            NrscEvent::LotFile { lot, name, data, .. } => {
+            NrscEvent::LotFile {
+                lot,
+                name,
+                data,
+                ..
+            } => {
                 // Reconstruct the `{lot}_{name}` filename that the old
                 // `nrsc5.exe --dump-aas-files` flag used to write.
                 // Downstream consumers (`extract_call_sign`,
@@ -1943,6 +2150,22 @@ impl Nrsc5App {
                     filename,
                     data.len()
                 );
+                if !filename.is_empty() {
+                    let kind = if filename.contains("_TMT_") {
+                        "traffic tile"
+                    } else if filename.contains("_DWRI_") || filename.contains("_DWRO_") {
+                        "weather frame"
+                    } else {
+                        "image payload"
+                    };
+                    self.app_state.push_payload_log(format!(
+                        "LOT {} {} ({} B): {}",
+                        lot,
+                        kind,
+                        data.len(),
+                        filename
+                    ));
+                }
                 if !data.is_empty() && !filename.is_empty() {
                     let path = self.aas_dir.join(&filename);
                     if let Err(e) = std::fs::write(&path, &data) {
@@ -1952,6 +2175,25 @@ impl Nrsc5App {
                             path.display(),
                             e
                         );
+                    }
+                }
+                // Standalone SL carousel logo (`SL<CALLSIGN>$$<NN>…`):
+                // cache one tiny file per (frequency, subchannel) in the
+                // durable store, then drop the AAS scratch copy so it can't
+                // grow or be pruned. XHDR logos are handled in the `Xhdr` arm.
+                if !filename.is_empty() && !data.is_empty() {
+                    if let Some((program, callsign)) = parse_station_logo_filename(&filename) {
+                        if let Some(cached) =
+                            self.store_station_logo(program, &logo_ext(&filename), &data)
+                        {
+                            let _ = std::fs::remove_file(self.aas_dir.join(&filename));
+                            self.app_state.station_logo_paths[program as usize] = Some(cached);
+                            self.app_state.push_payload_log(format!(
+                                "Station logo {callsign} HD{} (LOT {})",
+                                program + 1,
+                                lot
+                            ));
+                        }
                     }
                 }
                 if self.app_state.call_sign.is_empty() {
@@ -1969,8 +2211,12 @@ impl Nrsc5App {
                     );
                 }
                 if traffic_completed {
-                    self.app_state.traffic_map_path =
-                        self.traffic_map.completed_path.clone();
+                    self.apply_traffic_composite_update();
+                } else if self.traffic_map.completed_path.is_none() {
+                    // Source switched or map was cleared; avoid showing stale
+                    // composite from the previous feed while new tiles arrive.
+                    self.app_state.traffic_map_path = None;
+                    self.app_state.traffic_map_last_updated_hhmmss = None;
                 }
                 let weather_new = self.weather_map.process_lot(&filename);
                 #[cfg(debug_assertions)]
@@ -1983,59 +2229,166 @@ impl Nrsc5App {
                     );
                 }
                 if weather_new {
-                    let prev_len = self.app_state.weather_frames.len();
-                    let prev_idx = self.app_state.weather_current_frame;
-                    let new_frames = self.weather_map.frames.clone();
-                    let new_last = new_frames.len().saturating_sub(1);
-                    // Viewer was "following the live tail" if either the
-                    // animation is playing or the viewer was already on (or
-                    // past) the previous newest frame, or we had no frames
-                    // at all yet.
-                    let following = prev_len == 0
-                        || self.app_state.weather_playing
-                        || prev_idx + 1 >= prev_len;
-                    // If the buffer was at capacity, the new frame caused the
-                    // oldest to be dropped, so every existing index shifts
-                    // down by one.
-                    let shifted_idx = if prev_len == crate::maps::MAX_WEATHER_FRAMES
-                        && new_frames.len() == prev_len
-                    {
-                        prev_idx.saturating_sub(1)
-                    } else {
-                        prev_idx
-                    };
-                    self.app_state.weather_frames = new_frames;
-                    self.app_state.weather_current_frame = if following {
-                        new_last
-                    } else {
-                        shifted_idx.min(new_last)
-                    };
+                    self.apply_weather_frame_update();
                 }
                 self.lot_files.insert(lot, filename);
             }
-            NrscEvent::Xhdr { program, param, lot } => {
+            NrscEvent::Xhdr { program, mime, lot, .. } => {
+                // The album-art vs. station-logo distinction is carried
+                // by the XHDR MIME type, NOT by `param` (which is the
+                // upstream LOT-present flag). `NRSC5_MIME_STATION_LOGO`
+                // is the only value that means "this is a logo"; every
+                // other image MIME (`NRSC5_MIME_PRIMARY_IMAGE`, JPEG,
+                // PNG) is now-playing cover art.
                 if let Some(filename) = self.lot_files.get(&lot) {
                     let full_path = self.aas_dir.join(filename);
                     if full_path.exists() {
                         let path_str = full_path.to_string_lossy().to_string();
-                        if param == 0 {
+                        if mime == crate::ffi::nrsc5_sys::NRSC5_MIME_STATION_LOGO {
+                            // XHDR-delivered logo — cache it against the
+                            // now-playing subchannel and drop the AAS scratch
+                            // copy. Also temporarily takes over the Now Playing
+                            // artwork slot until the next cover-art XHDR arrives.
+                            let ext = logo_ext(filename);
+                            if let Some(cached) = std::fs::read(&full_path)
+                                .ok()
+                                .and_then(|bytes| self.store_station_logo(program, &ext, &bytes))
+                            {
+                                let _ = std::fs::remove_file(&full_path);
+                                self.app_state.station_logo_paths[program as usize] = Some(cached);
+                            }
+                            self.app_state.now_playing_image_mode =
+                                NowPlayingImageMode::StationLogo;
+                            self.app_state.push_payload_log(format!(
+                                "XHDR station logo HD{} (LOT {})",
+                                program + 1,
+                                lot
+                            ));
+                        } else {
                             self.app_state.now_playing_image_mode =
                                 NowPlayingImageMode::CoverArt;
+                            self.app_state.push_payload_log(format!(
+                                "XHDR cover art -> HD{} (LOT {})",
+                                program + 1,
+                                lot
+                            ));
                             // Cover art. `record_album_art` sets
                             // `programs[program].cover_art_path` itself
                             // (preferring the durable cache copy) and
                             // prunes the AAS-dir dump after a successful
                             // cache write.
                             self.record_album_art(program, &full_path, &path_str);
-                        } else if param == 1 {
-                            // Station logo — stays global; one logo
-                            // per station regardless of which subchannel
-                            // first transmitted it. Also temporarily takes
-                            // over the Now Playing artwork slot until the
-                            // next cover-art XHDR arrives.
-                            self.app_state.station_logo_path = Some(path_str);
-                            self.app_state.now_playing_image_mode =
-                                NowPlayingImageMode::StationLogo;
+                        }
+                    }
+                }
+            }
+            NrscEvent::HereImage {
+                image_type,
+                seq,
+                n1,
+                n2,
+                latitude1,
+                longitude1,
+                latitude2,
+                longitude2,
+                has_time_utc,
+                name,
+                size,
+                data,
+            } => {
+                let kind = here_image_type_label(image_type);
+                let safe_name = sanitize_filename(&name);
+                let leaf = if safe_name == "_" {
+                    "payload.bin".to_string()
+                } else {
+                    safe_name
+                };
+                let filename = format!("HERE_{}_{}_{}", image_type, seq, leaf);
+                let here_dir = self.aas_dir.join("here");
+                let path = here_dir.join(&filename);
+
+                if data.is_empty() {
+                    self.app_state.push_payload_log(format!(
+                        "HERE {} seq={} signaled {} B (empty payload): {}",
+                        kind, seq, size, filename
+                    ));
+                    self.app_state.push_payload_log(format!(
+                        "HERE meta seq={} tile=({}, {}) bbox=({:.4}, {:.4})..({:.4}, {:.4}) utc={}",
+                        seq,
+                        n1,
+                        n2,
+                        latitude1,
+                        longitude1,
+                        latitude2,
+                        longitude2,
+                        if has_time_utc { "present" } else { "none" }
+                    ));
+                } else {
+                    if let Err(e) = std::fs::create_dir_all(&here_dir) {
+                        eprintln!(
+                            "[here] failed to create output dir {}: {}",
+                            here_dir.display(),
+                            e
+                        );
+                    } else if let Err(e) = std::fs::write(&path, &data) {
+                        eprintln!("[here] failed to write {}: {}", path.display(), e);
+                    }
+                    self.app_state.push_payload_log(format!(
+                        "HERE {} seq={} ({} B): {}",
+                        kind,
+                        seq,
+                        data.len(),
+                        filename
+                    ));
+                    self.app_state.push_payload_log(format!(
+                        "HERE meta seq={} tile=({}, {}) bbox=({:.4}, {:.4})..({:.4}, {:.4}) utc={}",
+                        seq,
+                        n1,
+                        n2,
+                        latitude1,
+                        longitude1,
+                        latitude2,
+                        longitude2,
+                        if has_time_utc { "present" } else { "none" }
+                    ));
+
+                    let rel_filename = format!("here/{}", filename);
+                    if image_type == crate::ffi::nrsc5_sys::NRSC5_HERE_IMAGE_TRAFFIC {
+                        let traffic_completed =
+                            self.traffic_map.process_here_tile(&rel_filename, n1, n2);
+                        #[cfg(debug_assertions)]
+                        eprintln!(
+                            "[map] HERE traffic tile name={} tile=({}, {}) completed_stitch={}",
+                            rel_filename,
+                            n1,
+                            n2,
+                            traffic_completed
+                        );
+                        if traffic_completed {
+                            self.apply_traffic_composite_update();
+                        } else if self.traffic_map.completed_path.is_none() {
+                            self.app_state.traffic_map_path = None;
+                            self.app_state.traffic_map_last_updated_hhmmss = None;
+                        }
+                    } else if image_type == crate::ffi::nrsc5_sys::NRSC5_HERE_IMAGE_WEATHER {
+                        let weather_new = self.weather_map.process_here_image(
+                            &rel_filename,
+                            Some([
+                                latitude1 as f64,
+                                longitude1 as f64,
+                                latitude2 as f64,
+                                longitude2 as f64,
+                            ]),
+                        );
+                        #[cfg(debug_assertions)]
+                        eprintln!(
+                            "[map] HERE weather image name={} new_frame={} total_frames={}",
+                            rel_filename,
+                            weather_new,
+                            self.weather_map.frames.len()
+                        );
+                        if weather_new {
+                            self.apply_weather_frame_update();
                         }
                     }
                 }
@@ -2338,12 +2691,14 @@ impl Nrsc5App {
                 self.app_state.currently_synced = false;
                 self.app_state.lost_sync_at = None;
                 self.lot_files.clear();
-                self.app_state.station_logo_path = None;
                 self.app_state.now_playing_image_mode = NowPlayingImageMode::CoverArt;
                 self.app_state.traffic_map_path = None;
+                self.app_state.traffic_map_last_updated_hhmmss = None;
                 self.app_state.weather_frames.clear();
+                self.app_state.weather_map_last_updated_hhmmss = None;
                 self.app_state.weather_current_frame = 0;
                 self.app_state.weather_playing = false;
+                self.app_state.clear_payload_log();
                 self.app_state.call_sign.clear();
                 // Clear aggregated SIS so a fresh Start re-discovers identity
                 // from scratch rather than rendering stale fields from the
@@ -2383,7 +2738,6 @@ impl Nrsc5App {
                 self.app_state.lost_sync_at = None;
                 self.app_state.call_sign.clear();
                 self.app_state.now_playing_image_mode = NowPlayingImageMode::CoverArt;
-                // Wipe stale MER from the previous station so the Signal
                 // meters and AGC-status readout don't show last station's
                 // value during the gap between tune and first new MER
                 // event. The next NRSC5_EVENT_MER refills these once
@@ -2395,7 +2749,14 @@ impl Nrsc5App {
                 // every program slot so the panel doesn't show the wrong
                 // song while the new station's SIS / PSD roll in.
                 self.app_state.clear_all_programs();
+                // Repopulate logos from the durable cache for the new dial
+                // position so a previously-heard station's logos appear
+                // instantly, before its SL carousel comes back around.
+                self.preload_station_logos(mhz);
                 self.lot_files.clear();
+                self.app_state.traffic_map_last_updated_hhmmss = None;
+                self.app_state.weather_map_last_updated_hhmmss = None;
+                self.app_state.clear_payload_log();
                 self.config.frequency_mhz = mhz;
                 save_config(&self.config);
 
@@ -4159,8 +4520,43 @@ impl Nrsc5App {
 /// `KEGLHD01da41.jpg` (call sign + "HD" + 2-digit subchannel + hex). We
 /// strip the leading lot prefix, find the "HD" marker, and return the
 /// 3-5 uppercase ASCII letters preceding it.
+/// Parse the subchannel and FCC call sign out of a station-logo LOT
+/// filename of the form `{lot}_SL<CALLSIGN>$$<NN><image#>.<ext>`, where
+/// `<NN>` is the 1-based zero-padded subchannel (`01`=HD1, `02`=HD2…).
+/// Examples: `SLKJKK$$010005.jpg` (KJKK HD1), `SLKEGL$$0211540000.png`
+/// (KEGL HD2). The embedded call sign is the real FCC sign even when SIS
+/// reports a vanity name (100.3 reports "JACK" but the logo is
+/// `SLKJKK$$…`).
+///
+/// Returns `(zero-based program, call sign)`, or `None` for names that
+/// don't match the `SL…$$` convention or whose subchannel digits are
+/// missing / out of the HD1–HD8 range. Album-art names
+/// (e.g. `MT0001764873_1440144.jpg`) never match.
+fn parse_station_logo_filename(filename: &str) -> Option<(u32, String)> {
+    let raw = filename
+        .split_once('_')
+        .map(|(_, rest)| rest)
+        .unwrap_or(filename);
+    let (callsign, rest) = raw.strip_prefix("SL")?.split_once("$$")?;
+    let digits: String = rest.chars().take(2).collect();
+    let sub: u32 = digits.parse().ok()?;
+    if !(1..=8).contains(&sub) {
+        return None;
+    }
+    Some((sub - 1, callsign.to_string()))
+}
+
+/// Lower-cased file extension for a logo filename, defaulting to `png`
+/// when there's no recognizable extension.
+fn logo_ext(filename: &str) -> String {
+    std::path::Path::new(filename)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_else(|| "png".to_string())
+}
+
 fn extract_call_sign(filename: &str) -> Option<String> {
-    // Strip the leading "{lot}_" prefix.
     let raw = filename.split_once('_').map(|(_, rest)| rest).unwrap_or(filename);
 
     // Find "HD" followed by an ASCII digit.

@@ -40,7 +40,10 @@ pub enum NrscEvent {
     /// down; if Stop already ran, ignore. Lets us detect a dead child
     /// without polling `child.try_wait()` on every GUI frame.
     ChildExited,
-    Sync,
+    Sync {
+        freq_offset_hz: f32,
+        psmi: i32,
+    },
     LostSync,
     Mer { lower: f32, upper: f32 },
     Ber { cber: f32 },
@@ -89,12 +92,23 @@ pub enum NrscEvent {
         lot: String,
         name: String,
         data: Vec<u8>,
+        /// MIME type of the LOT payload (e.g. `NRSC5_MIME_PRIMARY_IMAGE`,
+        /// `NRSC5_MIME_STATION_LOGO`, `NRSC5_MIME_PNG`). Stations that
+        /// broadcast a station logo as a standalone data-service LOT
+        /// (no accompanying ID3 XHDR) can only be recognized via this
+        /// field.
+        mime: u32,
     },
-    /// XHDR event â€” param 0 = cover art, param 1 = station logo.
-    /// `program` is the HD subchannel whose decoder produced this
-    /// event; same routing role as on `LotFile`.
+    /// XHDR event â€” the album-art vs. station-logo distinction is
+    /// carried by `mime` (`NRSC5_MIME_PRIMARY_IMAGE` = album art,
+    /// `NRSC5_MIME_STATION_LOGO` = station logo), NOT by `param`.
+    /// `param` is the upstream LOT-present flag (0 = a LOT id is
+    /// attached, 1 = none). `program` is the HD subchannel whose
+    /// decoder produced this event; same routing role as on `LotFile`.
     Xhdr {
         program: u32,
+        mime: u32,
+        #[allow(dead_code)] // upstream LOT-present flag; routing keys off `mime`
         param: u32,
         lot: String,
     },
@@ -144,7 +158,24 @@ pub enum NrscEvent {
     EmergencyAlert {
         text: String,
     },
-    HereImage,
+    /// HERE image payload (traffic/weather map assets).
+    ///
+    /// This is a raw pass-through of the libnrsc5 event so the app layer
+    /// can persist and inspect payloads without decoding semantics yet.
+    HereImage {
+        image_type: i32,
+        seq: i32,
+        n1: i32,
+        n2: i32,
+        latitude1: f32,
+        longitude1: f32,
+        latitude2: f32,
+        longitude2: f32,
+        has_time_utc: bool,
+        name: String,
+        size: u32,
+        data: Vec<u8>,
+    },
     Agc { gain_db: f32 },
     /// Closed-loop AGC controller applied a new tuner gain. Emitted
     /// from the AGC driver thread immediately after the
@@ -217,7 +248,7 @@ impl NrscEvent {
             Self::LostDevice => "lost-device",
             Self::LostDeviceDetail(_) => "lost-device-detail",
             Self::ChildExited => "child-exited",
-            Self::Sync => "sync",
+            Self::Sync { .. } => "sync",
             Self::LostSync => "lost-sync",
             Self::Mer { .. } => "mer",
             Self::Ber { .. } => "ber",
@@ -235,7 +266,7 @@ impl NrscEvent {
             Self::SigServiceAudio { .. } => "sig-service-audio",
             Self::SigServiceData { .. } => "sig-service-data",
             Self::EmergencyAlert { .. } => "emergency-alert",
-            Self::HereImage => "here-image",
+            Self::HereImage { .. } => "here-image",
             Self::Agc { .. } => "agc",
             Self::AgcDecision { .. } => "agc-decision",
             Self::SyncAm { .. } => "sync-am",

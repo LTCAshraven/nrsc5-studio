@@ -177,6 +177,8 @@ pub enum DockTab {
     /// info, data services, alerts. Closed by default; opened from
     /// the toolbar's panel toggle row.
     StationInfo,
+    /// Raw nrsc5 telemetry grouped for radio-nerd diagnostics.
+    EngineeringInfo,
     Traffic,
     Weather,
     Signal,
@@ -195,10 +197,11 @@ pub enum DockTab {
 
 impl DockTab {
     /// All panel variants in the order they should appear in the View menu.
-    pub const ALL: [DockTab; 10] = [
+    pub const ALL: [DockTab; 11] = [
         DockTab::Tuner,
         DockTab::NowPlaying,
         DockTab::StationInfo,
+        DockTab::EngineeringInfo,
         DockTab::Collage,
         DockTab::Spectrum,
         DockTab::Signal,
@@ -214,6 +217,7 @@ impl DockTab {
             DockTab::Tuner => "\u{1F4FB} Tuner",
             DockTab::NowPlaying => "\u{1F3B5} Now Playing",
             DockTab::StationInfo => "\u{1F4DA} Station Info",
+            DockTab::EngineeringInfo => "\u{1F6E0} Engineering",
             DockTab::Collage => "\u{1F5BC} Collage",
             DockTab::Spectrum => "\u{1F4CA} Spectrum",
             DockTab::Signal => "\u{1F4F6} Signal",
@@ -240,6 +244,7 @@ impl TabViewer for DockViewer<'_> {
             DockTab::Tuner => "\u{1F4FB} Tuner".into(),
             DockTab::NowPlaying => "\u{1F3B5} Now Playing".into(),
             DockTab::StationInfo => "\u{1F4DA} Station Info".into(),
+            DockTab::EngineeringInfo => "\u{1F6E0} Engineering".into(),
             DockTab::Traffic => "\u{1F697} Traffic".into(),
             DockTab::Weather => "\u{2601} Weather".into(),
             DockTab::Signal => "\u{1F4F6} Signal".into(),
@@ -255,6 +260,7 @@ impl TabViewer for DockViewer<'_> {
             DockTab::Tuner => self.tuner_ui(ui),
             DockTab::NowPlaying => self.now_playing_ui(ui),
             DockTab::StationInfo => self.station_info_ui(ui),
+            DockTab::EngineeringInfo => self.engineering_info_ui(ui),
             DockTab::Traffic => self.traffic_ui(ui),
             DockTab::Weather => self.weather_ui(ui),
             DockTab::Signal => self.signal_ui(ui),
@@ -753,10 +759,10 @@ impl DockViewer<'_> {
         let image_path = match self.app_state.now_playing_image_mode {
             NowPlayingImageMode::StationLogo => self
                 .app_state
-                .station_logo_path
-                .as_ref()
-                .filter(|path| std::path::Path::new(path.as_str()).exists())
-                .cloned(),
+                .station_logo_paths
+                .get(self.app_state.active_idx())
+                .and_then(|p| p.clone())
+                .filter(|path| std::path::Path::new(path.as_str()).exists()),
             NowPlayingImageMode::CoverArt => slot.cover_art_path.clone(),
         };
 
@@ -997,62 +1003,76 @@ impl DockViewer<'_> {
             ui.add_space(6.0);
         }
 
-        // Header row: call sign + inferred service-mode badge + compact
-        // right-aligned station logo when one has been transmitted.
+        // Header row: the station identity text (call sign + PSMI badge,
+        // slogan, message) in a left column, with the per-subchannel
+        // station logo right-aligned beside it. Keeping the slogan/message
+        // inside the same column as the call sign — rather than below the
+        // row — stops the tall logo from pushing that text downward.
         let logo_path = self
             .app_state
-            .station_logo_path
-            .as_ref()
-            .filter(|path| std::path::Path::new(path.as_str()).exists())
-            .cloned();
-        if info.call_sign.is_some() || info.infer_service_mode().is_some() || logo_path.is_some() {
-            ui.horizontal(|ui| {
+            .station_logo_paths
+            .get(self.app_state.selected_program as usize)
+            .and_then(|p| p.clone())
+            .filter(|path| std::path::Path::new(path.as_str()).exists());
+        let has_header = info.call_sign.is_some()
+            || info.sync_psmi.is_some()
+            || info.slogan.is_some()
+            || info.message.is_some()
+            || logo_path.is_some();
+        if has_header {
+            // `horizontal_top` (not `horizontal`) so the tall logo doesn't
+            // vertically re-center the identity text; it stays pinned to the
+            // top of the row.
+            ui.horizontal_top(|ui| {
                 ui.vertical(|ui| {
                     ui.horizontal(|ui| {
                         if let Some(call_sign) = info.call_sign.clone() {
                             ui.label(RichText::new(call_sign).heading().color(accent));
                         }
-                        if let Some(mode) = info.infer_service_mode() {
+                        if let Some(psmi_badge) = info.sync_psmi_badge() {
                             ui.add_space(10.0);
                             let resp = ui.label(
-                                RichText::new(format!("[{} \u{2022} inferred]", mode.label()))
+                                RichText::new(format!("[{}]", psmi_badge))
                                     .small()
                                     .color(muted),
                             );
                             resp.on_hover_text(
-                                "HD Radio service mode inferred from the highest subchannel\nadvertised in SIS. nrsc5 does not report the mode directly.",
+                                "Raw PSMI from the libnrsc5 SYNC event. The app keeps this value\nas received instead of inferring service mode from SIS.",
                             );
                         }
                     });
+                    if let Some(slogan) = &info.slogan {
+                        ui.label(RichText::new(slogan).italics().color(dim));
+                    }
+                    if let Some(message) = &info.message {
+                        ui.label(RichText::new(message).color(dim));
+                    }
                 });
 
-                let gap = ui.available_width().max(0.0);
-                if gap > 0.0 {
-                    ui.add_space(gap);
-                }
-
                 if let Some(path) = logo_path {
+                    // Lay the logo out right-to-left within whatever width is
+                    // left over after the identity text. This right-aligns it
+                    // against the panel edge without a manual spacer, so it
+                    // never reflows or squeezes the text on the left.
                     let uri = format!("file:///{}", path.replace('\\', "/"));
-                    egui::Frame::new()
-                        .fill(Color32::from_rgba_unmultiplied(255, 255, 255, 16))
-                        .corner_radius(egui::CornerRadius::same(4))
-                        .inner_margin(egui::Margin::symmetric(6, 4))
-                        .show(ui, |ui| {
-                            ui.add(
-                                egui::Image::new(&uri)
-                                    .fit_to_exact_size(Vec2::new(112.0, 40.0))
-                                    .corner_radius(3),
-                            );
-                        });
+                    ui.with_layout(
+                        egui::Layout::right_to_left(egui::Align::TOP),
+                        |ui| {
+                            egui::Frame::new()
+                                .fill(Color32::from_rgba_unmultiplied(255, 255, 255, 16))
+                                .corner_radius(egui::CornerRadius::same(4))
+                                .inner_margin(egui::Margin::symmetric(6, 4))
+                                .show(ui, |ui| {
+                                    ui.add(
+                                        egui::Image::new(&uri)
+                                            .fit_to_exact_size(Vec2::new(224.0, 80.0))
+                                            .corner_radius(3),
+                                    );
+                                });
+                        },
+                    );
                 }
             });
-        }
-
-        if let Some(slogan) = &info.slogan {
-            ui.label(RichText::new(slogan).italics().color(dim));
-        }
-        if let Some(message) = &info.message {
-            ui.label(RichText::new(message).color(dim));
         }
 
         let has_identity_row = info.country.is_some()
@@ -1168,114 +1188,321 @@ impl DockViewer<'_> {
             }
         }
 
-        // Equipment block — exciter / importer manufacturer + firmware
-        // versions (libnrsc5 v3.2.0). Only rendered when SIS has
-        // surfaced at least one of them.
-        if info.exciter.is_some() || info.importer.is_some() {
-            ui.add_space(6.0);
-            ui.separator();
-            ui.add_space(4.0);
-            ui.label(RichText::new("Equipment").color(muted).small());
-
-            if let Some(eq) = &info.exciter {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Exciter:").color(muted));
-                    let mut txt = format!(
-                        "{}  core {} ({})  mfr {} ({})",
-                        if eq.manufacturer_id.is_empty() {
-                            "—"
-                        } else {
-                            eq.manufacturer_id.as_str()
-                        },
-                        eq.core_version_string(),
-                        crate::station_info::EquipmentInfo::status_label(eq.core_status),
-                        eq.manufacturer_version_string(),
-                        crate::station_info::EquipmentInfo::status_label(
-                            eq.manufacturer_status
-                        ),
-                    );
-                    if let Some(connected) = eq.importer_connected {
-                        txt.push_str(if connected {
-                            "  · importer connected"
-                        } else {
-                            "  · no importer"
-                        });
-                    }
-                    ui.label(RichText::new(txt).monospace().color(dim));
-                });
-            }
-
-            if let Some(eq) = &info.importer {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Importer:").color(muted));
-                    let txt = format!(
-                        "{}  core {} ({})  mfr {} ({})",
-                        if eq.manufacturer_id.is_empty() {
-                            "—"
-                        } else {
-                            eq.manufacturer_id.as_str()
-                        },
-                        eq.core_version_string(),
-                        crate::station_info::EquipmentInfo::status_label(eq.core_status),
-                        eq.manufacturer_version_string(),
-                        crate::station_info::EquipmentInfo::status_label(
-                            eq.manufacturer_status
-                        ),
-                    );
-                    ui.label(RichText::new(txt).monospace().color(dim));
-                });
-            }
-        }
-
-        // Local Time / Leap-second block (libnrsc5 v3.2.0).
-        if info.local_time.is_some() || info.leap_second.is_some() {
-            ui.add_space(6.0);
-            ui.separator();
-            ui.add_space(4.0);
-            ui.label(RichText::new("Time").color(muted).small());
-
-            if let Some(lt) = info.local_time {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Local time:").color(muted));
-                    let dst_txt = if lt.dst_local && lt.dst_regional {
-                        "DST in effect"
-                    } else if lt.dst_local || lt.dst_regional {
-                        "DST partial"
-                    } else {
-                        "no DST"
-                    };
-                    let txt = format!(
-                        "{}  ·  {} ({} schedule)",
-                        lt.offset_string(),
-                        dst_txt,
-                        lt.dst_schedule_label(),
-                    );
-                    ui.label(RichText::new(txt).monospace().color(dim));
-                });
-            }
-
-            if let Some(ls) = info.leap_second {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("GPS-UTC:").color(muted));
-                    let mut txt = format!("{}s", ls.current_offset);
-                    if ls.has_pending() {
-                        txt.push_str(&format!(
-                            "  ·  pending {}s @ ALFN {}",
-                            ls.pending_offset, ls.pending_alfn
-                        ));
-                    }
-                    let resp = ui.label(RichText::new(txt).monospace().color(dim));
-                    resp.on_hover_text(
-                        "Current GPS-to-UTC offset in seconds, plus any leap-second\nadjustment scheduled by the broadcaster (ALFN = absolute L1 frame number).",
-                    );
-                });
-            }
-        }
+        // Equipment (exciter/importer firmware) and Local Time / Leap-second
+        // blocks intentionally live only in the Engineering Info panel now —
+        // they're broadcast-plant diagnostics, not listener-facing identity.
 
         if let Some(ts) = info.last_updated {
             ui.add_space(8.0);
             let txt = format!("SIS updated {}", Self::fmt_elapsed_bucketed(ts.elapsed().as_secs()));
             ui.label(RichText::new(txt).small().color(muted));
+        }
+    }
+
+    /// Raw nrsc5 telemetry grouped for radio-nerd diagnostics.
+    fn engineering_info_ui(&mut self, ui: &mut Ui) {
+        let info = &self.app_state.station_info;
+        let accent = Color32::from_rgb(120, 190, 255);
+        let dim = Color32::from_gray(138);
+        let muted = Color32::from_gray(170);
+        let green = Color32::from_rgb(100, 200, 100);
+
+        ui.label(
+            RichText::new("Engineering Info \u{2014} Decoder & RF Diagnostics")
+                .color(accent)
+                .strong(),
+        );
+        ui.add_space(4.0);
+
+        // Check what data we have. Station identity (call sign, slogan,
+        // FCC ID, location) and the broadcast topology table now live
+        // exclusively in the Station Info panel — this panel is the
+        // pure signal/hardware diagnostics surface.
+        let has_rf_health = info.sync_psmi.is_some()
+            || info.sync_freq_offset_hz.is_some()
+            || self.app_state.mer != 0.0
+            || self.app_state.ber != 0.0;
+        let has_equipment = info.exciter.is_some() || info.importer.is_some();
+        let has_time = info.local_time.is_some() || info.leap_second.is_some();
+        let has_live_payloads = !self.app_state.payload_log.is_empty()
+            || self.app_state.traffic_map_path.is_some()
+            || !self.app_state.weather_frames.is_empty()
+            || self.app_state.station_logo_paths.iter().any(|p| p.is_some())
+            || self.app_state.active_program().cover_art_path.is_some();
+
+        if !(has_rf_health || has_live_payloads || has_equipment || has_time) {
+            ui.centered_and_justified(|ui| {
+                ui.label(
+                    RichText::new("Waiting for SIS data and raw telemetry...")
+                        .italics()
+                        .color(muted),
+                );
+            });
+            return;
+        }
+
+        // ============================================
+        // 1. RF / DECODER HEALTH
+        // ============================================
+        if has_rf_health {
+            ui.label(RichText::new("1. RF / Decoder Health").small().color(accent));
+            
+            // SYNC info
+            if let Some(freq_offset_hz) = info.sync_freq_offset_hz {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Frequency offset:").color(muted));
+                    ui.label(RichText::new(format!("{:.1} Hz", freq_offset_hz)).monospace().color(dim));
+                });
+            }
+            
+            if let Some(psmi) = info.sync_psmi {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("PSMI:").color(muted));
+                    let mode_code = match psmi {
+                        1 => "MA1",
+                        2 => "MA3",
+                        3 => "MP3",
+                        11 => "MP11",
+                        _ => "Unknown",
+                    };
+                    let mode_desc = info.sync_psmi_label().unwrap_or("Unknown mode");
+                    let mode_text = if mode_desc.eq_ignore_ascii_case(mode_code) {
+                        mode_code.to_string()
+                    } else {
+                        format!("{} - {}", mode_code, mode_desc)
+                    };
+                    let resp = ui.label(RichText::new(mode_text).monospace().color(dim));
+                    resp.on_hover_text(
+                        format!(
+                            "Raw PSMI value = {} from the libnrsc5 SYNC event.",
+                            psmi
+                        ),
+                    );
+                });
+            }
+            
+            // MER readout
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("MER:").color(muted));
+                let mer_txt = if self.app_state.mer > 0.0 {
+                    format!("lower {:.1} dB, upper {:.1} dB", self.app_state.mer_lower, self.app_state.mer_upper)
+                } else {
+                    "—".to_string()
+                };
+                ui.label(RichText::new(mer_txt).monospace().color(if self.app_state.mer > 0.0 { dim } else { muted }));
+            });
+            
+            // BER readout
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("BER:").color(muted));
+                let ber_txt = if self.app_state.ber > 0.0 {
+                    format!("{:.2e}", self.app_state.ber)
+                } else {
+                    "—".to_string()
+                };
+                ui.label(RichText::new(ber_txt).monospace().color(if self.app_state.ber > 0.0 { dim } else { muted }));
+            });
+            
+            // Sync status: use plain text labels so the state remains
+            // legible even when emoji/symbol fonts are missing.
+            let sync_status = if self.app_state.currently_synced
+                || self.app_state.nrsc5_status == "synced"
+            {
+                ("SYNC LOCKED", green)
+            } else if self.app_state.is_streaming {
+                ("NO SYNC", Color32::from_rgb(200, 100, 100))
+            } else {
+                ("IDLE", muted)
+            };
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Status:").color(muted));
+                ui.label(
+                    RichText::new(sync_status.0)
+                        .monospace()
+                        .color(sync_status.1),
+                );
+            });
+
+            // AM indicators (only on AM mode)
+            if let Some(am) = info.am_sync {
+                ui.add_space(4.0);
+                ui.label(RichText::new("AM Indicators:").small().color(muted));
+                let rows = [
+                    ("PLI", if am.pli >= 0 { if am.pli != 0 { "high" } else { "low" } } else { "unknown" }),
+                    ("HPPI", if am.hppi >= 0 { if am.hppi != 0 { "high" } else { "low" } } else { "unknown" }),
+                    ("AABI", if am.aabi >= 0 { if am.aabi != 0 { "8 kHz" } else { "5 kHz" } } else { "unknown" }),
+                    ("RDBI", if am.rdbi >= 0 { if am.rdbi != 0 { "reduced" } else { "full" } } else { "unknown" }),
+                ];
+
+                for (label, value) in rows {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(format!("  {}:", label)).color(muted));
+                        ui.label(RichText::new(value).monospace().color(dim));
+                    });
+                }
+            }
+
+            ui.add_space(6.0);
+            ui.separator();
+            ui.add_space(4.0);
+        }
+
+        // ============================================
+        // 2. EQUIPMENT & TIME (combined)
+        // ============================================
+        if has_equipment || has_time {
+            if has_equipment {
+                ui.label(RichText::new("2. Equipment").small().color(accent));
+
+                if let Some(eq) = &info.exciter {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Exciter:").color(muted));
+                        let mut txt = format!(
+                            "{}  core {} ({})  mfr {} ({})",
+                            if eq.manufacturer_id.is_empty() { "—" } else { eq.manufacturer_id.as_str() },
+                            eq.core_version_string(),
+                            crate::station_info::EquipmentInfo::status_label(eq.core_status),
+                            eq.manufacturer_version_string(),
+                            crate::station_info::EquipmentInfo::status_label(eq.manufacturer_status),
+                        );
+                        if let Some(connected) = eq.importer_connected {
+                            txt.push_str(if connected { "  · importer connected" } else { "  · no importer" });
+                        }
+                        ui.label(RichText::new(txt).monospace().color(dim));
+                    });
+                }
+
+                if let Some(eq) = &info.importer {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Importer:").color(muted));
+                        let txt = format!(
+                            "{}  core {} ({})  mfr {} ({})",
+                            if eq.manufacturer_id.is_empty() { "—" } else { eq.manufacturer_id.as_str() },
+                            eq.core_version_string(),
+                            crate::station_info::EquipmentInfo::status_label(eq.core_status),
+                            eq.manufacturer_version_string(),
+                            crate::station_info::EquipmentInfo::status_label(eq.manufacturer_status),
+                        );
+                        ui.label(RichText::new(txt).monospace().color(dim));
+                    });
+                }
+            }
+
+            if has_time {
+                if has_equipment {
+                    ui.add_space(4.0);
+                }
+                ui.label(RichText::new("Time / Leap Second").small().color(muted));
+
+                if let Some(lt) = info.local_time {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Local time:").color(muted));
+                        let dst_txt = if lt.dst_local && lt.dst_regional {
+                            "DST in effect"
+                        } else if lt.dst_local || lt.dst_regional {
+                            "DST partial"
+                        } else {
+                            "no DST"
+                        };
+                        let txt = format!(
+                            "{}  ·  {} ({} schedule)",
+                            lt.offset_string(),
+                            dst_txt,
+                            lt.dst_schedule_label(),
+                        );
+                        ui.label(RichText::new(txt).monospace().color(dim));
+                    });
+                }
+
+                if let Some(ls) = info.leap_second {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("GPS-UTC:").color(muted));
+                        let mut txt = format!("{}s", ls.current_offset);
+                        if ls.has_pending() {
+                            txt.push_str(&format!(
+                                "  ·  pending {}s @ ALFN {}",
+                                ls.pending_offset, ls.pending_alfn
+                            ));
+                        }
+                        let resp = ui.label(RichText::new(txt).monospace().color(dim));
+                        resp.on_hover_text(
+                            "Current GPS-to-UTC offset in seconds, plus any leap-second\nadjustment scheduled by the broadcaster (ALFN = absolute L1 frame number).",
+                        );
+                    });
+                }
+            }
+
+            ui.add_space(6.0);
+            ui.separator();
+            ui.add_space(4.0);
+        }
+
+        // ============================================
+        // 3. LIVE PAYLOADS
+        // ============================================
+        if has_live_payloads {
+            ui.label(RichText::new("3. Live Payloads").small().color(accent));
+
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Cover art:").color(muted));
+                let cover = self
+                    .app_state
+                    .active_program()
+                    .cover_art_path
+                    .as_ref()
+                    .map(|_| "present")
+                    .unwrap_or("none");
+                ui.label(RichText::new(cover).monospace().color(dim));
+            });
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Station logo:").color(muted));
+                let logo = if self
+                    .app_state
+                    .station_logo_paths
+                    .iter()
+                    .any(|p| p.is_some())
+                {
+                    "present"
+                } else {
+                    "none"
+                };
+                ui.label(RichText::new(logo).monospace().color(dim));
+            });
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Traffic Map:").color(muted));
+                let traffic = self
+                    .app_state
+                    .traffic_map_last_updated_hhmmss
+                    .as_ref()
+                    .map(|ts| format!("Last Updated {}", ts))
+                    .unwrap_or_else(|| "none".to_string());
+                ui.label(RichText::new(traffic).monospace().color(dim));
+            });
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Weather Map:").color(muted));
+                let weather = self
+                    .app_state
+                    .weather_map_last_updated_hhmmss
+                    .as_ref()
+                    .map(|ts| format!("Last Updated {}", ts))
+                    .unwrap_or_else(|| "none".to_string());
+                ui.label(RichText::new(weather).monospace().color(dim));
+            });
+
+            ui.add_space(4.0);
+            ui.label(RichText::new("Rolling payload log:").small().color(muted));
+            egui::ScrollArea::vertical().max_height(130.0).show(ui, |ui| {
+                for entry in self.app_state.payload_log.iter().rev() {
+                    ui.label(
+                        RichText::new(format!("- [{}] {}", entry.hhmmss, entry.text))
+                            .monospace()
+                            .color(dim),
+                    );
+                }
+                if self.app_state.payload_log.is_empty() {
+                    ui.label(RichText::new("- waiting for LOT/XHDR payloads...").monospace().color(muted));
+                }
+            });
         }
     }
 
@@ -1299,15 +1526,29 @@ impl DockViewer<'_> {
     fn traffic_ui(&mut self, ui: &mut Ui) {
         let dim = Color32::from_gray(120);
         if let Some(ref path) = self.app_state.traffic_map_path {
-            let uri = format!("file:///{}", path.replace('\\', "/"));
+            sync_image_texture(
+                ui,
+                path,
+                &mut self.app_state.traffic_texture_path,
+                &mut self.app_state.traffic_texture,
+                "traffic_map",
+            );
             let available = ui.available_size();
-            let max_side = available.x.min(available.y).min(600.0);
             ui.vertical_centered(|ui| {
-                ui.add(
-                    egui::Image::new(&uri)
-                        .fit_to_exact_size(Vec2::new(max_side, max_side))
-                        .corner_radius(4),
-                );
+                if let Some(tex) = self.app_state.traffic_texture.as_ref() {
+                    let size = fit_map_size(tex.size_vec2(), available);
+                    ui.add(
+                        egui::Image::new(tex)
+                            .fit_to_exact_size(size)
+                            .corner_radius(4),
+                    );
+                } else {
+                    ui.label(
+                        RichText::new("Traffic map image unavailable")
+                            .color(dim)
+                            .italics(),
+                    );
+                }
             });
         } else {
             ui.centered_and_justified(|ui| {
@@ -1361,20 +1602,42 @@ impl DockViewer<'_> {
         let frame = &self.app_state.weather_frames[cur];
         let path = frame.path.clone();
         let timestamp = frame.captured_at.format("%H:%M").to_string();
-        let uri = format!("file:///{}", path.replace('\\', "/"));
+        sync_image_texture(
+            ui,
+            &path,
+            &mut self.app_state.weather_texture_path,
+            &mut self.app_state.weather_texture,
+            "weather_map",
+        );
         let available = ui.available_size();
-        let max_side = available.x.min(available.y).min(600.0).max(120.0);
+        // Size the image to fill the panel while preserving the frame's aspect
+        // ratio (clamped against excessive upscaling). When the texture is not
+        // yet loaded, fall back to a square placeholder.
+        let img_size = self
+            .app_state
+            .weather_texture
+            .as_ref()
+            .map(|tex| fit_map_size(tex.size_vec2(), available))
+            .unwrap_or_else(|| {
+                let s = available.x.min(available.y).min(600.0).max(120.0);
+                Vec2::new(s, s)
+            });
 
         ui.vertical_centered(|ui| {
-            // Allocate the image square. The transport controls are painted on
+            // Allocate the image rect. The transport controls are painted on
             // top of the bottom strip as an overlay.
-            let (img_rect, _resp) = ui.allocate_exact_size(
-                Vec2::new(max_side, max_side),
-                egui::Sense::hover(),
-            );
-            egui::Image::new(&uri)
-                .corner_radius(4)
-                .paint_at(ui, img_rect);
+            let (img_rect, _resp) = ui.allocate_exact_size(img_size, egui::Sense::hover());
+            if let Some(tex) = self.app_state.weather_texture.as_ref() {
+                egui::Image::new(tex).corner_radius(4).paint_at(ui, img_rect);
+            } else {
+                ui.painter().text(
+                    img_rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "Weather frame unavailable",
+                    egui::FontId::proportional(14.0),
+                    dim,
+                );
+            }
 
             // Translucent dark strip along the bottom of the image, rounded
             // only on the bottom corners so it tucks under the image frame.
@@ -2641,6 +2904,60 @@ impl DockViewer<'_> {
                 });
             });
     }
+}
+
+fn sync_image_texture(
+    ui: &Ui,
+    path: &str,
+    texture_path: &mut Option<String>,
+    texture: &mut Option<egui::TextureHandle>,
+    texture_name: &str,
+) {
+    if texture_path.as_deref() == Some(path) && texture.is_some() {
+        return;
+    }
+
+    let Ok(img) = image::open(path) else {
+        *texture_path = None;
+        *texture = None;
+        return;
+    };
+    let rgba = img.to_rgba8();
+    let size = [rgba.width() as usize, rgba.height() as usize];
+    let color = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
+
+    match texture.as_mut() {
+        Some(handle) => handle.set(color, egui::TextureOptions::LINEAR),
+        None => {
+            *texture = Some(ui.ctx().load_texture(
+                texture_name,
+                color,
+                egui::TextureOptions::LINEAR,
+            ));
+        }
+    }
+    *texture_path = Some(path.to_string());
+}
+
+/// Largest factor a map texture may be scaled up beyond its native pixel
+/// size when filling the panel. Keeps the standard-resolution `map.png`
+/// basemap from going mushy on large windows while still letting it grow
+/// past the old fixed cap; the high-resolution `map2x.png` (twice the
+/// pixels) can therefore fill roughly twice the on-screen area at the same
+/// sharpness.
+const MAP_MAX_UPSCALE: f32 = 2.0;
+
+/// Compute the on-screen size for a map texture: scale to fit within
+/// `available` while preserving the texture's aspect ratio, but never
+/// upscale beyond `MAP_MAX_UPSCALE`× its native pixel size. Downscaling is
+/// always permitted so the map shrinks to fit a small panel.
+fn fit_map_size(tex_size: Vec2, available: Vec2) -> Vec2 {
+    if tex_size.x <= 0.0 || tex_size.y <= 0.0 {
+        return Vec2::ZERO;
+    }
+    let fit = (available.x / tex_size.x).min(available.y / tex_size.y);
+    let scale = fit.min(MAP_MAX_UPSCALE).max(0.0);
+    tex_size * scale
 }
 
 /// Render an integer-hour retention window as a compact human label

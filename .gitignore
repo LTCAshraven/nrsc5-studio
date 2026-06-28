@@ -52,3 +52,18 @@ nrsc5-*.log
 
 # Dev-only one-shot screenshot helper (mocks the album-art cache) -------
 scripts/seed-collage-mock.ps1
+
+# Local-only PNG basemap optimization tooling (kept on the dev box, not
+# shipped — used to regenerate / shrink the map basemaps by hand).
+scripts/png_lossless_opt.sh
+scripts/pngquant_sweep.sh
+scripts/png_reencode_test.py
+
+# High-resolution 2x map basemap. Distributed as a separate GitHub
+# Release asset rather than committed (~57 MB would bloat every clone
+# forever). Users drop it into res/ next to the exe; the app prefers it
+# over the standard, committed res/map.png when present.
+res/map2x.png
+
+# Scratch / working directory for regenerating the map basemaps locally.
+res/_newmaps/

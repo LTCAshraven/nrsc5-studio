@@ -1,3 +1,25 @@
+nrsc5-studio (0.6.3-1) unstable; urgency=medium
+
+  * HERE traffic & weather data-service support, alongside the existing
+    Total Traffic Network (TTN) feed: HERE traffic tiles stitch through
+    the shared map compositor and HERE weather images render into the
+    weather-radar animation, so stations using HERE now populate the
+    Traffic and Weather tabs
+  * New "Engineering Info - Decoder & RF Diagnostics" panel (RF/decoder
+    health, equipment, local-time/leap-second, live payload log), split
+    out from the Station Information panel
+  * Service-mode badge (MP1/MP3/MP11, plus AM MA1/MA3) now read from the
+    libnrsc5 SYNC PSMI telemetry instead of inferred from program slots
+  * Per-subchannel station logo display, persisted across tunes and
+    restarts via filename-encoded subchannel routing (closes #9)
+  * Optional high-resolution 2x map basemap (res/map2x.png) auto-detected
+    when present; distributed as a separate download, not packaged
+  * Resolution-independent map projection + traffic/weather cache replay
+    on launch
+  * Fixed: AAS scratch directory is pruned automatically (1 h retention)
+
+ -- LTCAshraven <ltcashraven@users.noreply.github.com>  Sun, 28 Jun 2026 10:00:00 +0000
+
 nrsc5-studio (0.6.2-1) unstable; urgency=medium
 
   * Per-program decoded audio bit rate in the Station Info panel,

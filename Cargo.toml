@@ -1,6 +1,6 @@
 [package]
 name = "nrsc5-studio"
-version = "0.6.2"
+version = "0.6.3"
 edition = "2021"
 authors = ["LTCAshraven"]
 license = "MIT"
@@ -179,7 +179,7 @@ assets = [
 
 [package.metadata.generate-rpm]
 license = "MIT"
-release = "2"
+release = "1"
 summary = "Native desktop receiver for HD Radio (NRSC-5) broadcasts"
 assets = [
     { source = "target/release/nrsc5-studio", dest = "/usr/bin/nrsc5-studio", mode = "755" },
