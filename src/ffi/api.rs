@@ -1445,4 +1445,283 @@ mod tests {
         assert_eq!(Mode::Fm.to_raw(), sys::NRSC5_MODE_FM);
         assert_eq!(Mode::Am.to_raw(), sys::NRSC5_MODE_AM);
     }
+
+    // -----------------------------------------------------------------
+    // Signal-quality / loss events
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn translates_ber() {
+        let (mut ctx, out) = capture();
+        let mut payload = zeroed_payload();
+        payload.ber = sys::nrsc5_event_ber { cber: 0.0125 };
+        dispatch(
+            sys::nrsc5_event_t {
+                event: sys::NRSC5_EVENT_BER,
+                payload,
+            },
+            &mut ctx,
+        );
+        let got = out.lock().unwrap();
+        assert_eq!(got.len(), 1);
+        match got[0] {
+            NrscEvent::Ber { cber } => assert!((cber - 0.0125).abs() < 1e-6),
+            ref other => panic!("expected Ber, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lost_device_event_signals_loss() {
+        // The hard signal-loss path: libnrsc5 reports the SDR vanished
+        // (USB unplug / backend error). Must surface as `LostDevice`
+        // so the app can tear down and re-arm the Start button.
+        let (mut ctx, out) = capture();
+        dispatch(
+            sys::nrsc5_event_t {
+                event: sys::NRSC5_EVENT_LOST_DEVICE,
+                payload: zeroed_payload(),
+            },
+            &mut ctx,
+        );
+        let got = out.lock().unwrap();
+        assert_eq!(got.len(), 1);
+        assert!(matches!(got[0], NrscEvent::LostDevice));
+    }
+
+    #[test]
+    fn lost_sync_event_signals_loss() {
+        // The soft signal-loss path: HD lock dropped (fading, antenna
+        // bump) but the device is still present. Surfaces as
+        // `LostSync` so the UI can clear the constellation/MER readout.
+        let (mut ctx, out) = capture();
+        dispatch(
+            sys::nrsc5_event_t {
+                event: sys::NRSC5_EVENT_LOST_SYNC,
+                payload: zeroed_payload(),
+            },
+            &mut ctx,
+        );
+        let got = out.lock().unwrap();
+        assert_eq!(got.len(), 1);
+        assert!(matches!(got[0], NrscEvent::LostSync));
+    }
+
+    // -----------------------------------------------------------------
+    // Empty / corrupt audio buffers (must never deref a bad pointer)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn empty_audio_buffer_does_not_invoke_sink() {
+        // count == 0 → the trampoline must not synthesize a
+        // zero-length slice or call the sink. Guards the `count > 0`
+        // half of the audio arm's safety check.
+        let calls: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+        let cnt = calls.clone();
+        let sink: PcmSink = Box::new(move |_, _| *cnt.lock().unwrap() += 1);
+        let mut ctx = CallbackCtx {
+            event_cb: None,
+            pcm_sink: Some(sink),
+            bitrate: BitrateAccum::default(),
+        };
+        let sample: [i16; 1] = [0];
+        let mut payload = zeroed_payload();
+        payload.audio = sys::nrsc5_event_audio {
+            program: 0,
+            data: sample.as_ptr(),
+            count: 0,
+        };
+        dispatch(
+            sys::nrsc5_event_t {
+                event: sys::NRSC5_EVENT_AUDIO,
+                payload,
+            },
+            &mut ctx,
+        );
+        assert_eq!(*calls.lock().unwrap(), 0, "sink must not fire on empty buffer");
+    }
+
+    #[test]
+    fn null_audio_data_does_not_invoke_sink() {
+        // A corrupt event whose `count` lies (> 0) while `data` is
+        // null must be rejected by the null guard, not dereferenced.
+        let calls: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+        let cnt = calls.clone();
+        let sink: PcmSink = Box::new(move |_, _| *cnt.lock().unwrap() += 1);
+        let mut ctx = CallbackCtx {
+            event_cb: None,
+            pcm_sink: Some(sink),
+            bitrate: BitrateAccum::default(),
+        };
+        let mut payload = zeroed_payload();
+        payload.audio = sys::nrsc5_event_audio {
+            program: 0,
+            data: ptr::null(),
+            count: 512,
+        };
+        dispatch(
+            sys::nrsc5_event_t {
+                event: sys::NRSC5_EVENT_AUDIO,
+                payload,
+            },
+            &mut ctx,
+        );
+        assert_eq!(*calls.lock().unwrap(), 0, "sink must not fire on null data");
+    }
+
+    // -----------------------------------------------------------------
+    // Error-handling surface (libnrsc5 returning non-zero)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn api_error_display_propagates_rc() {
+        // The fallible wrapper methods map libnrsc5's non-zero return
+        // codes to typed errors; the Display text must surface the rc
+        // so a failed open / set-frequency / pipe is diagnosable from
+        // the log without a debugger.
+        assert!(Nrsc5ApiError::OpenFailed(-3).to_string().contains("-3"));
+        assert!(Nrsc5ApiError::PipeFailed(7).to_string().contains('7'));
+        assert!(Nrsc5ApiError::SetFrequencyFailed(2).to_string().contains('2'));
+        assert!(Nrsc5ApiError::SetModeFailed(9).to_string().contains('9'));
+        let big = Nrsc5ApiError::PipeChunkTooLarge { len: 9_000_000_000 };
+        assert!(big.to_string().contains("9000000000"));
+    }
+
+    // -----------------------------------------------------------------
+    // Real-time streaming continuity
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn bitrate_emits_once_per_window_across_multiple_windows() {
+        // A long stream must produce a steady cadence of estimates —
+        // one per completed 32-frame window — rather than a single
+        // value or a runaway accumulation. Confirms the accumulator
+        // resets cleanly between windows.
+        let (mut ctx, out) = capture();
+        for _ in 0..(BITRATE_FRAME_WINDOW * 3) {
+            dispatch_hdc(&mut ctx, 0, 1024, true);
+        }
+        let got = out.lock().unwrap();
+        assert_eq!(got.len(), 3, "three full windows → three estimates");
+        for ev in got.iter() {
+            assert!(matches!(ev, NrscEvent::AudioBitRate { program: 0, .. }));
+        }
+    }
+
+    #[test]
+    fn normal_decode_flow_delivers_metadata_then_audio() {
+        // End-to-end happy path through one shared callback context,
+        // the way libnrsc5 drives it on its worker thread: lock
+        // acquired, song metadata + cover-art pointer, signal quality,
+        // a bit-rate window, then decoded PCM on the fast path.
+        let events: Arc<Mutex<Vec<NrscEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let pcm: Arc<Mutex<Vec<(u32, Vec<i16>)>>> = Arc::new(Mutex::new(Vec::new()));
+        let ev_out = events.clone();
+        let pcm_out = pcm.clone();
+        let mut ctx = CallbackCtx {
+            event_cb: Some(Box::new(move |e| ev_out.lock().unwrap().push(e))),
+            pcm_sink: Some(Box::new(move |p, s| pcm_out.lock().unwrap().push((p, s.to_vec())))),
+            bitrate: BitrateAccum::default(),
+        };
+
+        // 1. Sync (FM): -1 sentinels keep it FM-only (no SyncAm).
+        let mut p = zeroed_payload();
+        p.sync = sys::nrsc5_event_sync {
+            freq_offset: 0.5,
+            psmi: 1,
+            pli: -1,
+            hppi: -1,
+            aabi: -1,
+            rdbi: -1,
+        };
+        dispatch(
+            sys::nrsc5_event_t {
+                event: sys::NRSC5_EVENT_SYNC,
+                payload: p,
+            },
+            &mut ctx,
+        );
+
+        // 2. ID3: song metadata + cover-art (xhdr) pointer.
+        let title = CString::new("Track").unwrap();
+        let artist = CString::new("Artist").unwrap();
+        let album = CString::new("LP").unwrap();
+        let empty = CString::new("").unwrap();
+        let mut p = zeroed_payload();
+        p.id3 = sys::nrsc5_event_id3 {
+            program: 0,
+            title: title.as_ptr(),
+            artist: artist.as_ptr(),
+            album: album.as_ptr(),
+            genre: empty.as_ptr(),
+            ufid: sys::nrsc5_event_id3_ufid {
+                owner: ptr::null(),
+                id: ptr::null(),
+            },
+            xhdr: sys::nrsc5_event_id3_xhdr {
+                mime: sys::NRSC5_MIME_JPEG,
+                param: 0,
+                lot: 7,
+            },
+            comments: ptr::null_mut(),
+        };
+        dispatch(
+            sys::nrsc5_event_t {
+                event: sys::NRSC5_EVENT_ID3,
+                payload: p,
+            },
+            &mut ctx,
+        );
+
+        // 3. MER.
+        let mut p = zeroed_payload();
+        p.mer = sys::nrsc5_event_mer {
+            lower: 12.0,
+            upper: 13.0,
+        };
+        dispatch(
+            sys::nrsc5_event_t {
+                event: sys::NRSC5_EVENT_MER,
+                payload: p,
+            },
+            &mut ctx,
+        );
+
+        // 4. One full HDC window → exactly one AudioBitRate estimate.
+        for _ in 0..BITRATE_FRAME_WINDOW {
+            dispatch_hdc(&mut ctx, 0, 1024, true);
+        }
+
+        // 5. Decoded PCM for program 0 (fast path, not the event channel).
+        let samples: [i16; 4] = [5, -5, 6, -6];
+        let mut p = zeroed_payload();
+        p.audio = sys::nrsc5_event_audio {
+            program: 0,
+            data: samples.as_ptr(),
+            count: samples.len(),
+        };
+        dispatch(
+            sys::nrsc5_event_t {
+                event: sys::NRSC5_EVENT_AUDIO,
+                payload: p,
+            },
+            &mut ctx,
+        );
+
+        let evs = events.lock().unwrap();
+        assert_eq!(
+            evs.len(),
+            5,
+            "expected Sync, Metadata, Xhdr, Mer, AudioBitRate; got {evs:?}"
+        );
+        assert!(matches!(evs[0], NrscEvent::Sync { .. }));
+        assert!(matches!(evs[1], NrscEvent::Metadata { .. }));
+        assert!(matches!(evs[2], NrscEvent::Xhdr { .. }));
+        assert!(matches!(evs[3], NrscEvent::Mer { .. }));
+        assert!(matches!(evs[4], NrscEvent::AudioBitRate { program: 0, .. }));
+
+        let audio = pcm.lock().unwrap();
+        assert_eq!(audio.len(), 1);
+        assert_eq!(audio[0].0, 0);
+        assert_eq!(audio[0].1, vec![5i16, -5, 6, -6]);
+    }
 }

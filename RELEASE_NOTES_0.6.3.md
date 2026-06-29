@@ -45,9 +45,9 @@ Station Information panel:
   weather frame) as it arrives.
 
 With these diagnostics moved out, the **Station Information** panel is now a
-focused listener-facing identity view — call sign, slogan, message,
+focused listener-facing identity view. Call sign, slogan, message,
 per-subchannel logos, transmitter location, FCC ID, the subchannel line-up,
-and data services — with each block living in exactly one panel. (MER / BER
+and data services, with each block living in exactly one panel. (MER / BER
 intentionally stay visible in both the Engineering and Signal panels.)
 
 ### Optional high-resolution (2×) map basemap
@@ -78,7 +78,7 @@ of being inferred from the highest populated subchannel slot. AM tunes report
 their own service modes (`MA1` / `MA3`), and the tuned **carrier frequency
 offset (in Hz)** is now surfaced as raw telemetry in the Engineering panel.
 The old slot-count heuristic is kept only as a fallback for when the PSMI
-value isn't available.
+value isn't available. Credit to @Argilo for bringing that to my attention.
 
 ### Station logos, per subchannel and persisted (#9)
 

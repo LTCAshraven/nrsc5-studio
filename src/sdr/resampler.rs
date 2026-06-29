@@ -275,4 +275,51 @@ mod tests {
         assert_eq!(float_to_cu8(2.0), 255);
         assert_eq!(float_to_cu8(0.0), 128);
     }
+
+    /// CU8 conversion must stay well-defined on non-finite inputs — a
+    /// NaN or infinity from an upstream numerical glitch has to clamp
+    /// to a rail, never invoke UB through an out-of-range float cast.
+    #[test]
+    fn cu8_handles_non_finite() {
+        assert_eq!(float_to_cu8(f32::INFINITY), 255);
+        assert_eq!(float_to_cu8(f32::NEG_INFINITY), 0);
+        // clamp(NaN) stays NaN; the saturating `as u8` cast floors it to 0.
+        assert_eq!(float_to_cu8(f32::NAN), 0);
+    }
+
+    /// Empty input is a no-op: no output, no panic, buffers untouched.
+    #[test]
+    fn feed_empty_input_produces_no_output() {
+        let mut r = IqResampler::new(2_000_000.0, 1_488_375.0).unwrap();
+        let mut out = Vec::new();
+        r.feed(&[], &mut out);
+        assert!(out.is_empty());
+    }
+
+    /// A partial block (fewer than one chunk) must be buffered, not
+    /// emitted, until enough samples accumulate to fill a chunk.
+    #[test]
+    fn feed_sub_chunk_input_buffers_without_output() {
+        let mut r = IqResampler::new(2_000_000.0, 1_488_375.0).unwrap();
+        let input = vec![Complex::new(0.0_f32, 0.0_f32); CHUNK_FRAMES - 1];
+        let mut out = Vec::new();
+        r.feed(&input, &mut out);
+        assert!(out.is_empty(), "sub-chunk input must stay buffered");
+        // One more sample completes the chunk → output now flows.
+        r.feed(&[Complex::new(0.0, 0.0)], &mut out);
+        assert!(!out.is_empty(), "completing the chunk should emit output");
+        assert_eq!(out.len() % 2, 0, "CU8 output must be whole I/Q pairs");
+    }
+
+    /// Corrupt (non-finite) IQ must not panic or tear down the
+    /// resampler — `feed` drops the offending chunk and keeps the
+    /// stream alive. Any bytes emitted stay well-formed I/Q pairs.
+    #[test]
+    fn feed_corrupt_samples_does_not_panic() {
+        let mut r = IqResampler::new(2_000_000.0, 1_488_375.0).unwrap();
+        let input = vec![Complex::new(f32::NAN, f32::NAN); CHUNK_FRAMES * 2];
+        let mut out = Vec::new();
+        r.feed(&input, &mut out); // must not panic
+        assert_eq!(out.len() % 2, 0, "any emitted CU8 must be whole pairs");
+    }
 }

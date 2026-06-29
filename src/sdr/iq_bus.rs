@@ -432,4 +432,179 @@ mod tests {
         assert!(elapsed.as_millis() < 5, "drain_now took {elapsed:?}");
         assert!(rx.try_recv().is_err());
     }
+
+    // =================================================================
+    // Real-time streaming behaviour
+    // =================================================================
+
+    #[test]
+    fn publish_preserves_fifo_order() {
+        // The decoder relies on I/Q chunks arriving in the order the
+        // SDR produced them; a reorder would corrupt OFDM sync.
+        let bus = IqBus::new();
+        let rx = bus.subscribe(32);
+        for i in 0..10u8 {
+            bus.publish(&[i]);
+        }
+        for i in 0..10u8 {
+            let got = rx.recv_timeout(Duration::from_millis(50)).unwrap();
+            assert_eq!(&*got, &[i], "payloads must arrive in publish order");
+        }
+    }
+
+    #[test]
+    fn publish_empty_payload_delivers_empty_chunk() {
+        // A zero-length USB transfer is benign — it must round-trip as
+        // an empty `Arc<[u8]>`, never a panic or a swallowed delivery.
+        let bus = IqBus::new();
+        let rx = bus.subscribe(4);
+        bus.publish(&[]);
+        let got = rx.recv_timeout(Duration::from_millis(50)).unwrap();
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn slow_consumer_drops_while_fast_consumer_keeps_up() {
+        // Back-pressure isolation: a wedged decoder (never draining,
+        // capacity 1) must not throttle the SDR pump or starve the
+        // healthy spectrum tap running beside it.
+        let bus = IqBus::new();
+        let slow = bus.subscribe(1); // never drained
+        let fast = bus.subscribe(256); // drained below
+        for i in 0..100u8 {
+            // Must never block despite `slow` being permanently full.
+            bus.publish(&[i]);
+        }
+        let mut fast_got = 0;
+        while fast.try_recv().is_ok() {
+            fast_got += 1;
+        }
+        assert_eq!(fast_got, 100, "fast consumer should receive all 100");
+        let mut slow_got = 0;
+        while slow.try_recv().is_ok() {
+            slow_got += 1;
+        }
+        assert_eq!(slow_got, 1, "slow consumer is capacity-bounded → drops the rest");
+    }
+
+    // =================================================================
+    // Thread start/stop & teardown
+    // =================================================================
+
+    #[test]
+    fn shutdown_wakes_all_blocked_subscribers() {
+        // The bus's bulk shutdown is the app's single teardown lever:
+        // every blocked consumer thread must unblock with a RecvError
+        // so it can exit without a per-thread stop flag.
+        let bus = Arc::new(IqBus::new());
+        let mut handles = Vec::new();
+        for _ in 0..5 {
+            let rx = bus.subscribe(4);
+            handles.push(std::thread::spawn(move || rx.recv().is_err()));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+        bus.shutdown();
+        for h in handles {
+            assert!(
+                h.join().unwrap(),
+                "every blocked recv must return Err after shutdown"
+            );
+        }
+    }
+
+    #[test]
+    fn bus_reusable_after_shutdown() {
+        // start_piped builds a fresh bus per session, but shutdown must
+        // still leave the instance clean and re-subscribable (and be
+        // idempotent) rather than poisoned.
+        let bus = IqBus::new();
+        let rx1 = bus.subscribe(4);
+        bus.publish(&[1]);
+        assert_eq!(&*rx1.recv_timeout(Duration::from_millis(50)).unwrap(), &[1]);
+        bus.shutdown();
+        bus.shutdown(); // idempotent
+        assert_eq!(bus.subscriber_count(), 0);
+        // The old receiver is now disconnected.
+        assert!(rx1.recv().is_err());
+        // A fresh subscription works on the same bus instance.
+        let rx2 = bus.subscribe(4);
+        bus.publish(&[2]);
+        assert_eq!(&*rx2.recv_timeout(Duration::from_millis(50)).unwrap(), &[2]);
+    }
+
+    // =================================================================
+    // SDR signal loss
+    // =================================================================
+
+    #[test]
+    fn rms_dbfs_cu8_returns_none_when_disconnected_before_any_data() {
+        // SDR vanished before the first chunk arrived: the AGC
+        // pre-stage must get None (→ "stalled, back off"), never a
+        // bogus reading synthesized from zero samples.
+        let bus = IqBus::new();
+        let rx = bus.subscribe(4);
+        bus.shutdown(); // drop the sender → rx is disconnected
+        let got = rms_dbfs_cu8(&rx, 512, Duration::from_millis(50));
+        assert!(got.is_none(), "disconnect before data must yield None, got {got:?}");
+    }
+
+    // =================================================================
+    // Concurrency safety
+    // =================================================================
+
+    #[test]
+    fn concurrent_publish_and_subscribe_is_safe() {
+        // Stress the real producer/consumer race: one thread hammers
+        // publish while several consumers subscribe, drain, and drop
+        // concurrently. Asserts only timing-independent invariants —
+        // no panic, no deadlock, clean pruning afterwards.
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let bus = Arc::new(IqBus::new());
+        let stop = Arc::new(AtomicBool::new(false));
+        let received = Arc::new(AtomicUsize::new(0));
+
+        let prod_bus = Arc::clone(&bus);
+        let prod_stop = Arc::clone(&stop);
+        let producer = std::thread::spawn(move || {
+            let mut n: u64 = 0;
+            while !prod_stop.load(Ordering::Relaxed) {
+                prod_bus.publish(&n.to_le_bytes());
+                n += 1;
+            }
+            n
+        });
+
+        let mut consumers = Vec::new();
+        for _ in 0..4 {
+            let cbus = Arc::clone(&bus);
+            let crecv = Arc::clone(&received);
+            consumers.push(std::thread::spawn(move || {
+                let rx = cbus.subscribe(32);
+                let deadline = std::time::Instant::now() + Duration::from_millis(60);
+                while std::time::Instant::now() < deadline {
+                    if rx.recv_timeout(Duration::from_millis(5)).is_ok() {
+                        crecv.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                // rx dropped here → producer prunes it on next publish.
+            }));
+        }
+
+        for c in consumers {
+            c.join().expect("consumer thread panicked");
+        }
+        stop.store(true, Ordering::Relaxed);
+        let published = producer.join().expect("producer thread panicked");
+
+        assert!(published > 0, "producer published nothing");
+        assert!(
+            received.load(Ordering::Relaxed) > 0,
+            "no consumer received any payload"
+        );
+        // After every consumer dropped, one more publish prunes the
+        // stragglers; the bus must settle to zero live subscribers.
+        bus.publish(&[0]);
+        assert_eq!(bus.subscriber_count(), 0, "dead subscribers not pruned");
+    }
 }

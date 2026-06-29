@@ -4846,3 +4846,168 @@ fn default_dock_state() -> DockState<DockTab> {
         tree.split_below(NodeIndex::root(), 0.67, vec![DockTab::Collage]);
     ds
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // =================================================================
+    // Frequency-change state transition
+    //
+    // `snap_fm_tune_mhz` is the pure core of the retune path: every
+    // TuneMhz command runs the raw value through it before the app
+    // resets station state and spawns the background retune. These
+    // tests pin the band clamping and 200 kHz raster snapping.
+    // =================================================================
+
+    #[test]
+    fn snap_fm_tune_clamps_below_band() {
+        assert_eq!(snap_fm_tune_mhz(80.0), FM_TUNE_MIN_MHZ);
+        assert_eq!(snap_fm_tune_mhz(0.0), FM_TUNE_MIN_MHZ);
+        assert_eq!(snap_fm_tune_mhz(f32::NEG_INFINITY), FM_TUNE_MIN_MHZ);
+    }
+
+    #[test]
+    fn snap_fm_tune_clamps_above_band() {
+        assert_eq!(snap_fm_tune_mhz(120.0), FM_TUNE_MAX_MHZ);
+        assert_eq!(snap_fm_tune_mhz(f32::INFINITY), FM_TUNE_MAX_MHZ);
+    }
+
+    #[test]
+    fn snap_fm_tune_rounds_to_200khz_raster() {
+        // Off-grid inputs (well clear of x.5 ties) snap to the nearest
+        // odd-tenth channel; exact grid values pass through unchanged.
+        assert_eq!(snap_fm_tune_mhz(97.13), 97.1);
+        assert_eq!(snap_fm_tune_mhz(100.29), 100.3);
+        assert_eq!(snap_fm_tune_mhz(88.5), 88.5);
+        assert_eq!(snap_fm_tune_mhz(107.9), 107.9);
+    }
+
+    #[test]
+    fn snap_fm_tune_sweep_in_band_and_idempotent() {
+        // Property sweep: every output lands inside the band, and
+        // re-snapping a snapped value is a fixed point (the UI applies
+        // this repeatedly as the user nudges the dial).
+        let mut mhz = 70.0_f32;
+        while mhz < 130.0 {
+            let s = snap_fm_tune_mhz(mhz);
+            assert!(
+                (FM_TUNE_MIN_MHZ..=FM_TUNE_MAX_MHZ).contains(&s),
+                "{s} out of band for input {mhz}"
+            );
+            assert!(
+                (snap_fm_tune_mhz(s) - s).abs() < 1e-4,
+                "not idempotent at {mhz} (snapped {s})"
+            );
+            mhz += 0.01;
+        }
+    }
+
+    // =================================================================
+    // Gain-table snapping (apply-time correctness)
+    // =================================================================
+
+    #[test]
+    fn snap_to_gain_table_empty_returns_input() {
+        // Continuous-gain devices expose an empty table → no-op.
+        assert_eq!(snap_to_gain_table(123, &[]), 123);
+    }
+
+    #[test]
+    fn snap_to_gain_table_nearest_neighbor() {
+        let table = [0, 90, 140, 240, 480];
+        assert_eq!(snap_to_gain_table(240, &table), 240); // exact
+        assert_eq!(snap_to_gain_table(100, &table), 90); // nearer 90
+        assert_eq!(snap_to_gain_table(200, &table), 240); // nearer 240
+        assert_eq!(snap_to_gain_table(-50, &table), 0); // below min → first
+        assert_eq!(snap_to_gain_table(9999, &table), 480); // above max → last
+    }
+
+    #[test]
+    fn snap_to_gain_table_tie_prefers_earlier_entry() {
+        // The strict `<` comparison keeps the first (lower) candidate
+        // on an exact midpoint.
+        assert_eq!(snap_to_gain_table(150, &[100, 200]), 100);
+    }
+
+    #[test]
+    fn snap_to_gain_table_single_entry() {
+        assert_eq!(snap_to_gain_table(7, &[42]), 42);
+    }
+
+    // =================================================================
+    // Collage tile cap (hand-edited config robustness)
+    // =================================================================
+
+    fn cfg_with_tiles(n: u32) -> AppConfig {
+        AppConfig {
+            collage_max_tiles: n,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn collage_tile_cap_snaps_to_power_of_two() {
+        assert_eq!(collage_tile_cap(&cfg_with_tiles(100)), 128);
+        assert_eq!(collage_tile_cap(&cfg_with_tiles(64)), 64);
+        assert_eq!(collage_tile_cap(&cfg_with_tiles(3)), 4);
+    }
+
+    #[test]
+    fn collage_tile_cap_clamps_to_hard_max() {
+        assert_eq!(collage_tile_cap(&cfg_with_tiles(100_000)), ART_TILES_HARD_MAX);
+        assert_eq!(collage_tile_cap(&cfg_with_tiles(512)), 512);
+    }
+
+    #[test]
+    fn collage_tile_cap_floors_at_one() {
+        // 0 from a corrupt hand-edited config must not yield zero tiles.
+        assert_eq!(collage_tile_cap(&cfg_with_tiles(0)), 1);
+        assert_eq!(collage_tile_cap(&cfg_with_tiles(1)), 1);
+    }
+
+    // =================================================================
+    // Filename sanitization (recording subfolders)
+    // =================================================================
+
+    #[test]
+    fn sanitize_filename_empty_becomes_underscore() {
+        assert_eq!(sanitize_filename(""), "_");
+    }
+
+    #[test]
+    fn sanitize_filename_preserves_safe_chars() {
+        assert_eq!(sanitize_filename("KEXP-FM_90.3"), "KEXP-FM_90.3");
+    }
+
+    #[test]
+    fn sanitize_filename_replaces_unsafe_chars() {
+        assert_eq!(sanitize_filename("A/B\\C:D*E?"), "A_B_C_D_E_");
+        assert_eq!(sanitize_filename("hello world"), "hello_world");
+    }
+
+    #[test]
+    fn sanitize_filename_non_ascii_becomes_underscore() {
+        // Conservative ASCII-only policy: each non-ASCII scalar → one `_`.
+        assert_eq!(sanitize_filename("caf\u{00e9}"), "caf_");
+    }
+
+    // =================================================================
+    // HERE image-type labelling
+    // =================================================================
+
+    #[test]
+    fn here_image_type_label_maps_known_and_unknown() {
+        use crate::ffi::nrsc5_sys;
+        assert_eq!(
+            here_image_type_label(nrsc5_sys::NRSC5_HERE_IMAGE_TRAFFIC),
+            "traffic"
+        );
+        assert_eq!(
+            here_image_type_label(nrsc5_sys::NRSC5_HERE_IMAGE_WEATHER),
+            "weather"
+        );
+        assert_eq!(here_image_type_label(0), "other");
+        assert_eq!(here_image_type_label(999), "other");
+    }
+}

@@ -1931,3 +1931,43 @@ impl Drop for Nrsc5Process {
         self.stop();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The error surface the GUI relies on to react when libnrsc5 or
+    // the SDR backend fails: each variant must Display actionably and
+    // the `?`-lifting (`#[from]`) conversions must preserve the cause.
+
+    #[test]
+    fn invalid_program_error_displays_range() {
+        let s = Nrsc5Error::InvalidProgram(9).to_string();
+        assert!(s.contains('9'), "should name the bad program: {s}");
+        assert!(s.contains("0..=7"), "should state the valid range: {s}");
+    }
+
+    #[test]
+    fn not_started_error_is_actionable() {
+        // Surfaced when set_active_speaker / attach_recorder run before
+        // a successful start_piped — the message must point the caller
+        // at the fix.
+        let s = Nrsc5Error::NotStarted.to_string();
+        assert!(s.contains("start_piped"), "should name the prerequisite: {s}");
+    }
+
+    #[test]
+    fn api_error_lifts_into_process_error() {
+        // `?` on a fallible libnrsc5 call lifts the typed rc error into
+        // Nrsc5Error::Api without losing the rc in the Display chain.
+        let wrapped: Nrsc5Error = Nrsc5ApiError::PipeFailed(5).into();
+        assert!(matches!(wrapped, Nrsc5Error::Api(_)));
+        assert!(wrapped.to_string().contains('5'), "rc must survive: {wrapped}");
+    }
+
+    #[test]
+    fn sdr_error_lifts_into_process_error() {
+        let wrapped: Nrsc5Error = SdrError::AlreadyStreaming.into();
+        assert!(matches!(wrapped, Nrsc5Error::Sdr(_)));
+    }
+}
