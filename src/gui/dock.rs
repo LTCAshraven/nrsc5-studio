@@ -6,6 +6,105 @@ use egui_dock::TabViewer;
 use serde::{Deserialize, Serialize};
 use std::time::Instant;
 
+#[cfg(test)]
+mod tests {
+    use super::now_playing_rds_fallback_text;
+    use super::sis_header_logo_layout;
+    use crate::gui::state::ProgramRuntime;
+
+    #[test]
+    fn uses_rds_when_hd_metadata_is_empty() {
+        let slot = ProgramRuntime::default();
+        assert_eq!(
+            now_playing_rds_fallback_text(&slot, Some("WXYZ")),
+            Some("WXYZ".to_string())
+        );
+    }
+
+    #[test]
+    fn suppresses_rds_when_hd_metadata_is_present() {
+        let mut slot = ProgramRuntime::default();
+        slot.artist = "Artist".to_string();
+        assert_eq!(now_playing_rds_fallback_text(&slot, Some("WXYZ")), None);
+    }
+
+    #[test]
+    fn sis_header_stacks_below_breakpoint() {
+        let layout = sis_header_logo_layout(699.0);
+        assert!(layout.compact_header);
+    }
+
+    #[test]
+    fn sis_header_side_by_side_at_breakpoint() {
+        let layout = sis_header_logo_layout(700.0);
+        assert!(!layout.compact_header);
+    }
+
+    #[test]
+    fn sis_header_logo_clamps_to_min_size_on_tiny_width() {
+        let layout = sis_header_logo_layout(100.0);
+        assert!((layout.logo_size.x - 120.0).abs() < 0.01);
+        assert!((layout.logo_size.y - 52.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn sis_header_logo_uses_available_width_in_compact_mode() {
+        let layout = sis_header_logo_layout(200.0);
+        assert!(layout.compact_header);
+        assert!((layout.logo_size.x - 184.0).abs() < 0.01);
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SisHeaderLogoLayout {
+    compact_header: bool,
+    logo_col_width: f32,
+    logo_size: Vec2,
+}
+
+/// Compute responsive SIS header geometry for the logo/provenance lane.
+fn sis_header_logo_layout(header_width: f32) -> SisHeaderLogoLayout {
+    const LOGO_COL_MIN_WIDTH: f32 = 170.0;
+    const LOGO_COL_MAX_WIDTH: f32 = 236.0;
+    const LOGO_MAX_SIZE: Vec2 = Vec2::new(224.0, 80.0);
+    const HEADER_STACK_BREAKPOINT: f32 = 700.0;
+
+    let width = header_width.max(0.0);
+    let compact_header = width < HEADER_STACK_BREAKPOINT;
+    let logo_col_width = (width * 0.38).clamp(LOGO_COL_MIN_WIDTH, LOGO_COL_MAX_WIDTH);
+    let compact_logo_width = (width - 16.0).clamp(120.0, LOGO_MAX_SIZE.x);
+    let wide_logo_width = (logo_col_width - 12.0).clamp(120.0, LOGO_MAX_SIZE.x);
+    let logo_width = if compact_header {
+        compact_logo_width
+    } else {
+        wide_logo_width
+    };
+    let logo_height = (logo_width * (LOGO_MAX_SIZE.y / LOGO_MAX_SIZE.x)).clamp(52.0, LOGO_MAX_SIZE.y);
+
+    SisHeaderLogoLayout {
+        compact_header,
+        logo_col_width,
+        logo_size: Vec2::new(logo_width, logo_height),
+    }
+}
+
+fn now_playing_rds_fallback_text(
+    slot: &crate::gui::state::ProgramRuntime,
+    rds_program_service: Option<&str>,
+) -> Option<String> {
+    let has_hd_metadata = !slot.artist.is_empty()
+        || !slot.title.is_empty()
+        || !slot.album.is_empty()
+        || !slot.genre.is_empty();
+    if has_hd_metadata {
+        None
+    } else {
+        rds_program_service
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_string)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum UiCommand {
     Start,
@@ -62,6 +161,12 @@ pub enum UiCommand {
     /// R820T2 step at apply time. Persisted to config; takes effect on
     /// the next piped Start.
     SetManualGainTenths(i32),
+    /// Enable or disable the experimental analog-FM fallback path.
+    /// Persisted via `AppConfig::analog_fallback_enabled` and applied on
+    /// the next piped Start.
+    SetAnalogFallbackMode(crate::config::AnalogFallbackMode),
+    SetAnalogFallbackStereo(bool),
+    SetAnalogFallbackRdsEnabled(bool),
     /// v0.6.0 — override the amplitude pre-stage RMS target (dBFS).
     /// `None` clears the override and reverts to the per-device profile
     /// default. `Some(x)` is clamped to [−30, −10] on apply. Takes
@@ -200,14 +305,14 @@ impl DockTab {
     pub const ALL: [DockTab; 11] = [
         DockTab::Tuner,
         DockTab::NowPlaying,
-        DockTab::StationInfo,
-        DockTab::EngineeringInfo,
-        DockTab::Collage,
-        DockTab::Spectrum,
         DockTab::Signal,
-        DockTab::Constellation,
         DockTab::Traffic,
         DockTab::Weather,
+        DockTab::Collage,
+        DockTab::StationInfo,
+        DockTab::Spectrum,
+        DockTab::Constellation,
+        DockTab::EngineeringInfo,
         DockTab::Log,
     ];
 
@@ -733,6 +838,14 @@ impl DockViewer<'_> {
         // emitted Metadata most recently.
         let slot = self.app_state.active_program();
 
+        let rds_fallback_text = now_playing_rds_fallback_text(
+            slot,
+            self.app_state
+                .station_info
+                .rds_ticker_text()
+                .as_deref(),
+        );
+
         // Line 1: Artist (long station name OR song artist — changes with broadcast).
         if !slot.artist.is_empty() {
             ui.label(
@@ -754,7 +867,7 @@ impl DockViewer<'_> {
         // (Station identity line removed — the upcoming Station Information
         // panel (0.3.5) is the canonical surface for call sign / frequency /
         // subchannel. Avoids the stale-callsign bug here.)
-        ui.add_space(6.0);
+        ui.add_space(4.0);
 
         let image_path = match self.app_state.now_playing_image_mode {
             NowPlayingImageMode::StationLogo => self
@@ -801,6 +914,72 @@ impl DockViewer<'_> {
             };
             ui.label(RichText::new(waiting).color(dim));
         }
+
+        if let Some(rds) = rds_fallback_text {
+            ui.add_space(8.0);
+            // RDS-derived Artist/Title pops in statically once a field is
+            // confirmed rather than scrolling — the decode is discrete and
+            // a marquee here would fight the album-art layout.
+            ui.label(RichText::new(&rds).size(22.0).color(accent));
+        }
+    }
+
+    /// Full-width horizontal RDS ticker. The Program Service text always
+    /// scrolls right-to-left, entering from the right edge and looping
+    /// continuously (a second copy trails a fixed gap behind so the wrap
+    /// is seamless). Painting is clipped to the allocated strip, and a
+    /// repaint is requested each frame so the motion stays smooth.
+    fn rds_ticker(ui: &mut Ui, text: &str, color: Color32, font_size: f32, id_salt: &str) {
+        let font_id = egui::FontId::proportional(font_size);
+        // Bake a separator into the repeated string so each copy carries
+        // its own trailing "   |   ". The separator then scrolls along
+        // with the text and marks the wrap point between repeats, and its
+        // width doubles as the inter-copy gap.
+        let display = format!("{text}   |   ");
+        let galley = ui
+            .painter()
+            .layout_no_wrap(display, font_id, color);
+        let text_w = galley.size().x;
+        let text_h = galley.size().y;
+        let desired = Vec2::new(ui.available_width(), text_h + 8.0);
+        let (rect, _resp) = ui.allocate_exact_size(desired, egui::Sense::hover());
+        let painter = ui.painter_at(rect);
+        let y = rect.top() + (rect.height() - text_h) * 0.5;
+
+        // Scroll right-to-left as a continuous marquee: the message
+        // repeats back-to-back (the baked-in separator is the only gap),
+        // so the next copy starts re-entering from the right as soon as
+        // the previous one begins leaving the left — no waiting for the
+        // whole message to clear the strip first.
+        let period = text_w;
+        let speed = 32.0; // px/sec
+
+        // Advance a persistent offset by the frame delta instead of
+        // recomputing it from absolute time. Deriving the offset from
+        // `time % period` snaps the marquee whenever `period` changes
+        // (i.e. every time a new PS segment lengthens the text); a
+        // continuously-integrated offset stays smooth across those
+        // changes. Keyed by `id_salt` so multiple tickers are independent.
+        let id = ui.id().with(("rds_ticker", id_salt));
+        let dt = ui.input(|i| i.stable_dt).min(0.1);
+        let mut offset = ui.data(|d| d.get_temp::<f32>(id)).unwrap_or(0.0);
+        offset += dt * speed;
+        if period > 0.0 {
+            offset = offset.rem_euclid(period);
+        }
+        ui.data_mut(|d| d.insert_temp(id, offset));
+
+        // Draw as many repeating copies as needed to cover the full strip
+        // width. Start one period left of the first copy so a partial
+        // copy is always present on the left edge as the message wraps.
+        if period > 0.0 {
+            let mut x = rect.right() - offset - period;
+            while x < rect.right() {
+                painter.galley(egui::pos2(x, y), galley.clone(), color);
+                x += period;
+            }
+        }
+        ui.ctx().request_repaint();
     }
 
     /// Station Information panel. Two stacked tables:
@@ -1003,27 +1182,32 @@ impl DockViewer<'_> {
             ui.add_space(6.0);
         }
 
-        // Header row: the station identity text (call sign + PSMI badge,
-        // slogan, message) in a left column, with the per-subchannel
-        // station logo right-aligned beside it. Keeping the slogan/message
-        // inside the same column as the call sign — rather than below the
-        // row — stops the tall logo from pushing that text downward.
+        // Header row: station identity on the left, selected-program logo
+        // and provenance on the right.
         let logo_path = self
             .app_state
             .station_logo_paths
             .get(self.app_state.selected_program as usize)
             .and_then(|p| p.clone())
             .filter(|path| std::path::Path::new(path.as_str()).exists());
+        let logo_source = self
+            .app_state
+            .station_logo_sources
+            .get(self.app_state.selected_program as usize)
+            .and_then(|s| s.clone());
         let has_header = info.call_sign.is_some()
             || info.sync_psmi.is_some()
             || info.slogan.is_some()
             || info.message.is_some()
             || logo_path.is_some();
         if has_header {
-            // `horizontal_top` (not `horizontal`) so the tall logo doesn't
-            // vertically re-center the identity text; it stays pinned to the
-            // top of the row.
-            ui.horizontal_top(|ui| {
+            let header_width = ui.available_width();
+            let header_layout = sis_header_logo_layout(header_width);
+            let compact_header = header_layout.compact_header;
+            let logo_col_width = header_layout.logo_col_width;
+            let logo_size = header_layout.logo_size;
+
+            let render_identity = |ui: &mut Ui| {
                 ui.vertical(|ui| {
                     ui.horizontal(|ui| {
                         if let Some(call_sign) = info.call_sign.clone() {
@@ -1048,31 +1232,81 @@ impl DockViewer<'_> {
                         ui.label(RichText::new(message).color(dim));
                     }
                 });
+            };
 
-                if let Some(path) = logo_path {
-                    // Lay the logo out right-to-left within whatever width is
-                    // left over after the identity text. This right-aligns it
-                    // against the panel edge without a manual spacer, so it
-                    // never reflows or squeezes the text on the left.
+            let render_logo = |ui: &mut Ui, align: egui::Align| {
+                if let Some(path) = logo_path.as_ref() {
                     let uri = format!("file:///{}", path.replace('\\', "/"));
-                    ui.with_layout(
-                        egui::Layout::right_to_left(egui::Align::TOP),
-                        |ui| {
-                            egui::Frame::new()
-                                .fill(Color32::from_rgba_unmultiplied(255, 255, 255, 16))
-                                .corner_radius(egui::CornerRadius::same(4))
-                                .inner_margin(egui::Margin::symmetric(6, 4))
-                                .show(ui, |ui| {
-                                    ui.add(
-                                        egui::Image::new(&uri)
-                                            .fit_to_exact_size(Vec2::new(224.0, 80.0))
-                                            .corner_radius(3),
-                                    );
-                                });
-                        },
-                    );
+                    let src = logo_source.as_deref().unwrap_or("Unknown");
+                    ui.with_layout(egui::Layout::top_down(align), |ui| {
+                        ui.label(
+                            RichText::new(format!("Source: {src}"))
+                                .small()
+                                .color(muted),
+                        );
+                        ui.add_space(2.0);
+                        egui::Frame::new()
+                            .fill(Color32::from_rgba_unmultiplied(255, 255, 255, 16))
+                            .corner_radius(egui::CornerRadius::same(4))
+                            .inner_margin(egui::Margin::symmetric(6, 4))
+                            .show(ui, |ui| {
+                                ui.add(
+                                    egui::Image::new(&uri)
+                                        .fit_to_exact_size(logo_size)
+                                        .corner_radius(3),
+                                );
+                            });
+                    });
                 }
-            });
+            };
+
+            if compact_header {
+                // Narrow dock widths: stack the logo block below identity to
+                // avoid compressing call-sign/slogan text to unreadability.
+                render_identity(ui);
+                if logo_path.is_some() {
+                    ui.add_space(6.0);
+                    render_logo(ui, egui::Align::LEFT);
+                }
+            } else {
+                // Wide layouts: keep the logo/provenance lane pinned right.
+                ui.allocate_ui_with_layout(
+                    Vec2::new(header_width, 0.0),
+                    egui::Layout::left_to_right(egui::Align::TOP).with_main_justify(true),
+                    |ui| {
+                        render_identity(ui);
+                        if logo_path.is_some() {
+                            ui.allocate_ui_with_layout(
+                                Vec2::new(logo_col_width, 0.0),
+                                egui::Layout::top_down(egui::Align::RIGHT),
+                                |ui| {
+                                    render_logo(ui, egui::Align::RIGHT);
+                                },
+                            );
+                        }
+                    },
+                );
+            }
+        }
+
+        // Full-width scrolling RDS ticker (analog FM fallback Program
+        // Service). Driven by the accumulated segment history so
+        // dynamic-PS stations produce a continuous marquee across the
+        // whole panel instead of a static 8-char chip. Always shown when
+        // any PS text has been received, regardless of HD metadata.
+        if let Some(rds) = info.rds_ticker_text() {
+            ui.add_space(6.0);
+            egui::Frame::new()
+                .fill(Color32::from_rgba_unmultiplied(255, 255, 255, 12))
+                .corner_radius(egui::CornerRadius::same(4))
+                .inner_margin(egui::Margin::symmetric(8, 6))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("RDS").small().color(muted));
+                        ui.add_space(8.0);
+                        Self::rds_ticker(ui, &rds, dim, 15.0, "station_info");
+                    });
+                });
         }
 
         let has_identity_row = info.country.is_some()
@@ -2280,6 +2514,106 @@ impl DockViewer<'_> {
             ui.add_space(6.0);
         }
 
+        ui.separator();
+        let mut analog_fallback_mode = self.app_state.analog_fallback_mode;
+        let mut analog_fallback_stereo = self.app_state.analog_fallback_stereo;
+        let mut analog_fallback_rds_enabled = self.app_state.analog_fallback_rds_enabled;
+        let analog_audible = self.app_state.analog_fallback_mode.is_analog_audible();
+        // What's actually reaching the speakers depends on both sync *and*
+        // the fallback mode. In Analog Only the audio stays on the FM path
+        // even when HD locks (HD subchannels only feed metadata there), so
+        // sync alone can't decide the label.
+        let currently_synced = self.app_state.currently_synced;
+        let source_mode = self.app_state.analog_fallback_mode;
+        let mode_select_id = ui.make_persistent_id("mode_select_section");
+        egui::collapsing_header::CollapsingState::load_with_default_open(
+            ui.ctx(),
+            mode_select_id,
+            true,
+        )
+        .show_header(ui, |ui| {
+            ui.label(RichText::new("Mode Select").small().strong().color(dim));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let (source_text, source_color) = match source_mode {
+                    // Analog Only: always the FM path, regardless of HD sync.
+                    crate::config::AnalogFallbackMode::AnalogOnly => {
+                        ("Analog FM", Color32::from_rgb(200, 160, 50))
+                    }
+                    // Digital Only: HD when locked, otherwise nothing audible.
+                    crate::config::AnalogFallbackMode::DigitalOnly => {
+                        if currently_synced {
+                            ("HD Radio", Color32::from_rgb(60, 170, 90))
+                        } else {
+                            ("No Signal", Color32::from_rgb(200, 70, 70))
+                        }
+                    }
+                    // Automatic: HD once locked, analog fallback until then.
+                    crate::config::AnalogFallbackMode::Automatic => {
+                        if currently_synced {
+                            ("HD Radio", Color32::from_rgb(60, 170, 90))
+                        } else {
+                            ("Analog FM", Color32::from_rgb(200, 160, 50))
+                        }
+                    }
+                };
+                ui.label(RichText::new(source_text).small().strong().color(source_color));
+                ui.label(RichText::new("Current Source:").small().color(dim));
+            });
+        })
+        .body(|ui| {
+                // Mode row, centered.
+                ui.vertical_centered(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(
+                            &mut analog_fallback_mode,
+                            crate::config::AnalogFallbackMode::DigitalOnly,
+                            crate::config::AnalogFallbackMode::DigitalOnly.label(),
+                        );
+                        ui.selectable_value(
+                            &mut analog_fallback_mode,
+                            crate::config::AnalogFallbackMode::Automatic,
+                            crate::config::AnalogFallbackMode::Automatic.label(),
+                        );
+                        ui.selectable_value(
+                            &mut analog_fallback_mode,
+                            crate::config::AnalogFallbackMode::AnalogOnly,
+                            crate::config::AnalogFallbackMode::AnalogOnly.label(),
+                        );
+                    });
+                });
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Stereo FM").small().strong().color(dim));
+                    let stereo_response = ui.add_enabled(analog_audible, egui::RadioButton::new(analog_fallback_stereo, "Stereo"));
+                    let mono_response = ui.add_enabled(analog_audible, egui::RadioButton::new(!analog_fallback_stereo, "Mono"));
+                    if stereo_response.clicked() {
+                        analog_fallback_stereo = true;
+                    }
+                    if mono_response.clicked() {
+                        analog_fallback_stereo = false;
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("RDS").small().strong().color(dim));
+                    ui.add_enabled(
+                        analog_audible,
+                        egui::Checkbox::new(&mut analog_fallback_rds_enabled, "On"),
+                    );
+                });
+                ui.label(
+                    RichText::new("Choose how the analog FM fallback behaves when HD is unavailable. Stereo and RDS are only active when analog audio is audible.")
+                        .small()
+                        .color(dim),
+                );
+            });
+        if analog_fallback_mode != self.app_state.analog_fallback_mode {
+            self.commands.push(UiCommand::SetAnalogFallbackMode(analog_fallback_mode));
+        }
+        if analog_fallback_stereo != self.app_state.analog_fallback_stereo {
+            self.commands.push(UiCommand::SetAnalogFallbackStereo(analog_fallback_stereo));
+        }
+        if analog_fallback_rds_enabled != self.app_state.analog_fallback_rds_enabled {
+            self.commands.push(UiCommand::SetAnalogFallbackRdsEnabled(analog_fallback_rds_enabled));
+        }
         ui.separator();
         ui.label(
             RichText::new(format!("Status: {}", self.app_state.nrsc5_status))

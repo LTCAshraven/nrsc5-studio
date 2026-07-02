@@ -34,7 +34,7 @@ pub enum NrscEvent {
     /// for diagnostics/UI status.
     LostDeviceDetail(String),
     /// The nrsc5.exe child process closed its stdout pipe. Emitted from
-    /// the PCM pump on EOF / BrokenPipe â€” covers external `taskkill`,
+    /// the PCM pump on EOF / BrokenPipe — covers external `taskkill`,
     /// child crash, child clean exit, or our own `stop()` path. Handled
     /// idempotently in the app: if we still think we're streaming, tear
     /// down; if Stop already ran, ignore. Lets us detect a dead child
@@ -54,8 +54,8 @@ pub enum NrscEvent {
         #[allow(dead_code)] // surfaced for future per-program plumbing
         program: u32,
     },
-    /// Per-program audio bit rate from `Audio bit rate: 96.0 kbps â€¦`.
-    /// Emitted on every occurrence (not just the first â€”
+    /// Per-program audio bit rate from `Audio bit rate: 96.0 kbps …`.
+    /// Emitted on every occurrence (not just the first —
     /// `AudioStarted` carries the one-shot "audio is alive"
     /// signal). `program` is 0-indexed and matches the program
     /// nrsc5 was launched with, so it always corresponds to the
@@ -98,8 +98,13 @@ pub enum NrscEvent {
         /// (no accompanying ID3 XHDR) can only be recognized via this
         /// field.
         mime: u32,
+        /// Optional MIME type from the associated SIG component's
+        /// data metadata (`lot.component->data.mime`) when present.
+        /// Some broadcasters leave `lot.mime` generic but annotate
+        /// the component correctly.
+        lot_component_mime: Option<u32>,
     },
-    /// XHDR event â€” the album-art vs. station-logo distinction is
+    /// XHDR event — the album-art vs. station-logo distinction is
     /// carried by `mime` (`NRSC5_MIME_PRIMARY_IMAGE` = album art,
     /// `NRSC5_MIME_STATION_LOGO` = station logo), NOT by `param`.
     /// `param` is the upstream LOT-present flag (0 = a LOT id is
@@ -113,13 +118,18 @@ pub enum NrscEvent {
         lot: String,
     },
     StationName(String),
-    /// Long-form station identifier from `Slogan: â€¦`. Sent by SIS
+    /// Long-form station identifier from `Slogan: …`. Sent by SIS
     /// every few seconds while synced; receivers display it alongside
     /// the call sign.
     Slogan(String),
-    /// Free-text broadcaster message from `Message: â€¦`. Used for
-    /// promos, "now playing on HD2", etc. â€” distinct from `Alert:`.
+    /// Free-text broadcaster message from `Message: …`. Used for
+    /// promos, "now playing on HD2", etc. — distinct from `Alert:`.
     Message(String),
+    RdsProgramService(String),
+    /// RadioText (RDS group 2) decoded from the analog FM subcarrier.
+    /// The longer scrolling message field — song / artist / promo text —
+    /// distinct from the 8-character Program Service name.
+    RdsRadioText(String),
     /// Transmitter location from `Location: <lat>, <lon>, <alt> m`.
     /// `altitude_m` is height above mean sea level.
     Location {
@@ -134,7 +144,7 @@ pub enum NrscEvent {
         facility_id: u32,
     },
     /// Per-program descriptor from
-    /// `Audio program N: <MPS|SPSx>, type: <Music|Talk|â€¦>, sound experience: <Mono|Stereo|â€¦>`.
+    /// `Audio program N: <MPS|SPSx>, type: <Music|Talk|…>, sound experience: <Mono|Stereo|…>`.
     /// `number` is 1-indexed to match the wire format (HD1..HD8).
     AudioProgram {
         number: u32,
@@ -147,14 +157,14 @@ pub enum NrscEvent {
         number: u32,
         name: String,
     },
-    /// Non-audio data service from `SIG Service: type=data number=N name=â€¦`.
-    /// Inner `Component: â€¦` lines (mime, service_data_type) are not yet
-    /// captured â€” added when the panel needs them.
+    /// Non-audio data service from `SIG Service: type=data number=N name=…`.
+    /// Inner `Component: …` lines (mime, service_data_type) are not yet
+    /// captured — added when the panel needs them.
     SigServiceData {
         number: u32,
         name: String,
     },
-    /// Emergency alert text from `Alert: â€¦`. Empty alerts are dropped.
+    /// Emergency alert text from `Alert: …`. Empty alerts are dropped.
     EmergencyAlert {
         text: String,
     },
@@ -260,6 +270,8 @@ impl NrscEvent {
             Self::StationName(_) => "station-name",
             Self::Slogan(_) => "slogan",
             Self::Message(_) => "message",
+            Self::RdsProgramService(_) => "rds-program-service",
+            Self::RdsRadioText(_) => "rds-radio-text",
             Self::Location { .. } => "location",
             Self::CountryFcc { .. } => "country-fcc",
             Self::AudioProgram { .. } => "audio-program",
@@ -277,6 +289,20 @@ impl NrscEvent {
         }
     }
 }
+
+fn analog_fallback_runtime_enabled(
+    audio_sink_present: bool,
+    mode: crate::config::AnalogFallbackMode,
+) -> bool {
+    audio_sink_present && mode.is_analog_audible()
+}
+
+/// How long HD audio must be absent before the analog-FM fallback
+/// resumes feeding the sink. Long enough to ride through a brief HD
+/// dropout (a passing overpass, momentary fade) without flapping back
+/// to analog, short enough that a real loss of HD lock hands back to
+/// analog promptly.
+const HD_HANDOFF_WINDOW_MS: u64 = 600;
 
 // -- Errors -----------------------------------------------------------
 
@@ -308,7 +334,7 @@ pub enum Nrsc5Error {
 /// fresh process (or one that's only been stopped) can be retuned via
 /// [`Nrsc5Process::retune`] without the caller having to track state.
 /// The pre-0.5.0 `Usb` and `RtlTcp` variants were removed when the
-/// legacy start paths were retired â€” the in-process piped pipeline is
+/// legacy start paths were retired — the in-process piped pipeline is
 /// now the only way Start runs.
 #[derive(Debug, Clone)]
 enum LastStartMode {
@@ -338,6 +364,11 @@ pub struct Nrsc5Process {
     /// consumers (`stdin_thread` below; per-program decoders in
     /// Phase 3).
     iq_thread: Option<JoinHandle<()>>,
+    /// Optional analog-FM fallback consumer. When enabled, it listens
+    /// on the shared I/Q bus and feeds a mono demodulator into the
+    /// existing audio sink so the app can still produce audio even if
+    /// the HD decoder path is unavailable.
+    analog_thread: Option<JoinHandle<()>>,
     /// Fan-out bus that carries raw I/Q payloads from `iq_thread`
     /// (the one producer) to the nrsc5 stdin pump (Phase 2's single
     /// consumer) and, in Phase 3, to per-program decoder instances.
@@ -349,7 +380,7 @@ pub struct Nrsc5Process {
     /// startup (via `set_audio_sink`). When `Some`, `start_piped`
     /// will request PCM on stdout from `nrsc5.exe` (`-o -`) and feed
     /// it to this sink. When `None`, the piped path falls back to
-    /// `Stdio::null()` for stdout (audio is silently discarded â€”
+    /// `Stdio::null()` for stdout (audio is silently discarded —
     /// useful for headless testing).
     audio_sink: Option<crate::audio::AudioSink>,
     /// Long-lived speaker-routing thread spawned when an audio sink
@@ -359,6 +390,12 @@ pub struct Nrsc5Process {
     /// Phase 3 Chunk 2 wires this in for the single-decoder case;
     /// Chunk 3 makes `Nrsc5Process` a true multiplexer on top of it.
     speaker_router: Option<crate::audio::SpeakerRouter>,
+    /// Shared arbiter between the HD speaker path and the analog-FM
+    /// fallback. The `SpeakerRouter` stamps it whenever HD audio is
+    /// forwarded to the sink; the analog thread reads it to suppress
+    /// its own output while HD is live. Created once at startup and
+    /// shared (by clone) with both the router and each analog thread.
+    analog_handoff: crate::audio::AnalogHandoff,
     /// Program number whose decoded PCM is currently routed to the
     /// speakers. `Some` between `start_piped` and `stop`; `None`
     /// otherwise. Kept in sync with the router's own `active` state
@@ -367,9 +404,9 @@ pub struct Nrsc5Process {
     /// SDR backend for the active piped stream. `Some` between
     /// `start_piped` and `stop`; `None` otherwise.
     ///
-    /// The modern `librtlsdr.dll` (osmocom â‰¥ 2022-01) handles
+    /// The modern `librtlsdr.dll` (osmocom ≥ 2022-01) handles
     /// `rtlsdr_close` after `rtlsdr_cancel_async` cleanly, so we
-    /// open fresh on every Start and close fully on every Stop â€”
+    /// open fresh on every Start and close fully on every Stop —
     /// the LED on the dongle goes off, the USB device is released,
     /// and the next Start (or a switch to USB / rtl_tcp mode) gets
     /// a clean handle. Older bundled DLLs crashed on this path; see
@@ -426,6 +463,14 @@ pub struct Nrsc5Process {
     /// the first piped Start (which is fine — retune before any
     /// Start is a no-op anyway).
     last_agc_amp_target_dbfs_override: Option<f32>,
+    /// Analog-FM fallback mode for the current/last piped stream.
+    /// Preserved across `stop()` so [`retune`](Self::retune) reuses the
+    /// same user choice.
+    last_analog_fallback_mode: Option<crate::config::AnalogFallbackMode>,
+    /// Whether stereo decode is enabled for the current/last piped stream.
+    last_analog_fallback_stereo: Option<bool>,
+    /// Whether RDS decode is enabled for the current/last piped stream.
+    last_analog_fallback_rds_enabled: Option<bool>,
     /// Transport selection (local Soapy, SoapyRemote, native rtl_tcp)
     /// active for the current/last piped stream. Preserved across
     /// `stop()` so [`retune`](Self::retune) can re-open the same kind
@@ -512,7 +557,7 @@ fn agc_log_start(header: &str) {
 /// (matches the legacy librtlsdr convention from v0.2.x). Each device
 /// has a different physical knob the controller should drive: RTL-SDR
 /// has a single straight-gain `TUNER`, SDRplay has a `IFGR` (gain
-/// reduction â€” *lower* is more gain), HackRF has a stepped `LNA`.
+/// reduction — *lower* is more gain), HackRF has a stepped `LNA`.
 /// [`DeviceProfile`] encodes the per-driver mapping; this function is
 /// the single place that mapping is applied.
 ///
@@ -566,7 +611,7 @@ fn apply_agc_action(
             // expose. Either a profile bug or a driver version that
             // renamed it. Log once and let the caller no-op.
             eprintln!(
-                "[agc] driver={} doesn't expose element {} â€” AGC disabled \
+                "[agc] driver={} doesn't expose element {} — AGC disabled \
                  for this device. Elements present: {:?}",
                 profile.driver,
                 target,
@@ -619,9 +664,11 @@ impl Nrsc5Process {
         Ok(Self {
             session: None,
             iq_thread: None,
+            analog_thread: None,
             iq_bus: None,
             audio_sink: None,
             speaker_router: None,
+            analog_handoff: crate::audio::AnalogHandoff::new(),
             active_speaker: None,
             sdr: None,
             last_mode: None,
@@ -635,6 +682,9 @@ impl Nrsc5Process {
             last_ppm: None,
             last_antenna: None,
             last_agc_amp_target_dbfs_override: None,
+            last_analog_fallback_mode: None,
+            last_analog_fallback_stereo: None,
+            last_analog_fallback_rds_enabled: None,
             last_transport: SdrTransport::LocalSoapy,
             last_remote: None,
             last_frequency_mhz: None,
@@ -657,7 +707,7 @@ impl Nrsc5Process {
     /// (invoked with `-o -`) whenever a piped stream is active. Call
     /// once at app startup. When absent, the piped path runs with
     /// `Stdio::null()` on the child's stdout and produces no audio.
-    /// Only the piped path emits PCM through this sink â€” the legacy
+    /// Only the piped path emits PCM through this sink — the legacy
     /// `start()` (USB direct) and `start_rtltcp()` paths still let
     /// `nrsc5.exe` drive libao itself.
     ///
@@ -674,7 +724,10 @@ impl Nrsc5Process {
         if let Some(mut prev) = self.speaker_router.take() {
             prev.shutdown();
         }
-        self.speaker_router = Some(crate::audio::SpeakerRouter::spawn(sink.clone()));
+        self.speaker_router = Some(crate::audio::SpeakerRouter::spawn(
+            sink.clone(),
+            self.analog_handoff.clone(),
+        ));
         self.audio_sink = Some(sink);
     }
 
@@ -842,7 +895,7 @@ impl Nrsc5Process {
 
     /// Number of entries currently in the gain cache (fresh + stale).
     /// Surfaces in the Tools menu as a parenthetical so the user can
-    /// see whether "Clear gain cacheâ€¦" would do anything.
+    /// see whether "Clear gain cache…" would do anything.
     pub fn gain_cache_len(&self) -> usize {
         self.gain_cache.lock().map(|c| c.len()).unwrap_or(0)
     }
@@ -890,10 +943,22 @@ impl Nrsc5Process {
         }
     }
 
+    /// Feed OFDM sync state into the analog-fallback handoff gate so a
+    /// sync loss releases the sink back to analog and a re-sync lets
+    /// HD reclaim it. Called from the app's event drain each frame,
+    /// alongside `forward_event_to_agc`.
+    pub fn forward_event_to_handoff(&self, event: &NrscEvent) {
+        match event {
+            NrscEvent::Sync { .. } => self.analog_handoff.set_hd_synced(true),
+            NrscEvent::LostSync => self.analog_handoff.set_hd_synced(false),
+            _ => {}
+        }
+    }
+
     /// Apply a manual per-element gain on the live SDR if a piped
     /// stream is currently running. No-op when there's no active SDR
     /// (the change still survives in config and is applied on the
-    /// next Start). Returns `Ok(())` for the no-op case too â€” callers
+    /// next Start). Returns `Ok(())` for the no-op case too — callers
     /// don't need to distinguish "no stream running" from "applied".
     pub fn set_sdr_gain_element(
         &self,
@@ -911,12 +976,12 @@ impl Nrsc5Process {
     /// (`apply_agc_action`) so the value gets routed through the
     /// device profile's sign-flip / offset and clamped to the
     /// element's actual range. No-op when no piped stream is
-    /// running â€” callers can still safely poke this on Manual-mode
+    /// running — callers can still safely poke this on Manual-mode
     /// slider drags while idle; the value will be picked up at the
     /// next Start via the persisted `manual_gain_tenths`.
     ///
     /// Also updates `last_manual_gain_tenths` so the Tuner panel's
-    /// "(restart stream to apply)" hint stays in sync â€” without this,
+    /// "(restart stream to apply)" hint stays in sync — without this,
     /// dragging the slider while streaming would leave the hint stuck
     /// on even after the value matches the live device.
     pub fn set_manual_gain_tenths(&mut self, tenths: i32) -> Result<(), SdrError> {
@@ -944,7 +1009,7 @@ impl Nrsc5Process {
 
     /// Apply a frequency-correction PPM nudge to the live SDR. Same
     /// no-op-when-idle semantics as `set_sdr_gain_element`. Some
-    /// backends (SDRplay) silently ignore this â€” see their `Sdr`
+    /// backends (SDRplay) silently ignore this — see their `Sdr`
     /// trait impl for details.
     pub fn set_sdr_freq_correction_ppm(&self, ppm: f64) -> Result<(), SdrError> {
         match self.sdr.as_ref() {
@@ -954,7 +1019,7 @@ impl Nrsc5Process {
     }
 
     /// Snapshot the live SDR's reported gain elements. Returns an
-    /// empty `Vec` when no stream is running â€” the SDR Settings modal
+    /// empty `Vec` when no stream is running — the SDR Settings modal
     /// then falls back to an idle open-and-close to populate its
     /// sliders.
     pub fn sdr_gain_elements(&self) -> Vec<crate::sdr::GainElement> {
@@ -966,7 +1031,7 @@ impl Nrsc5Process {
 
     /// Names of every antenna input the live SDR exposes. Empty when
     /// no stream is running, or when the live device only has a single
-    /// (unnamed) input â€” the Tuner panel uses `len() > 1` as the gate
+    /// (unnamed) input — the Tuner panel uses `len() > 1` as the gate
     /// for showing its antenna dropdown.
     pub fn sdr_antennas(&self) -> Vec<String> {
         self.sdr
@@ -992,7 +1057,7 @@ impl Nrsc5Process {
 
     /// Short status label for the top bar. Reports the in-process
     /// libnrsc5 library version (lazy-loads the DLL on first call;
-    /// returns the empty string if the load fails â€” the GUI just
+    /// returns the empty string if the load fails — the GUI just
     /// shows "ready" without a version suffix in that case).
     pub fn version(&self) -> String {
         let v = Nrsc5Session::library_version();
@@ -1177,6 +1242,9 @@ impl Nrsc5Process {
         manual_gain_tenths: i32,
         antenna: Option<String>,
         agc_amp_target_dbfs_override: Option<f32>,
+        analog_fallback_mode: crate::config::AnalogFallbackMode,
+        analog_fallback_stereo: bool,
+        analog_fallback_rds_enabled: bool,
     ) -> Result<(), Nrsc5Error> {
         if (program as usize) >= MAX_PROGRAMS {
             return Err(Nrsc5Error::InvalidProgram(program));
@@ -1187,12 +1255,12 @@ impl Nrsc5Process {
         // Open + configure a fresh SDR for this stream. The initial
         // gain depends on which mode we're operating in:
         //
-        //   * `Auto`        â€” leave gain alone here; the AGC controller
+        //   * `Auto`        — leave gain alone here; the AGC controller
         //                    constructed below will set the starting
         //                    value via its own `initial_action`.
-        //   * `Manual`      â€” force manual gain mode at the user-chosen
+        //   * `Manual`      — force manual gain mode at the user-chosen
         //                    value. Snapping happens inside the SDR.
-        //   * `HardwareAgc` â€” leave gain alone so the R820T2's hardware
+        //   * `HardwareAgc` — leave gain alone so the R820T2's hardware
         //                    AGC stays in charge (librtlsdr's default).
         let initial_gain_tenths = match gain_mode {
             GainMode::Auto => None,
@@ -1200,10 +1268,10 @@ impl Nrsc5Process {
             GainMode::HardwareAgc => None,
         };
         // Pick the backend based on transport:
-        //   * LocalSoapy / SoapyRemote â†’ open via SoapySDR using the
+        //   * LocalSoapy / SoapyRemote → open via SoapySDR using the
         //     composed args string. For SoapyRemote the args already
         //     encode `driver=remote,remote=<host>:<port>`.
-        //   * RtlTcpRemote â†’ open a native TCP connection to an
+        //   * RtlTcpRemote → open a native TCP connection to an
         //     `rtl_tcp` server. Bypasses SoapySDR entirely so the
         //     remote machine doesn't need a SoapyRemote server.
         let sdr: Arc<dyn Sdr> = match transport {
@@ -1253,7 +1321,7 @@ impl Nrsc5Process {
         // wrap in `Arc<Mutex<_>>` so both the decoder's event callback
         // (tee for MER / Sync) and the AGC driver thread (tick + apply)
         // can share it. In `Manual` / `HardwareAgc` we leave these
-        // `None` and skip the driver thread entirely â€” the dongle's
+        // `None` and skip the driver thread entirely — the dongle's
         // gain is set once by `configure` above and never touched again
         // for this stream.
         //
@@ -1272,12 +1340,12 @@ impl Nrsc5Process {
             // sweet spot (19.7 dB); SDRplay and HackRF override it via
             // `default_agc_initial_tenths` so they land closer to their
             // own HD lock range on first tick. Each profile also
-            // picks the initial search direction â€” RTL-SDR walks
+            // picks the initial search direction — RTL-SDR walks
             // DOWN from 19.7 dB (over-clip caution), SDRplay walks UP
             // from 39 dB (HD sweet spot is above the start, not below).
             // v0.4.0 also wires the profile's coarse probe set into
             // the controller so the Coarse phase visits each family's
-            // middle-biased sweet-spot points before falling into Â±1
+            // middle-biased sweet-spot points before falling into ±1
             // Fine hill-climb around the winner.
             let mut agc_cfg = AgcConfig::default();
             agc_cfg.initial_tenths = profile.default_agc_initial_tenths;
@@ -1309,7 +1377,7 @@ impl Nrsc5Process {
             // default initial gain with the previously-settled value
             // and flips the controller into Fine-from-start so the
             // coarse search is skipped entirely (~3 s warm tune vs
-            // ~10â€“15 s cold). The trust-but-verify floor is set 3 dB
+            // ~10–15 s cold). The trust-but-verify floor is set 3 dB
             // below the previously-observed MER so a marginal
             // station doesn't get held to the production 18 dB
             // target it could never reach again.
@@ -1359,7 +1427,7 @@ impl Nrsc5Process {
                         false
                     }
                 },
-                Err(_) => false, // poisoned mutex â€” treat as cache miss
+                Err(_) => false, // poisoned mutex — treat as cache miss
             };
             let agc_ctrl = AgcController::new(
                 profile.agc_tenths_table,
@@ -1411,6 +1479,23 @@ impl Nrsc5Process {
         // through `self.tx` (events) or per-program rings (PCM).
         let session = self.spawn_session(&bus, frequency_mhz)?;
 
+        let analog_runtime_enabled = analog_fallback_runtime_enabled(
+            self.audio_sink.is_some(),
+            analog_fallback_mode,
+        );
+        let analog_rx = if analog_runtime_enabled {
+            Some(bus.subscribe(64))
+        } else {
+            None
+        };
+
+        let analog_sink = if analog_runtime_enabled {
+            self.audio_sink.clone()
+        } else {
+            None
+        };
+        let analog_enabled = analog_runtime_enabled;
+
         // I/Q source pump. Runs `run_stream`, feeds the spectrum tap,
         // and publishes raw bytes onto the bus. On exit (clean
         // cancel, USB unplug, etc.) calls `bus.shutdown()` so the
@@ -1419,6 +1504,7 @@ impl Nrsc5Process {
         let sdr_for_thread: Arc<dyn Sdr> = Arc::clone(&sdr);
         let bus_for_sdr = Arc::clone(&bus);
         let evt_tx = self.tx.clone();
+        let evt_tx_for_iq = evt_tx.clone();
         // Optional FFT tap clone for the Spectrum panel. `None` when the
         // GUI side hasn't installed one (e.g. headless test builds).
         let spectrum_tap = self.spectrum_tap.clone();
@@ -1427,7 +1513,7 @@ impl Nrsc5Process {
         }
         let iq_thread = std::thread::spawn(move || {
             let run_res = sdr_for_thread.run_stream(&mut |bytes| {
-                // Spectrum tap first â€” it's cheap (and internally
+                // Spectrum tap first — it's cheap (and internally
                 // throttled) and we want the panel to keep updating
                 // regardless of any consumer back-pressure on the bus.
                 if let Some(tap) = spectrum_tap.as_ref() {
@@ -1455,8 +1541,8 @@ impl Nrsc5Process {
                 // etc. Cheap diagnostic; only fires on actual
                 // backend failure, not on user Stop.
                 eprintln!("[sdr] run_stream failed: {e}");
-                let _ = evt_tx.send(NrscEvent::LostDevice);
-                let _ = evt_tx.send(NrscEvent::LostDeviceDetail(e.to_string()));
+                let _ = evt_tx_for_iq.send(NrscEvent::LostDevice);
+                let _ = evt_tx_for_iq.send(NrscEvent::LostDeviceDetail(e.to_string()));
             }
         });
 
@@ -1487,8 +1573,112 @@ impl Nrsc5Process {
             self.active_speaker = Some(program);
         }
 
+        // Configure the analog/HD handoff gate for this tune. This runs
+        // for *every* fallback mode — including Digital Only, where no
+        // analog thread is spawned — because the speaker router's
+        // `hd_output_allowed()` check keys off these flags to decide
+        // whether HD PCM may reach the sink. Skipping it in Digital
+        // Only left a stale `analog_only = true` from a prior Analog
+        // Only session, which silently blocked all HD audio until an
+        // analog-audible mode ran and cleared it.
+        //
+        // Fresh tune: clear any HD-audio history so analog plays
+        // immediately until the HD decoder locks. `set_analog_only`
+        // gates HD off only in the AnalogOnly mode. The AGC-ready gate
+        // holds the handoff through the closed-loop AGC search in Auto
+        // (the driver thread flips it true on settle/bail); Manual /
+        // Hardware-AGC have no search, so they're ready to hand over as
+        // soon as HD audio appears.
+        self.analog_handoff.reset();
+        self.analog_handoff
+            .set_analog_only(analog_fallback_mode == crate::config::AnalogFallbackMode::AnalogOnly);
+        self.analog_handoff
+            .set_agc_ready(gain_mode != GainMode::Auto);
+
+        let analog_thread = if analog_enabled {
+            if let Some(rx) = analog_rx {
+                if let Some(sink) = analog_sink {
+                    let handoff = self.analog_handoff.clone();
+                    let evt_tx_for_analog = evt_tx.clone();
+                    let analog_mode = analog_fallback_mode;
+                    let analog_stereo = analog_fallback_stereo;
+                    let analog_rds_enabled = analog_fallback_rds_enabled;
+                    Some(std::thread::spawn(move || {
+                        let mut demod = crate::dsp::FmDemod::new();
+                        demod.set_stereo_enabled(analog_stereo);
+                        demod.set_rds_enabled(analog_rds_enabled);
+                        let mut batch = Vec::with_capacity(2048);
+                        let mut last_ps: Option<String> = None;
+                        let mut last_rt: Option<String> = None;
+                        loop {
+                            match rx.recv() {
+                                Ok(payload) => {
+                                    // The speaker router forwards HD
+                                    // PCM (and stamps the handoff) only
+                                    // while HD is allowed to own the
+                                    // sink -- the AGC is trustworthy AND
+                                    // the decoder is locked. So a recent
+                                    // stamp means HD genuinely owns the
+                                    // sink; keep demodulating to stay
+                                    // warm but drop our output. Analog
+                                    // resumes once HD has been silent for
+                                    // the handoff window (AGC still
+                                    // searching, or sync lost).
+                                    let hd_owns = if analog_mode == crate::config::AnalogFallbackMode::AnalogOnly {
+                                        false
+                                    } else {
+                                        handoff.suppress_analog(HD_HANDOFF_WINDOW_MS)
+                                    };
+                                    for pair in payload.chunks_exact(2) {
+                                        let i = (pair[0] as f32 - 127.5) / 127.5;
+                                        let q = (pair[1] as f32 - 127.5) / 127.5;
+                                        if let Some([l, r]) = demod.push_complex(i, q) {
+                                            if let Some(ps) = demod.take_rds_program_service() {
+                                                if last_ps.as_deref() != Some(ps.as_str()) {
+                                                    last_ps = Some(ps.clone());
+                                                    let _ = evt_tx_for_analog.send(NrscEvent::RdsProgramService(ps));
+                                                }
+                                            }
+                                            if let Some(rt) = demod.take_rds_radiotext() {
+                                                if last_rt.as_deref() != Some(rt.as_str()) {
+                                                    last_rt = Some(rt.clone());
+                                                    let _ = evt_tx_for_analog.send(NrscEvent::RdsRadioText(rt));
+                                                }
+                                            }
+                                            if !hd_owns {
+                                                batch.push(l);
+                                                batch.push(r);
+                                                if batch.len() >= 2048 {
+                                                    sink.push(&batch);
+                                                    batch.clear();
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if hd_owns {
+                                        batch.clear();
+                                    } else if !batch.is_empty() {
+                                        sink.push(&batch);
+                                        batch.clear();
+                                    }
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                    }))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         self.session = Some(session);
         self.iq_thread = Some(iq_thread);
+        self.analog_thread = analog_thread;
         self.iq_bus = Some(bus);
         self.sdr = Some(sdr);
         self.last_mode = Some(LastStartMode::Piped);
@@ -1501,13 +1691,16 @@ impl Nrsc5Process {
         self.last_remote = remote.map(|(h, p)| (h.to_string(), p));
         self.last_frequency_mhz = Some(frequency_mhz);
         self.last_agc_amp_target_dbfs_override = agc_amp_target_dbfs_override;
+        self.last_analog_fallback_mode = Some(analog_fallback_mode);
+        self.last_analog_fallback_stereo = Some(analog_fallback_stereo);
+        self.last_analog_fallback_rds_enabled = Some(analog_fallback_rds_enabled);
 
         // ----- AGC driver thread (only when AGC is active) ----------
         // Ticks the controller every ~500 ms and applies any gain
         // change it asks for via the shared SDR Arc. Sends an
         // `AgcDecision` event so the UI's "last changed" timestamp
         // matches the moment of the real FFI call. Skipped entirely in
-        // `Manual` / `HardwareAgc` modes â€” there's no controller to
+        // `Manual` / `HardwareAgc` modes — there's no controller to
         // tick and no decisions to apply.
         if let Some(agc) = agc {
             let agc_for_driver = Arc::clone(&agc);
@@ -1535,6 +1728,11 @@ impl Nrsc5Process {
                 ppm_correction as f32,
             );
             let cache_path_for_driver = crate::paths::gain_cache_path();
+            // Analog handoff gate. The driver flips it `true` on the
+            // Probing -> Settled (or -> Bailed) edge so the analog
+            // fallback hands the sink to HD only after the gain has
+            // converged, not mid-search.
+            let handoff_for_agc = self.analog_handoff.clone();
             // v0.6.0: subscribe to the I/Q bus for the amplitude
             // pre-stage. The driver thread reads cu8 chunks to
             // measure RMS dBFS between probes. Capacity is small
@@ -1673,13 +1871,13 @@ impl Nrsc5Process {
                             let snap = ctrl.snapshot();
                             (action, snap)
                         }
-                        Err(_) => break, // mutex poisoned â€” give up gracefully
+                        Err(_) => break, // mutex poisoned — give up gracefully
                     };
                     if let Some(action) = action {
                         // Phase 2c: per-action trace. Mirrored to
                         // stderr (for the rare case the user got
                         // stdio attached) and to the AGC log file
-                        // (the reliable channel â€” read with
+                        // (the reliable channel — read with
                         // `Get-Content -Wait %LOCALAPPDATA%\nrsc5-studio\agc-trace.log`).
                         let best_str = snap
                             .best_mer
@@ -1716,6 +1914,9 @@ impl Nrsc5Process {
                     if prev_status != AgcStatus::Settled
                         && snap.status == AgcStatus::Settled
                     {
+                        // Gain has converged — let the analog fallback
+                        // hand the sink over to HD from here on.
+                        handoff_for_agc.set_agc_ready(true);
                         if let Some(mer) = snap.best_mer {
                             let entry = GainCacheEntry {
                                 gain_tenths: snap.current_tenths,
@@ -1748,6 +1949,12 @@ impl Nrsc5Process {
                     } else if prev_status == AgcStatus::Probing
                         && snap.status == AgcStatus::Bailed
                     {
+                        // AGC gave up; gain is restored to the
+                        // best-known value. Release the handoff gate
+                        // so HD can still take over if it locks — we
+                        // can't hold analog hostage on a search that
+                        // will never settle.
+                        handoff_for_agc.set_agc_ready(true);
                         let msg = format!(
                             "[agc] BAILED — gain restored to {:.1} dB (idx {}, best MER {})",
                             snap.current_tenths as f32 / 10.0,
@@ -1771,13 +1978,13 @@ impl Nrsc5Process {
 
     /// Stop the active stream (regardless of mode).
     ///
-    /// For piped mode this fully releases the SDR â€” the LED on the
+    /// For piped mode this fully releases the SDR — the LED on the
     /// dongle goes off, the USB device is unclaimed, and the next
     /// Start (or a switch to USB / rtl_tcp) starts from scratch. For
     /// the legacy USB and rtl_tcp paths this is a no-op for the SDR
     /// state (nrsc5 owns it directly there).
     pub fn stop(&mut self) {
-        // Signal the AGC driver thread to stop first â€” it borrows the
+        // Signal the AGC driver thread to stop first — it borrows the
         // SDR Arc and we want it joined before we drop the SDR below.
         if let Some(flag) = self.agc_stop.as_ref() {
             flag.store(true, Ordering::Relaxed);
@@ -1797,9 +2004,12 @@ impl Nrsc5Process {
         // Join the I/Q source pump first. `cancel_stream` above made
         // `run_stream` return; on exit the source thread already
         // called `bus.shutdown()`, which drops every subscriber's
-        // `Sender` â€” so the stdin pump (joined next) and any Phase 3
+        // `Sender` — so the stdin pump (joined next) and any Phase 3
         // decoders will wake from `recv` with `Err(RecvError)`.
         if let Some(handle) = self.iq_thread.take() {
+            let _ = handle.join();
+        }
+        if let Some(handle) = self.analog_thread.take() {
             let _ = handle.join();
         }
         // Tear down the per-tune session. The shared SDR pump above
@@ -1854,12 +2064,12 @@ impl Nrsc5Process {
             if let Some(sink) = self.audio_sink.as_ref() {
                 sink.clear();
             }
-        }        // Drop the SDR last â€” all Arc clones (the one held by
+        }        // Drop the SDR last — all Arc clones (the one held by
         // iq_thread is already gone) are released, refcount hits zero,
         // and `RtlSdr::Drop` runs `rtlsdr_close`. Safe on the modern
-        // osmocom librtlsdr.dll (â‰¥ 2022-01).
+        // osmocom librtlsdr.dll (≥ 2022-01).
         self.sdr = None;
-        // Clear AGC handles last â€” all references (driver thread,
+        // Clear AGC handles last — all references (driver thread,
         // decoder event-callback tee) are gone by this point.
         self.agc = None;
         self.agc_stop = None;
@@ -1872,7 +2082,7 @@ impl Nrsc5Process {
     /// site.
     ///
     /// If `start_piped` has never been called (no `last_mode`), this is
-    /// a no-op that returns `Ok(())` â€” historically the caller would
+    /// a no-op that returns `Ok(())` — historically the caller would
     /// fall back to a USB-direct start here, but that legacy path was
     /// removed in the 0.5.0 transport cleanup. The GUI guarantees a
     /// `start_piped` precedes any retune.
@@ -1908,6 +2118,9 @@ impl Nrsc5Process {
                 let transport = self.last_transport;
                 let remote = self.last_remote.clone();
                 let amp_override = self.last_agc_amp_target_dbfs_override;
+                let analog_mode = self.last_analog_fallback_mode.unwrap_or_default();
+                let analog_stereo = self.last_analog_fallback_stereo.unwrap_or(true);
+                let analog_rds_enabled = self.last_analog_fallback_rds_enabled.unwrap_or(true);
                 self.start_piped(
                     frequency_mhz,
                     program,
@@ -1919,6 +2132,9 @@ impl Nrsc5Process {
                     manual,
                     antenna,
                     amp_override,
+                    analog_mode,
+                    analog_stereo,
+                    analog_rds_enabled,
                 )
             }
             None => Ok(()),
@@ -1969,5 +2185,25 @@ mod tests {
     fn sdr_error_lifts_into_process_error() {
         let wrapped: Nrsc5Error = SdrError::AlreadyStreaming.into();
         assert!(matches!(wrapped, Nrsc5Error::Sdr(_)));
+    }
+
+    #[test]
+    fn analog_fallback_runtime_gate_requires_sink_and_non_digital_mode() {
+        assert!(!analog_fallback_runtime_enabled(
+            false,
+            crate::config::AnalogFallbackMode::Automatic
+        ));
+        assert!(!analog_fallback_runtime_enabled(
+            true,
+            crate::config::AnalogFallbackMode::DigitalOnly
+        ));
+        assert!(analog_fallback_runtime_enabled(
+            true,
+            crate::config::AnalogFallbackMode::Automatic
+        ));
+        assert!(analog_fallback_runtime_enabled(
+            true,
+            crate::config::AnalogFallbackMode::AnalogOnly
+        ));
     }
 }

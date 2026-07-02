@@ -44,6 +44,39 @@ pub enum GainMode {
     HardwareAgc,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AnalogFallbackMode {
+    /// Never route the analog FM demod to the speakers. This is the
+    /// DXer / silence-as-cue mode.
+    DigitalOnly,
+    /// Use the full HD → analog ladder: HD audio while synced, then
+    /// analog stereo, then mono, then squelch.
+    Automatic,
+    /// Force the analog-FM demod to own the audio sink and ignore HD.
+    AnalogOnly,
+}
+
+impl Default for AnalogFallbackMode {
+    fn default() -> Self {
+        Self::DigitalOnly
+    }
+}
+
+impl AnalogFallbackMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::DigitalOnly => "Digital Only",
+            Self::Automatic => "Automatic",
+            Self::AnalogOnly => "Analog Only",
+        }
+    }
+
+    pub fn is_analog_audible(self) -> bool {
+        !matches!(self, Self::DigitalOnly)
+    }
+}
+
 /// Phase 4 — Opus 96 kbps recording mode. Persisted so the user's
 /// choice survives across sessions. Chunk 4.3 wires Off and
 /// Continuous; Chunk 4.4 adds the PerSong PSD-split logic on top of
@@ -205,6 +238,23 @@ pub struct AppConfig {
     /// on some compositor/window-manager combinations.
     #[serde(default = "default_collage_secondary_click_fallback")]
     pub collage_secondary_click_fallback: bool,
+    /// Analog-FM fallback source selection. `DigitalOnly` keeps the analog
+    /// path silent, `Automatic` uses the HD → analog ladder, and
+    /// `AnalogOnly` forces the analog demod to own the sink.
+    #[serde(default)]
+    pub analog_fallback_mode: AnalogFallbackMode,
+    /// When true, the analog path decodes stereo width and blends into
+    /// stereo audio when the pilot is strong. False forces mono output.
+    #[serde(default = "default_true")]
+    pub analog_fallback_stereo: bool,
+    /// When true, the analog path decodes the 57 kHz RDS subcarrier and
+    /// surfaces Program Service text in the UI.
+    #[serde(default = "default_true")]
+    pub analog_fallback_rds_enabled: bool,
+    /// Legacy flag kept only for config migration from the old boolean
+    /// surface. The new `analog_fallback_mode` drives runtime behavior.
+    #[serde(default, skip_serializing)]
+    pub analog_fallback_enabled: bool,
 }
 
 /// SoapySDR-keyed configuration for the v0.3.0 in-process backend.
@@ -454,6 +504,10 @@ impl Default for AppConfig {
             art_blocklist: Vec::new(),
             collage_secondary_click_fallback:
                 default_collage_secondary_click_fallback(),
+            analog_fallback_mode: AnalogFallbackMode::default(),
+            analog_fallback_stereo: true,
+            analog_fallback_rds_enabled: true,
+            analog_fallback_enabled: false,
         }
     }
 }
@@ -487,6 +541,9 @@ pub fn load_config() -> AppConfig {
 fn sanitize(cfg: &mut AppConfig) {
     cfg.play_log_retention_hours =
         crate::play_log::clamp_retention(cfg.play_log_retention_hours);
+    if cfg.analog_fallback_enabled && cfg.analog_fallback_mode == AnalogFallbackMode::default() {
+        cfg.analog_fallback_mode = AnalogFallbackMode::Automatic;
+    }
     migrate_legacy_sdr(cfg);
 }
 
@@ -665,6 +722,24 @@ mod tests {
             !raw.contains("rtl_tcp_port"),
             "rtl_tcp_port must not round-trip; raw was:\n{raw}"
         );
+    }
+
+    #[test]
+    fn analog_fallback_mode_round_trips_through_toml() {
+        let mut cfg = AppConfig::default();
+        cfg.analog_fallback_mode = AnalogFallbackMode::AnalogOnly;
+        cfg.analog_fallback_stereo = false;
+        cfg.analog_fallback_rds_enabled = false;
+
+        let raw = toml::to_string_pretty(&cfg).expect("serialize config");
+        assert!(raw.contains("analog_fallback_mode = \"analog_only\""));
+        assert!(raw.contains("analog_fallback_stereo = false"));
+        assert!(raw.contains("analog_fallback_rds_enabled = false"));
+
+        let decoded: AppConfig = toml::from_str(&raw).expect("deserialize config");
+        assert_eq!(decoded.analog_fallback_mode, AnalogFallbackMode::AnalogOnly);
+        assert!(!decoded.analog_fallback_stereo);
+        assert!(!decoded.analog_fallback_rds_enabled);
     }
 
     #[test]

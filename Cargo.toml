@@ -8,6 +8,10 @@ description = "Native desktop receiver for HD Radio (NRSC-5) broadcasts with an 
 repository = "https://github.com/LTCAshraven/nrsc5-studio"
 readme = "README.md"
 
+[features]
+default = ["analog-fallback"]
+analog-fallback = []
+
 [dependencies]
 anyhow = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }

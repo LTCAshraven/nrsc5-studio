@@ -523,6 +523,19 @@ unsafe fn translate_event(
             } else {
                 unsafe { slice::from_raw_parts(lot.data, lot.size as usize) }.to_vec()
             };
+            let lot_component_mime = if lot.component.is_null() {
+                None
+            } else {
+                // SAFETY: `lot.component` is non-null for this branch and
+                // valid for the lifetime of this callback.
+                let component = unsafe { &*lot.component };
+                if component.type_ == sys::NRSC5_SIG_COMPONENT_DATA {
+                    // SAFETY: union variant matches `type_`.
+                    Some(unsafe { component.variant.data.mime })
+                } else {
+                    None
+                }
+            };
             // Phase 2 placeholder: program=0. The per-decoder event
             // callback in `Nrsc5Process::spawn_decoder` rewrites this
             // to the right subchannel; Phase 5 (multi-program decode)
@@ -533,6 +546,7 @@ unsafe fn translate_event(
                 name: unsafe { cstr_to_string(lot.name) },
                 data,
                 mime: lot.mime,
+                lot_component_mime,
             });
         }
         sys::NRSC5_EVENT_SIS => {
@@ -1200,12 +1214,69 @@ mod tests {
                 data,
                 program,
                 mime,
+                lot_component_mime,
             } => {
                 assert_eq!(lot, "123");
                 assert_eq!(name, "123_cover.jpg");
                 assert_eq!(*program, 0); // api.rs hardcodes 0; rewritten by mod.rs.
                 assert_eq!(data, &bytes);
                 assert_eq!(*mime, sys::NRSC5_MIME_JPEG);
+                assert_eq!(*lot_component_mime, None);
+            }
+            other => panic!("expected LotFile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lot_event_reads_component_data_mime() {
+        let (mut ctx, out) = capture();
+        let name = CString::new("logo.png").unwrap();
+        let bytes: Vec<u8> = vec![0x89, b'P', b'N', b'G'];
+        let mut component = sys::nrsc5_sig_component_t {
+            next: ptr::null_mut(),
+            type_: sys::NRSC5_SIG_COMPONENT_DATA,
+            id: 7,
+            variant: sys::nrsc5_sig_component_variant {
+                data: sys::nrsc5_sig_component_data {
+                    port: 0,
+                    service_data_type: 0,
+                    type_: 0,
+                    mime: sys::NRSC5_MIME_STATION_LOGO,
+                },
+            },
+        };
+        let mut payload = zeroed_payload();
+        payload.lot = sys::nrsc5_event_lot {
+            port: 0,
+            lot: 9,
+            size: bytes.len() as u32,
+            mime: sys::NRSC5_MIME_PNG,
+            name: name.as_ptr(),
+            data: bytes.as_ptr(),
+            expiry_utc: ptr::null_mut(),
+            service: ptr::null_mut(),
+            component: &mut component,
+        };
+        dispatch(
+            sys::nrsc5_event_t {
+                event: sys::NRSC5_EVENT_LOT,
+                payload,
+            },
+            &mut ctx,
+        );
+        let got = out.lock().unwrap();
+        assert_eq!(got.len(), 1);
+        match &got[0] {
+            NrscEvent::LotFile {
+                mime,
+                lot_component_mime,
+                ..
+            } => {
+                assert_eq!(*mime, sys::NRSC5_MIME_PNG);
+                assert_eq!(
+                    *lot_component_mime,
+                    Some(sys::NRSC5_MIME_STATION_LOGO)
+                );
             }
             other => panic!("expected LotFile, got {other:?}"),
         }

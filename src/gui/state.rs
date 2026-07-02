@@ -2,9 +2,9 @@ use std::time::{Duration, Instant};
 
 use chrono::Local;
 
-pub use crate::maps::WeatherFrame;
 use crate::config::GainMode;
 use crate::dsp::{AgcSnapshot, SpectrumSnapshot, SpectrumTap};
+pub use crate::maps::WeatherFrame;
 use crate::sdr::{DeviceInfo, GainElement};
 use crate::station_info::StationInfo;
 
@@ -214,6 +214,12 @@ pub struct AppState {
     /// `None` until that subchannel's logo arrives, so the UI shows
     /// nothing rather than another subchannel's logo.
     pub station_logo_paths: [Option<String>; 8],
+    /// Human-readable source/provenance for each cached station logo
+    /// slot (`station_logo_paths[i]`). Examples: `LOT mime`,
+    /// `LOT component mime`, `LOT heuristic`, `XHDR mime`, `Cache`.
+    /// Rendered as a tiny tag above the logo in Station Info so users
+    /// can tell whether the match was definitive metadata or fallback.
+    pub station_logo_sources: [Option<String>; 8],
     /// Which image the Now Playing panel should currently display.
     pub now_playing_image_mode: NowPlayingImageMode,
     /// Full path to the stitched traffic map image, if any.
@@ -254,6 +260,13 @@ pub struct AppState {
     /// Collage tab as a fallback when context-menu popups are suppressed by
     /// compositor/WM quirks.
     pub collage_secondary_click_fallback: bool,
+    /// Mirrors the analog-FM fallback mode from config so the dock can show
+    /// the current selection without taking a borrow on config each frame.
+    pub analog_fallback_mode: crate::config::AnalogFallbackMode,
+    /// Mirrors the analog stereo preference from config.
+    pub analog_fallback_stereo: bool,
+    /// Mirrors the analog RDS preference from config.
+    pub analog_fallback_rds_enabled: bool,
     /// Preset slot currently being edited via the popup (None = no popup).
     pub editing_preset: Option<usize>,
     /// In-progress name text for the preset editor.
@@ -374,6 +387,10 @@ pub struct AppState {
     /// when no device is currently configured or enumeration failed.
     /// The SDR Settings modal renders one slider per entry.
     pub sdr_gain_elements: Vec<GainElement>,
+    /// True while the background SDR-device refresh is in flight.
+    /// The Settings modal uses this to show a transient "Refreshing…"
+    /// status instead of pretending the list is stale.
+    pub sdr_devices_refresh_in_flight: bool,
     /// Wall-clock time of the last `RefreshSdrDevices` apply. Used to
     /// throttle automatic refreshes and to show "Last refreshed Xs ago"
     /// in the modal.
@@ -438,10 +455,7 @@ impl AppState {
             hhmmss: Local::now().format("%H:%M:%S").to_string(),
             text: text.into(),
         });
-        let overflow = self
-            .payload_log
-            .len()
-            .saturating_sub(Self::PAYLOAD_LOG_CAP);
+        let overflow = self.payload_log.len().saturating_sub(Self::PAYLOAD_LOG_CAP);
         if overflow > 0 {
             self.payload_log.drain(0..overflow);
         }
@@ -481,7 +495,8 @@ impl AppState {
     /// True iff a per-field PSD timestamp is within
     /// [`Self::PSD_STALE_AFTER`]. `None` -> always stale.
     pub fn is_psd_field_fresh(ts: Option<Instant>) -> bool {
-        ts.map(|t| t.elapsed() < Self::PSD_STALE_AFTER).unwrap_or(false)
+        ts.map(|t| t.elapsed() < Self::PSD_STALE_AFTER)
+            .unwrap_or(false)
     }
 
     /// Most recent PSD update across all four fields of the **active
@@ -541,6 +556,7 @@ impl AppState {
         // Station logos are per-subchannel but station-scoped; a full
         // teardown (Stop / retune / LostDevice) invalidates them all.
         self.station_logo_paths = Default::default();
+        self.station_logo_sources = Default::default();
     }
 
     /// Derived `[bool; 8]` indicating which HD subchannels should be

@@ -272,6 +272,18 @@ pub struct StationInfo {
     pub slogan: Option<String>,
     /// Free-text broadcaster message from `Message: …`.
     pub message: Option<String>,
+    /// Program Service string decoded from the analog FM RDS subcarrier.
+    /// The short (8-character) station name — call sign, slogan, or a
+    /// slice of a dynamic-PS message. Used as the station-name display
+    /// and as the ticker fallback when no RadioText is present.
+    pub rds_program_service: Option<String>,
+    /// RadioText (RDS group 2) decoded from the analog FM subcarrier.
+    /// The long scrolling message field (up to 64 characters) — song /
+    /// artist / promo text. Preferred as the ticker source because it
+    /// arrives with explicit segment addressing, so it needs no
+    /// fragile reconstruction the way dynamic PS does. `None` until a
+    /// complete RadioText message is decoded.
+    pub rds_radiotext: Option<String>,
     /// Active emergency-alert text from `Alert: …`. `None` until an alert
     /// is observed; not cleared automatically (alerts persist until the
     /// next retune).
@@ -319,6 +331,37 @@ impl StationInfo {
         self.last_updated.is_some()
     }
 
+    /// Record a freshly decoded RDS Program Service string as the
+    /// current station name. The 8-character PS field is shown verbatim;
+    /// dynamic-PS stations step through their message a frame at a time,
+    /// exactly like a car RDS radio, rather than being reconstructed
+    /// (which compounds decode errors on weak analog signals).
+    pub fn push_rds_ps(&mut self, ps: &str) {
+        let trimmed = ps.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        self.rds_program_service = Some(trimmed.to_string());
+    }
+
+    /// Record a freshly decoded RDS RadioText message. This becomes the
+    /// preferred ticker source.
+    pub fn push_rds_radiotext(&mut self, rt: &str) {
+        let trimmed = rt.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        self.rds_radiotext = Some(trimmed.to_string());
+    }
+
+    /// Text for the RDS ticker: the decoded RadioText message when the
+    /// station transmits it, otherwise the current Program Service name.
+    /// `None` until either field is observed.
+    pub fn rds_ticker_text(&self) -> Option<String> {
+        self.rds_radiotext
+            .clone()
+            .or_else(|| self.rds_program_service.clone())
+    }
     /// Count of audio program slots that have been observed in SIS.
     /// Used by the program selector to decide how many HD buttons to
     /// light up and by the service-mode heuristic.
@@ -379,3 +422,50 @@ impl StationInfo {
         Some(format!("PSMI {} • {}", psmi, label))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::StationInfo;
+
+    #[test]
+    fn ps_is_shown_verbatim_as_the_ticker_when_no_radiotext() {
+        let mut info = StationInfo::default();
+        info.push_rds_ps("KPLX");
+        assert_eq!(info.rds_ticker_text().as_deref(), Some("KPLX"));
+        // A later PS frame simply replaces the previous one — no
+        // reconstruction, no error compounding.
+        info.push_rds_ps("Eagle FM");
+        assert_eq!(info.rds_ticker_text().as_deref(), Some("Eagle FM"));
+    }
+
+    #[test]
+    fn empty_and_whitespace_ps_frames_are_ignored() {
+        let mut info = StationInfo::default();
+        info.push_rds_ps("Boston");
+        info.push_rds_ps("");
+        info.push_rds_ps("   ");
+        assert_eq!(info.rds_ticker_text().as_deref(), Some("Boston"));
+    }
+
+    #[test]
+    fn radiotext_is_preferred_over_ps_for_the_ticker() {
+        let mut info = StationInfo::default();
+        info.push_rds_ps("Eagle FM");
+        assert_eq!(info.rds_ticker_text().as_deref(), Some("Eagle FM"));
+        info.push_rds_radiotext("Now Playing: Luke Combs - Better Together");
+        assert_eq!(
+            info.rds_ticker_text().as_deref(),
+            Some("Now Playing: Luke Combs - Better Together")
+        );
+        // PS still tracked as the station name behind the RadioText.
+        assert_eq!(info.rds_program_service.as_deref(), Some("Eagle FM"));
+    }
+
+    #[test]
+    fn ticker_text_is_none_until_any_rds_observed() {
+        let info = StationInfo::default();
+        assert_eq!(info.rds_ticker_text(), None);
+    }
+}
+
+

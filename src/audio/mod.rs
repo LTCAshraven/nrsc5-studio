@@ -31,7 +31,7 @@
 //! that design.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -166,6 +166,177 @@ impl AudioSink {
         if let Ok(mut q) = self.queue.lock() {
             q.clear();
         }
+    }
+}
+
+/// Shared gate that arbitrates between the HD speaker path and the
+/// analog-FM fallback so only one source feeds the cpal sink at a
+/// time.
+///
+/// The [`SpeakerRouter`] stamps [`mark_hd_audio`](Self::mark_hd_audio)
+/// every time it forwards decoded HD PCM to the sink. The analog
+/// fallback thread checks [`hd_recent`](Self::hd_recent) before
+/// pushing its own demodulated audio and stays silent while HD audio
+/// is flowing. The asymmetry is deliberate: HD takes over the instant
+/// it produces audio, while analog only resumes after HD has been
+/// absent for a full window — so a brief HD dropout doesn't flap the
+/// two sources against each other.
+///
+/// Cloning is `Arc::clone` on one pointer plus a `Copy` of the origin
+/// `Instant`; both clones share the same atomic timestamp.
+#[derive(Clone)]
+pub struct AnalogHandoff {
+    /// Milliseconds since `origin` at which HD audio was last pushed.
+    /// Zero means "never" (HD has not produced audio this stream).
+    last_hd_ms: Arc<AtomicU64>,
+    /// Whether the gain stage is trustworthy enough to hand the sink
+    /// over to HD. In closed-loop AGC (Auto) mode this is `false`
+    /// while the controller is still searching and flips `true` once
+    /// it settles (or bails). In Manual / Hardware-AGC modes there is
+    /// no search, so it stays `true` for the whole stream and the
+    /// handoff keys purely off HD-audio presence. Holding analog
+    /// through the AGC search keeps a clean, full-volume fallback
+    /// playing instead of letting brief mid-search HD locks flap the
+    /// two sources against each other.
+    agc_ready: Arc<AtomicBool>,
+    /// Whether the HD decoder is currently OFDM-synced. Driven by the
+    /// `Sync` / `LostSync` events. HD is only allowed to own the sink
+    /// while locked, so a sync loss immediately releases the sink back
+    /// to the analog fallback instead of waiting for the PCM ring to
+    /// run dry (which can lag, or never happen if the decoder keeps
+    /// emitting silence).
+    hd_synced: Arc<AtomicBool>,
+    /// Whether the current fallback mode is forcing analog-only output.
+    /// In this mode the speaker router must never let HD PCM claim the
+    /// sink, even when AGC and sync are otherwise healthy.
+    analog_only: Arc<AtomicBool>,
+    /// Common monotonic origin so both clones compute the same
+    /// elapsed time. `Instant` is `Copy`, so each clone carries the
+    /// same value.
+    origin: std::time::Instant,
+}
+
+impl Default for AnalogHandoff {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AnalogHandoff {
+    pub fn new() -> Self {
+        Self {
+            last_hd_ms: Arc::new(AtomicU64::new(0)),
+            // Default ready: Manual / Hardware-AGC streams never call
+            // `set_agc_ready(false)`, so they hand over as soon as HD
+            // audio appears. Auto mode explicitly arms the gate at
+            // stream start.
+            agc_ready: Arc::new(AtomicBool::new(true)),
+            // Nothing is locked at stream start; the first `Sync`
+            // event flips this true.
+            hd_synced: Arc::new(AtomicBool::new(false)),
+            analog_only: Arc::new(AtomicBool::new(false)),
+            origin: std::time::Instant::now(),
+        }
+    }
+
+    fn now_ms(&self) -> u64 {
+        self.origin.elapsed().as_millis() as u64
+    }
+
+    /// Record that HD audio was just forwarded to the sink. Called by
+    /// the [`SpeakerRouter`] on every tick that pushes active-program
+    /// samples. Wait-free relaxed store.
+    pub fn mark_hd_audio(&self) {
+        // Saturate 0 to 1 so a push in the first millisecond still
+        // reads as "seen" rather than the sentinel "never".
+        self.last_hd_ms.store(self.now_ms().max(1), Ordering::Relaxed);
+    }
+
+    /// Arm or disarm the AGC-ready gate. Called once at stream start
+    /// (`false` for Auto so analog holds through the search, `true`
+    /// for Manual / Hardware-AGC) and flipped `true` by the AGC
+    /// driver thread when the controller settles or bails.
+    pub fn set_agc_ready(&self, ready: bool) {
+        self.agc_ready.store(ready, Ordering::Relaxed);
+    }
+
+    /// Record the HD decoder's OFDM sync state. Driven by the
+    /// `Sync` (true) / `LostSync` (false) events. When sync drops,
+    /// HD stops owning the sink so the analog fallback resumes even
+    /// if the PCM ring is still draining its last few frames.
+    pub fn set_hd_synced(&self, synced: bool) {
+        self.hd_synced.store(synced, Ordering::Relaxed);
+    }
+
+    /// Force the handoff gate into analog-only mode. When enabled, HD
+    /// PCM must never claim the sink, even if AGC is settled and OFDM
+    /// sync is healthy.
+    pub fn set_analog_only(&self, analog_only: bool) {
+        self.analog_only.store(analog_only, Ordering::Relaxed);
+    }
+
+    /// True when the HD speaker path is allowed to feed the sink:
+    /// the gain stage is trustworthy (AGC settled / bailed, or no
+    /// search running), the decoder is currently locked, and the
+    /// current mode is not forcing analog-only output. The
+    /// [`SpeakerRouter`] checks this before forwarding HD PCM so a
+    /// mid-AGC-search burst or a post-sync-loss dribble can't fight
+    /// the analog fallback for the sink.
+    pub fn hd_output_allowed(&self) -> bool {
+        !self.analog_only.load(Ordering::Relaxed)
+            && self.agc_ready.load(Ordering::Relaxed)
+            && self.hd_synced.load(Ordering::Relaxed)
+    }
+
+    /// True if HD audio was forwarded within the last `window_ms`.
+    fn hd_recent(&self, window_ms: u64) -> bool {
+        let last = self.last_hd_ms.load(Ordering::Relaxed);
+        if last == 0 {
+            return false;
+        }
+        self.now_ms().saturating_sub(last) < window_ms
+    }
+
+    /// True when the analog fallback should stay silent because HD is
+    /// currently the sink owner. The [`SpeakerRouter`] only stamps
+    /// [`mark_hd_audio`](Self::mark_hd_audio) when
+    /// [`hd_output_allowed`](Self::hd_output_allowed) holds, so a
+    /// recent stamp already means HD is both trustworthy and locked;
+    /// the window just adds hysteresis so a one-frame audio gap
+    /// doesn't flap the two sources.
+    pub fn suppress_analog(&self, window_ms: u64) -> bool {
+        self.analog_only.load(Ordering::Relaxed) || self.hd_recent(window_ms)
+    }
+
+    /// Forget any HD-audio history and clear the sync flag. Called on
+    /// stream start so a fresh tune begins with analog enabled until
+    /// the HD decoder locks.
+    pub fn reset(&self) {
+        self.last_hd_ms.store(0, Ordering::Relaxed);
+        self.hd_synced.store(false, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AnalogHandoff;
+
+    #[test]
+    fn hd_output_is_blocked_when_analog_only_mode_is_active() {
+        let handoff = AnalogHandoff::new();
+        handoff.set_agc_ready(true);
+        handoff.set_hd_synced(true);
+        handoff.set_analog_only(true);
+        assert!(!handoff.hd_output_allowed());
+    }
+
+    #[test]
+    fn hd_output_is_allowed_when_analog_only_mode_is_inactive() {
+        let handoff = AnalogHandoff::new();
+        handoff.set_agc_ready(true);
+        handoff.set_hd_synced(true);
+        handoff.set_analog_only(false);
+        assert!(handoff.hd_output_allowed());
     }
 }
 
@@ -444,9 +615,13 @@ impl SpeakerRouter {
     /// forward the active one's samples into `sink`. Long-lived;
     /// survives multiple Start/Stop cycles. Killed via `shutdown()`
     /// or implicitly on drop.
-    pub fn spawn(sink: AudioSink) -> Self {
+    ///
+    /// `handoff` is stamped every time active-program HD audio is
+    /// forwarded to the sink, so the analog-FM fallback thread can
+    /// stay silent while HD is live.
+    pub fn spawn(sink: AudioSink, handoff: AnalogHandoff) -> Self {
         let (cmd_tx, cmd_rx) = unbounded();
-        let join = std::thread::spawn(move || run_speaker_loop(sink, cmd_rx));
+        let join = std::thread::spawn(move || run_speaker_loop(sink, handoff, cmd_rx));
         Self {
             cmd_tx,
             join: Some(join),
@@ -481,6 +656,7 @@ const ROUTER_TICK_MS: u64 = 5;
 
 fn run_speaker_loop(
     sink: AudioSink,
+    handoff: AnalogHandoff,
     cmd_rx: crossbeam_channel::Receiver<SpeakerCmd>,
 ) {
     let mut rings: HashMap<u32, Arc<PcmRing>> = HashMap::new();
@@ -574,8 +750,16 @@ fn run_speaker_loop(
             if scratch.is_empty() {
                 continue;
             }
-            if active == Some(*prog) {
+            if active == Some(*prog) && handoff.hd_output_allowed() {
                 sink.push(&scratch);
+                // Tell the analog fallback HD audio is live so it
+                // stays silent and the two sources don't flap. Only
+                // stamped while HD is allowed to own the sink (AGC
+                // trustworthy AND decoder locked); otherwise the HD
+                // PCM is dropped here so the analog fallback keeps
+                // the sink to itself through the AGC search and
+                // after a sync loss.
+                handoff.mark_hd_audio();
             }
             if let Some(tap) = recorders.get(prog) {
                 // Clone the scratch into a fresh Vec for the

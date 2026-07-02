@@ -27,6 +27,13 @@ struct SdrProbeResult {
     sdrplay_service: Option<crate::sdr_detect::SdrplayServiceState>,
 }
 
+#[derive(Debug)]
+struct SdrDeviceRefreshResult {
+    devices: Vec<crate::sdr::DeviceInfo>,
+    gain_elements: Vec<crate::sdr::GainElement>,
+    diagnostics: String,
+}
+
 /// Hard cap on tracked album-art tiles — prevents the collage from getting
 /// unbounded if a session runs all day on a very busy station.
 /// Hard cap on tracked album-art tiles — prevents the collage from getting
@@ -59,6 +66,51 @@ fn snap_fm_tune_mhz(mhz: f32) -> f32 {
     let slots = ((clamped - FM_TUNE_BASE_MHZ) / FM_TUNE_STEP_MHZ).round();
     let snapped = FM_TUNE_BASE_MHZ + slots * FM_TUNE_STEP_MHZ;
     (snapped * 10.0).round() / 10.0
+}
+
+fn should_auto_refresh_sdr_devices(
+    transport: crate::config::SdrTransport,
+    refresh_in_flight: bool,
+    devices_empty: bool,
+) -> bool {
+    matches!(transport, crate::config::SdrTransport::LocalSoapy)
+        && !refresh_in_flight
+        && devices_empty
+}
+
+fn pick_best_sdr_device<'a>(
+    configured_driver: &str,
+    configured_device_args: &str,
+    devices: &'a [crate::sdr::DeviceInfo],
+) -> Option<&'a crate::sdr::DeviceInfo> {
+    if devices.is_empty() {
+        return None;
+    }
+
+    if let Some(dev) = devices.iter().find(|dev| {
+        dev.driver.eq_ignore_ascii_case(configured_driver)
+            && dev
+                .args_after_driver()
+                .eq_ignore_ascii_case(configured_device_args)
+    }) {
+        return Some(dev);
+    }
+
+    if let Some(dev) = devices
+        .iter()
+        .find(|dev| dev.driver.eq_ignore_ascii_case("rtlsdr"))
+    {
+        return Some(dev);
+    }
+
+    if let Some(dev) = devices
+        .iter()
+        .find(|dev| dev.driver.eq_ignore_ascii_case("sdrplay"))
+    {
+        return Some(dev);
+    }
+
+    devices.first()
 }
 
 /// Snap an arbitrary tenths-of-dB gain value to the nearest entry in
@@ -261,6 +313,12 @@ pub struct Nrsc5App {
     /// is drained from `sdr_probe_rx`. Prevents stacking multiple
     /// probes if one runs longer than the throttle interval.
     sdr_probe_in_flight: bool,
+    /// Background SDR device-refresh work. The Settings modal opens
+    /// immediately and the refresh result is applied on the next UI
+    /// frame once the worker finishes.
+    sdr_refresh_tx: mpsc::Sender<SdrDeviceRefreshResult>,
+    sdr_refresh_rx: mpsc::Receiver<SdrDeviceRefreshResult>,
+    sdr_refresh_in_flight: bool,
 }
 
 impl Nrsc5App {
@@ -317,6 +375,7 @@ impl Nrsc5App {
         // so both endpoints land in the struct literal as a matched
         // pair without any post-construction reshuffling.
         let (sdr_probe_tx, sdr_probe_rx) = mpsc::channel();
+        let (sdr_refresh_tx, sdr_refresh_rx) = mpsc::channel();
 
         // Open the on-disk art cache and load any history from previous
         // sessions. Failure here is non-fatal — we just start with an
@@ -357,8 +416,10 @@ impl Nrsc5App {
                 art_tiles,
                 art_session_started,
                 art_blocklist_count,
-                collage_secondary_click_fallback:
-                    config.collage_secondary_click_fallback,
+                collage_secondary_click_fallback: config.collage_secondary_click_fallback,
+                analog_fallback_mode: config.analog_fallback_mode,
+                analog_fallback_stereo: config.analog_fallback_stereo,
+                analog_fallback_rds_enabled: config.analog_fallback_rds_enabled,
                 collage_tile_cap: collage_tile_cap(&config) as u32,
                 spectrum_tap: Some(spectrum_tap),
                 ..AppState::default()
@@ -392,6 +453,9 @@ impl Nrsc5App {
             sdr_probe_tx,
             sdr_probe_rx,
             sdr_probe_in_flight: false,
+            sdr_refresh_tx,
+            sdr_refresh_rx,
+            sdr_refresh_in_flight: false,
         };
         if !app.weather_map.frames.is_empty() {
             app.apply_weather_frame_update();
@@ -407,6 +471,7 @@ impl eframe::App for Nrsc5App {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.update_runtime_metrics();
+        self.drain_sdr_refresh_results();
         ui.ctx().request_repaint_after(Duration::from_millis(50));
 
         // Phase 4: rotate the active recording's .opus file when its
@@ -420,8 +485,7 @@ impl eframe::App for Nrsc5App {
         // having to plumb a query through every call site. Falls
         // back to `None` when no piped session is running so the
         // panel naturally drops back to `selected_program`.
-        self.app_state.active_speaker =
-            self.nrsc5.as_ref().and_then(|n| n.active_speaker());
+        self.app_state.active_speaker = self.nrsc5.as_ref().and_then(|n| n.active_speaker());
 
         // Mirror the per-subchannel decoded-state bitmap so the
         // HD selector's toggle switches reflect reality (e.g. an
@@ -450,6 +514,7 @@ impl eframe::App for Nrsc5App {
                 // when the primary decoder is disabled and so that
                 // starting on a non-HD1 program still drives AGC.
                 nrsc5.forward_event_to_agc(&evt);
+                nrsc5.forward_event_to_handoff(&evt);
                 pending.push(evt);
             }
             for evt in pending {
@@ -494,8 +559,14 @@ impl eframe::App for Nrsc5App {
         // speaker; visible feedback goes to stderr.
         if let Some(nrsc5) = self.nrsc5.as_mut() {
             const NUM_KEYS: [egui::Key; 8] = [
-                egui::Key::Num1, egui::Key::Num2, egui::Key::Num3, egui::Key::Num4,
-                egui::Key::Num5, egui::Key::Num6, egui::Key::Num7, egui::Key::Num8,
+                egui::Key::Num1,
+                egui::Key::Num2,
+                egui::Key::Num3,
+                egui::Key::Num4,
+                egui::Key::Num5,
+                egui::Key::Num6,
+                egui::Key::Num7,
+                egui::Key::Num8,
             ];
             for (idx, key) in NUM_KEYS.iter().enumerate() {
                 let program = idx as u32;
@@ -522,7 +593,11 @@ impl eframe::App for Nrsc5App {
             // Theme toggle stays at the very left as the most-used
             // single-purpose button.
             let mut menu_commands: Vec<UiCommand> = Vec::new();
-            let theme_icon = if self.app_state.dark_mode { "☀" } else { "🌙" };
+            let theme_icon = if self.app_state.dark_mode {
+                "☀"
+            } else {
+                "🌙"
+            };
             if ui
                 .button(egui::RichText::new(theme_icon).size(18.0))
                 .on_hover_text("Toggle light/dark theme")
@@ -557,11 +632,7 @@ impl eframe::App for Nrsc5App {
                 // count comes from the live Nrsc5Process; when the
                 // backend isn't initialized yet we hide the entry
                 // entirely rather than show "(0 entries)".
-                if let Some(count) = self
-                    .nrsc5
-                    .as_ref()
-                    .map(|p| p.gain_cache_len())
-                {
+                if let Some(count) = self.nrsc5.as_ref().map(|p| p.gain_cache_len()) {
                     if count > 0 {
                         let label = format!(
                             "\u{1F5D1}  Clear gain cache\u{2026}  ({} {})",
@@ -589,15 +660,13 @@ impl eframe::App for Nrsc5App {
             );
             ui.separator();
             ui.label(
-                egui::RichText::new(format!("{:.1} MHz", self.app_state.frequency_mhz))
-                    .monospace(),
+                egui::RichText::new(format!("{:.1} MHz", self.app_state.frequency_mhz)).monospace(),
             );
             ui.separator();
             // Active SDR device chip — clickable shortcut to the SDR
             // Settings modal. Shows just the driver key in the top bar
             // to keep the space tight; full label is in the modal.
-            let sdr_chip_text =
-                format!("\u{1F4E1} {}", self.config.sdr.chip_label());
+            let sdr_chip_text = format!("\u{1F4E1} {}", self.config.sdr.chip_label());
             if ui
                 .button(egui::RichText::new(sdr_chip_text).monospace())
                 .on_hover_text("Open Settings (transport • device • gain • display • recording)")
@@ -611,9 +680,8 @@ impl eframe::App for Nrsc5App {
             } else {
                 egui::Color32::from_gray(140)
             };
-            let status_resp = ui.label(
-                egui::RichText::new(&self.app_state.nrsc5_status).color(status_color),
-            );
+            let status_resp =
+                ui.label(egui::RichText::new(&self.app_state.nrsc5_status).color(status_color));
             if let Some(version) = self.nrsc5.as_ref().map(|n| n.version()) {
                 status_resp.on_hover_text(version);
             }
@@ -850,9 +918,7 @@ impl Nrsc5App {
     /// codepoints each bundled font covers.
     fn install_fonts(ctx: &egui::Context) {
         let mut fonts = egui::FontDefinitions::default();
-        if let Some(chain) =
-            fonts.families.get_mut(&egui::FontFamily::Proportional)
-        {
+        if let Some(chain) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
             if !chain.iter().any(|n| n == "Hack") {
                 chain.push("Hack".to_owned());
             }
@@ -878,8 +944,7 @@ impl Nrsc5App {
             v.faint_bg_color = egui::Color32::from_rgb(35, 35, 45);
             v.widgets.noninteractive.bg_stroke =
                 egui::Stroke::new(0.5, egui::Color32::from_gray(60));
-            v.widgets.inactive.bg_stroke =
-                egui::Stroke::new(0.5, egui::Color32::from_gray(80));
+            v.widgets.inactive.bg_stroke = egui::Stroke::new(0.5, egui::Color32::from_gray(80));
             v
         } else {
             let mut v = egui::Visuals::light();
@@ -890,8 +955,7 @@ impl Nrsc5App {
             v.faint_bg_color = egui::Color32::from_rgb(240, 240, 248);
             v.widgets.noninteractive.bg_stroke =
                 egui::Stroke::new(0.5, egui::Color32::from_gray(200));
-            v.widgets.inactive.bg_stroke =
-                egui::Stroke::new(0.5, egui::Color32::from_gray(180));
+            v.widgets.inactive.bg_stroke = egui::Stroke::new(0.5, egui::Color32::from_gray(180));
             v
         };
 
@@ -944,18 +1008,21 @@ impl Nrsc5App {
         // Refresh the active gain-mode mirrors so the dropdown can show
         // a "(restart stream to apply)" hint when the user changes the
         // selection mid-stream.
-        self.app_state.active_gain_mode =
-            self.nrsc5.as_ref().and_then(|n| n.active_gain_mode());
-        self.app_state.active_manual_gain_tenths =
-            self.nrsc5.as_ref().and_then(|n| n.active_manual_gain_tenths());
+        self.app_state.active_gain_mode = self.nrsc5.as_ref().and_then(|n| n.active_gain_mode());
+        self.app_state.active_manual_gain_tenths = self
+            .nrsc5
+            .as_ref()
+            .and_then(|n| n.active_manual_gain_tenths());
         // Refresh antenna state for the Tuner-panel dropdown. Both
         // are best-effort: a live SDR with no multi-antenna concept
         // returns an empty `Vec` and `None`, which collapses the
         // dropdown to nothing (intended).
-        self.app_state.sdr_antennas =
-            self.nrsc5.as_ref().map(|n| n.sdr_antennas()).unwrap_or_default();
-        self.app_state.active_antenna =
-            self.nrsc5.as_ref().and_then(|n| n.active_antenna());
+        self.app_state.sdr_antennas = self
+            .nrsc5
+            .as_ref()
+            .map(|n| n.sdr_antennas())
+            .unwrap_or_default();
+        self.app_state.active_antenna = self.nrsc5.as_ref().and_then(|n| n.active_antenna());
     }
 
     /// Push the current `app_state.volume` into the audio player. Wait-
@@ -1022,8 +1089,7 @@ impl Nrsc5App {
                 self.app_state.sdr_probe_available = true;
                 // While streaming, trust that a device is present (the
                 // stream is using one). Otherwise reflect probe results.
-                self.app_state.sdr_present =
-                    self.app_state.is_streaming || any_present;
+                self.app_state.sdr_present = self.app_state.is_streaming || any_present;
             } else {
                 self.app_state.sdr_probe_available = false;
                 self.app_state.sdr_present = true;
@@ -1130,17 +1196,12 @@ impl Nrsc5App {
                     .show(ui, |ui| {
                         ui.set_max_width(380.0);
                         ui.vertical_centered(|ui| {
-                            ui.label(
-                                egui::RichText::new("\u{1F4F6}")
-                                    .size(56.0),
-                            );
+                            ui.label(egui::RichText::new("\u{1F4F6}").size(56.0));
                             ui.add_space(2.0);
                             ui.label(
                                 egui::RichText::new("No SDR detected")
                                     .heading()
-                                    .color(egui::Color32::from_rgb(
-                                        230, 200, 110,
-                                    )),
+                                    .color(egui::Color32::from_rgb(230, 200, 110)),
                             );
                             ui.add_space(10.0);
                             ui.label(
@@ -1151,11 +1212,9 @@ impl Nrsc5App {
                             );
                             ui.add_space(4.0);
                             ui.label(
-                                egui::RichText::new(
-                                    "(or just wait \u{2014} we keep checking)",
-                                )
-                                .small()
-                                .color(egui::Color32::from_gray(150)),
+                                egui::RichText::new("(or just wait \u{2014} we keep checking)")
+                                    .small()
+                                    .color(egui::Color32::from_gray(150)),
                             );
                             // Extra hint when the SDRplay API service
                             // is installed but stopped: tell the user
@@ -1166,13 +1225,9 @@ impl Nrsc5App {
                             if self.app_state.sdrplay_service_stopped {
                                 ui.add_space(12.0);
                                 ui.label(
-                                    egui::RichText::new(
-                                        "SDRplay API service is stopped.",
-                                    )
-                                    .size(13.0)
-                                    .color(egui::Color32::from_rgb(
-                                        230, 160, 100,
-                                    )),
+                                    egui::RichText::new("SDRplay API service is stopped.")
+                                        .size(13.0)
+                                        .color(egui::Color32::from_rgb(230, 160, 100)),
                                 );
                                 ui.add_space(2.0);
                                 ui.label(
@@ -1284,9 +1339,7 @@ impl Nrsc5App {
                 .store_image(key, &bytes, full_path)
                 .map(|p| p.to_string_lossy().into_owned())
         });
-        let resolved_path = cached_path
-            .clone()
-            .unwrap_or_else(|| path_str.to_string());
+        let resolved_path = cached_path.clone().unwrap_or_else(|| path_str.to_string());
 
         // Live cover display follows the cache when possible.
         self.app_state.programs[slot_idx].cover_art_path = Some(resolved_path.clone());
@@ -1340,7 +1393,7 @@ impl Nrsc5App {
         self.try_record_play(program);
     }
 
-  /// Phase 4 — spawn a new Opus recording locked to whatever
+    /// Phase 4 — spawn a new Opus recording locked to whatever
     /// subchannel the user currently has *selected* (not necessarily
     /// the active speaker; the recorder follows the selection at
     /// start time, then stays put even if the user swaps speakers).
@@ -1360,8 +1413,7 @@ impl Nrsc5App {
             return;
         }
         if !self.app_state.is_streaming {
-            self.app_state.nrsc5_status =
-                "press Start before recording".to_string();
+            self.app_state.nrsc5_status = "press Start before recording".to_string();
             return;
         }
 
@@ -1377,8 +1429,7 @@ impl Nrsc5App {
             .map(|n| n.is_decoding(program))
             .unwrap_or(false);
         if self.nrsc5.is_none() {
-            self.app_state.nrsc5_status =
-                "no SDR backend — cannot record".to_string();
+            self.app_state.nrsc5_status = "no SDR backend — cannot record".to_string();
             return;
         }
         if !decoder_up {
@@ -1413,9 +1464,7 @@ impl Nrsc5App {
                 .as_deref()
                 .filter(|s| !s.is_empty())
                 .map(sanitize_filename)
-                .unwrap_or_else(|| {
-                    format!("{:.1}MHz", self.config.frequency_mhz)
-                });
+                .unwrap_or_else(|| format!("{:.1}MHz", self.config.frequency_mhz));
             dir.push(station);
         }
         let now = chrono::Local::now();
@@ -1429,8 +1478,7 @@ impl Nrsc5App {
         // between the read-only probe above and here (impossible on
         // current code paths, but defensive).
         let Some(nrsc5) = self.nrsc5.as_mut() else {
-            self.app_state.nrsc5_status =
-                "no SDR backend — cannot record".to_string();
+            self.app_state.nrsc5_status = "no SDR backend — cannot record".to_string();
             return;
         };
 
@@ -1440,10 +1488,8 @@ impl Nrsc5App {
                 // program disappeared between the is_decoding check
                 // above and now — race against decoder teardown.
                 if let Err(err) = nrsc5.attach_recorder(program, pcm_tx) {
-                    self.app_state.nrsc5_status = format!(
-                        "recording attach failed for HD{}: {err}",
-                        program + 1,
-                    );
+                    self.app_state.nrsc5_status =
+                        format!("recording attach failed for HD{}: {err}", program + 1,);
                     // Drop the session so its forwarder sees a
                     // closed channel and flushes the (empty) file.
                     drop(session);
@@ -1455,15 +1501,11 @@ impl Nrsc5App {
                     output_path: output_path.display().to_string(),
                 });
                 self.recording_session = Some(session);
-                self.app_state.nrsc5_status = format!(
-                    "● recording HD{} → {}",
-                    program + 1,
-                    output_path.display(),
-                );
+                self.app_state.nrsc5_status =
+                    format!("● recording HD{} → {}", program + 1, output_path.display(),);
             }
             Err(err) => {
-                self.app_state.nrsc5_status =
-                    format!("recording start failed: {err}");
+                self.app_state.nrsc5_status = format!("recording start failed: {err}");
             }
         }
     }
@@ -1478,8 +1520,7 @@ impl Nrsc5App {
     fn stop_recording(&mut self, fatal: bool) {
         let Some(session) = self.recording_session.take() else {
             if !fatal {
-                self.app_state.nrsc5_status =
-                    "no active recording to stop".to_string();
+                self.app_state.nrsc5_status = "no active recording to stop".to_string();
             }
             return;
         };
@@ -1502,8 +1543,7 @@ impl Nrsc5App {
                 };
             }
             Err(err) => {
-                self.app_state.nrsc5_status =
-                    format!("recording stop error: {err}");
+                self.app_state.nrsc5_status = format!("recording stop error: {err}");
             }
         }
         self.app_state.recording = None;
@@ -1546,9 +1586,8 @@ impl Nrsc5App {
         let Some(status) = self.app_state.recording.as_ref() else {
             return;
         };
-        let cap = Duration::from_secs(
-            (self.config.recording_max_minutes as u64).saturating_mul(60),
-        );
+        let cap =
+            Duration::from_secs((self.config.recording_max_minutes as u64).saturating_mul(60));
         if status.started_at.elapsed() < cap {
             return;
         }
@@ -1624,14 +1663,10 @@ impl Nrsc5App {
         let artist = slot.artist.clone();
         let freq = self.config.frequency_mhz;
         let call_sign = self.app_state.call_sign.clone();
-        if self.play_log.try_push(
-            now_ms,
-            &title,
-            &artist,
-            freq,
-            program,
-            &call_sign,
-        ) {
+        if self
+            .play_log
+            .try_push(now_ms, &title, &artist, freq, program, &call_sign)
+        {
             self.play_log.save();
         }
     }
@@ -1730,7 +1765,13 @@ impl Nrsc5App {
     /// re-sends from the carousel reuse the existing file. Stale logos for
     /// the same (frequency, subchannel) are removed so the cache holds at
     /// most one file per slot.
-    fn store_station_logo(&self, program: u32, ext: &str, bytes: &[u8]) -> Option<String> {
+    fn store_station_logo(
+        &self,
+        program: u32,
+        ext: &str,
+        bytes: &[u8],
+        source: &str,
+    ) -> Option<String> {
         let dir = crate::paths::station_logo_dir()?;
         std::fs::create_dir_all(&dir).ok()?;
         let freq_key = (self.config.frequency_mhz * 10.0).round() as u32;
@@ -1738,6 +1779,7 @@ impl Nrsc5App {
         bytes.hash(&mut hasher);
         let hash = hasher.finish() as u32;
         let target = dir.join(format!("{freq_key}_hd{}_{hash:08x}.{ext}", program + 1));
+        let source_sidecar = station_logo_source_sidecar_path(&target);
         if !target.exists() {
             std::fs::write(&target, bytes).ok()?;
             let stale_prefix = format!("{freq_key}_hd{}_", program + 1);
@@ -1751,6 +1793,7 @@ impl Nrsc5App {
                 }
             }
         }
+        let _ = std::fs::write(&source_sidecar, source);
         Some(target.to_string_lossy().into_owned())
     }
 
@@ -1759,6 +1802,7 @@ impl Nrsc5App {
     /// no cached file stay `None`.
     fn preload_station_logos(&mut self, mhz: f32) {
         self.app_state.station_logo_paths = Default::default();
+        self.app_state.station_logo_sources = Default::default();
         let Some(dir) = crate::paths::station_logo_dir() else {
             return;
         };
@@ -1775,8 +1819,19 @@ impl Nrsc5App {
             let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
             if let Ok(n) = digits.parse::<u32>() {
                 if (1..=8).contains(&n) {
-                    self.app_state.station_logo_paths[(n - 1) as usize] =
-                        Some(e.path().to_string_lossy().into_owned());
+                    let idx = (n - 1) as usize;
+                    let logo_path = e.path();
+                    self.app_state.station_logo_paths[idx] =
+                        Some(logo_path.to_string_lossy().into_owned());
+                    let source = std::fs::read_to_string(station_logo_source_sidecar_path(
+                        &logo_path,
+                    ))
+                    .ok()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "Unknown".to_string());
+                    self.app_state.station_logo_sources[idx] =
+                        Some(format!("{} (Cached)", source));
                 }
             }
         }
@@ -1923,13 +1978,12 @@ impl Nrsc5App {
         // If the buffer was at capacity, the new frame caused the
         // oldest to be dropped, so every existing index shifts
         // down by one.
-        let shifted_idx = if prev_len == crate::maps::MAX_WEATHER_FRAMES
-            && new_frames.len() == prev_len
-        {
-            prev_idx.saturating_sub(1)
-        } else {
-            prev_idx
-        };
+        let shifted_idx =
+            if prev_len == crate::maps::MAX_WEATHER_FRAMES && new_frames.len() == prev_len {
+                prev_idx.saturating_sub(1)
+            } else {
+                prev_idx
+            };
         self.app_state.weather_frames = new_frames;
         self.app_state.weather_current_frame = if following {
             new_last
@@ -2061,13 +2115,10 @@ impl Nrsc5App {
                 if idx < 8 {
                     let slot = &mut self.app_state.station_info.programs[idx];
                     let info = slot.get_or_insert_with(|| {
-                        crate::station_info::ProgramInfo::from_short_name(
-                            String::new(),
-                        )
+                        crate::station_info::ProgramInfo::from_short_name(String::new())
                     });
                     info.bit_rate_kbps = Some(kbps);
-                    self.app_state.station_info.last_updated =
-                        Some(Instant::now());
+                    self.app_state.station_info.last_updated = Some(Instant::now());
                 }
             }
             NrscEvent::Metadata {
@@ -2117,10 +2168,12 @@ impl Nrsc5App {
                 }
             }
             NrscEvent::LotFile {
+                program,
                 lot,
                 name,
                 data,
-                ..
+                mime,
+                lot_component_mime,
             } => {
                 // Reconstruct the `{lot}_{name}` filename that the old
                 // `nrsc5.exe --dump-aas-files` flag used to write.
@@ -2137,6 +2190,7 @@ impl Nrsc5App {
                 } else {
                     format!("{lot}_{name}")
                 };
+                let image_class = classify_lot_image(&filename, mime, lot_component_mime);
                 // Persist the payload to the AAS scratch directory.
                 // Downstream map / cover-art code reads it back via
                 // `aas_dir.join(filename)`. Empty payloads (libnrsc5
@@ -2156,14 +2210,42 @@ impl Nrsc5App {
                     } else if filename.contains("_DWRI_") || filename.contains("_DWRO_") {
                         "weather frame"
                     } else {
-                        "image payload"
+                        match &image_class {
+                            LotImageClass::StationLogo { definitive, source } => {
+                                if *definitive {
+                                    match *source {
+                                        "lot.mime" => "station logo (lot mime)",
+                                        "lot.component.data.mime" => {
+                                            "station logo (component mime)"
+                                        }
+                                        _ => "station logo",
+                                    }
+                                } else {
+                                    "station logo (filename heuristic)"
+                                }
+                            }
+                            LotImageClass::CoverArt { source } => match *source {
+                                "lot.mime" => "cover art (lot mime)",
+                                "lot.component.data.mime" => "cover art (component mime)",
+                                _ => "cover art",
+                            },
+                            LotImageClass::GenericImage { source } => match *source {
+                                "generic_image_mime" => "generic image payload (jpeg/png)",
+                                _ => "generic image payload",
+                            },
+                            LotImageClass::Other => "payload",
+                        }
                     };
                     self.app_state.push_payload_log(format!(
-                        "LOT {} {} ({} B): {}",
+                        "LOT {} {} ({} B): {} [mime={}, component={}]",
                         lot,
                         kind,
                         data.len(),
-                        filename
+                        filename,
+                        mime_hex(mime),
+                        lot_component_mime
+                            .map(mime_hex)
+                            .unwrap_or_else(|| "none".to_string())
                     ));
                 }
                 if !data.is_empty() && !filename.is_empty() {
@@ -2177,21 +2259,52 @@ impl Nrsc5App {
                         );
                     }
                 }
-                // Standalone SL carousel logo (`SL<CALLSIGN>$$<NN>…`):
-                // cache one tiny file per (frequency, subchannel) in the
-                // durable store, then drop the AAS scratch copy so it can't
-                // grow or be pruned. XHDR logos are handled in the `Xhdr` arm.
+                // Station-logo LOT path (MIME-first): classify image type
+                // from LOT metadata first, then use filename only as a
+                // fallback heuristic when broadcasters emit generic/missing
+                // MIME tags.
                 if !filename.is_empty() && !data.is_empty() {
-                    if let Some((program, callsign)) = parse_station_logo_filename(&filename) {
+                    if let LotImageClass::StationLogo { source, .. } = image_class {
+                        let source_label = match source {
+                            "lot.mime" => "LOT mime",
+                            "lot.component.data.mime" => "LOT component mime",
+                            "filename_heuristic" => "LOT heuristic",
+                            _ => "LOT",
+                        };
+                        let parsed = parse_station_logo_filename(&filename);
+                        let (logo_program, program_source) = if let Some((p, _)) = parsed.as_ref() {
+                            (*p, "filename")
+                        } else if program == 0 {
+                            // libnrsc5 currently tends to emit 0 for LOT
+                            // program; when no filename hint exists we map to
+                            // the selected subchannel rather than pinning HD1.
+                            (self.app_state.selected_program.min(7), "selected_program")
+                        } else {
+                            (program.min(7), "lot.program")
+                        };
+                        let callsign = parsed
+                            .as_ref()
+                            .map(|(_, cs)| cs.as_str())
+                            .filter(|cs| !cs.is_empty())
+                            .unwrap_or("unknown");
                         if let Some(cached) =
-                            self.store_station_logo(program, &logo_ext(&filename), &data)
+                            self.store_station_logo(
+                                logo_program,
+                                &logo_ext(&filename),
+                                &data,
+                                source_label,
+                            )
                         {
                             let _ = std::fs::remove_file(self.aas_dir.join(&filename));
-                            self.app_state.station_logo_paths[program as usize] = Some(cached);
+                            self.app_state.station_logo_paths[logo_program as usize] = Some(cached);
+                            self.app_state.station_logo_sources[logo_program as usize] =
+                                Some(source_label.to_string());
                             self.app_state.push_payload_log(format!(
-                                "Station logo {callsign} HD{} (LOT {})",
-                                program + 1,
-                                lot
+                                "Station logo {callsign} -> HD{} (LOT {}, source={}, map={})",
+                                logo_program + 1,
+                                lot,
+                                source,
+                                program_source
                             ));
                         }
                     }
@@ -2233,7 +2346,9 @@ impl Nrsc5App {
                 }
                 self.lot_files.insert(lot, filename);
             }
-            NrscEvent::Xhdr { program, mime, lot, .. } => {
+            NrscEvent::Xhdr {
+                program, mime, lot, ..
+            } => {
                 // The album-art vs. station-logo distinction is carried
                 // by the XHDR MIME type, NOT by `param` (which is the
                 // upstream LOT-present flag). `NRSC5_MIME_STATION_LOGO`
@@ -2252,10 +2367,19 @@ impl Nrsc5App {
                             let ext = logo_ext(filename);
                             if let Some(cached) = std::fs::read(&full_path)
                                 .ok()
-                                .and_then(|bytes| self.store_station_logo(program, &ext, &bytes))
+                                .and_then(|bytes| {
+                                    self.store_station_logo(
+                                        program,
+                                        &ext,
+                                        &bytes,
+                                        "XHDR mime",
+                                    )
+                                })
                             {
                                 let _ = std::fs::remove_file(&full_path);
                                 self.app_state.station_logo_paths[program as usize] = Some(cached);
+                                self.app_state.station_logo_sources[program as usize] =
+                                    Some("XHDR mime".to_string());
                             }
                             self.app_state.now_playing_image_mode =
                                 NowPlayingImageMode::StationLogo;
@@ -2265,8 +2389,7 @@ impl Nrsc5App {
                                 lot
                             ));
                         } else {
-                            self.app_state.now_playing_image_mode =
-                                NowPlayingImageMode::CoverArt;
+                            self.app_state.now_playing_image_mode = NowPlayingImageMode::CoverArt;
                             self.app_state.push_payload_log(format!(
                                 "XHDR cover art -> HD{} (LOT {})",
                                 program + 1,
@@ -2359,10 +2482,7 @@ impl Nrsc5App {
                         #[cfg(debug_assertions)]
                         eprintln!(
                             "[map] HERE traffic tile name={} tile=({}, {}) completed_stitch={}",
-                            rel_filename,
-                            n1,
-                            n2,
-                            traffic_completed
+                            rel_filename, n1, n2, traffic_completed
                         );
                         if traffic_completed {
                             self.apply_traffic_composite_update();
@@ -2405,17 +2525,24 @@ impl Nrsc5App {
                 self.app_state.station_info.message = Some(text);
                 self.app_state.station_info.last_updated = Some(Instant::now());
             }
+            NrscEvent::RdsProgramService(text) => {
+                self.app_state.station_info.push_rds_ps(&text);
+                self.app_state.station_info.last_updated = Some(Instant::now());
+            }
+            NrscEvent::RdsRadioText(text) => {
+                self.app_state.station_info.push_rds_radiotext(&text);
+                self.app_state.station_info.last_updated = Some(Instant::now());
+            }
             NrscEvent::Location {
                 latitude,
                 longitude,
                 altitude_m,
             } => {
-                self.app_state.station_info.location =
-                    Some(crate::station_info::Location {
-                        latitude,
-                        longitude,
-                        altitude_m,
-                    });
+                self.app_state.station_info.location = Some(crate::station_info::Location {
+                    latitude,
+                    longitude,
+                    altitude_m,
+                });
                 self.app_state.station_info.last_updated = Some(Instant::now());
             }
             NrscEvent::CountryFcc {
@@ -2437,15 +2564,10 @@ impl Nrsc5App {
                     match slot {
                         Some(info) => info.short_name = name,
                         None => {
-                            *slot = Some(
-                                crate::station_info::ProgramInfo::from_short_name(
-                                    name,
-                                ),
-                            );
+                            *slot = Some(crate::station_info::ProgramInfo::from_short_name(name));
                         }
                     }
-                    self.app_state.station_info.last_updated =
-                        Some(Instant::now());
+                    self.app_state.station_info.last_updated = Some(Instant::now());
                 }
             }
             NrscEvent::AudioProgram {
@@ -2459,14 +2581,11 @@ impl Nrsc5App {
                     let idx = (number - 1) as usize;
                     let slot = &mut self.app_state.station_info.programs[idx];
                     let info = slot.get_or_insert_with(|| {
-                        crate::station_info::ProgramInfo::from_short_name(
-                            String::new(),
-                        )
+                        crate::station_info::ProgramInfo::from_short_name(String::new())
                     });
                     info.program_type = Some(program_type);
                     info.sound_experience = Some(sound_experience);
-                    self.app_state.station_info.last_updated =
-                        Some(Instant::now());
+                    self.app_state.station_info.last_updated = Some(Instant::now());
                 }
             }
             NrscEvent::SigServiceData { number, name } => {
@@ -2474,9 +2593,7 @@ impl Nrsc5App {
                 // seconds, so replace any existing entry rather than
                 // appending duplicates.
                 let services = &mut self.app_state.station_info.data_services;
-                if let Some(existing) =
-                    services.iter_mut().find(|s| s.number == number)
-                {
+                if let Some(existing) = services.iter_mut().find(|s| s.number == number) {
                     existing.name = name;
                 } else {
                     services.push(crate::station_info::DataService {
@@ -2500,15 +2617,14 @@ impl Nrsc5App {
                 manufacturer_status,
                 importer_connected,
             } => {
-                self.app_state.station_info.exciter =
-                    Some(crate::station_info::EquipmentInfo {
-                        manufacturer_id,
-                        core_version,
-                        core_status,
-                        manufacturer_version,
-                        manufacturer_status,
-                        importer_connected: Some(importer_connected),
-                    });
+                self.app_state.station_info.exciter = Some(crate::station_info::EquipmentInfo {
+                    manufacturer_id,
+                    core_version,
+                    core_status,
+                    manufacturer_version,
+                    manufacturer_status,
+                    importer_connected: Some(importer_connected),
+                });
                 self.app_state.station_info.last_updated = Some(Instant::now());
             }
             NrscEvent::ImporterInfo {
@@ -2518,15 +2634,14 @@ impl Nrsc5App {
                 manufacturer_version,
                 manufacturer_status,
             } => {
-                self.app_state.station_info.importer =
-                    Some(crate::station_info::EquipmentInfo {
-                        manufacturer_id,
-                        core_version,
-                        core_status,
-                        manufacturer_version,
-                        manufacturer_status,
-                        importer_connected: None,
-                    });
+                self.app_state.station_info.importer = Some(crate::station_info::EquipmentInfo {
+                    manufacturer_id,
+                    core_version,
+                    core_status,
+                    manufacturer_version,
+                    manufacturer_status,
+                    importer_connected: None,
+                });
                 self.app_state.station_info.last_updated = Some(Instant::now());
             }
             NrscEvent::LocalTime {
@@ -2535,13 +2650,12 @@ impl Nrsc5App {
                 dst_local,
                 dst_schedule,
             } => {
-                self.app_state.station_info.local_time =
-                    Some(crate::station_info::LocalTimeInfo {
-                        utc_offset_minutes,
-                        dst_regional,
-                        dst_local,
-                        dst_schedule,
-                    });
+                self.app_state.station_info.local_time = Some(crate::station_info::LocalTimeInfo {
+                    utc_offset_minutes,
+                    dst_regional,
+                    dst_local,
+                    dst_schedule,
+                });
                 self.app_state.station_info.last_updated = Some(Instant::now());
             }
             NrscEvent::LeapSecondOffset {
@@ -2564,13 +2678,12 @@ impl Nrsc5App {
                 rdbi,
             } => {
                 // Plumbed for diagnostics; not rendered today.
-                self.app_state.station_info.am_sync =
-                    Some(crate::station_info::AmSyncIndicators {
-                        pli,
-                        hppi,
-                        aabi,
-                        rdbi,
-                    });
+                self.app_state.station_info.am_sync = Some(crate::station_info::AmSyncIndicators {
+                    pli,
+                    hppi,
+                    aabi,
+                    rdbi,
+                });
             }
             _ => {}
         }
@@ -2593,8 +2706,7 @@ impl Nrsc5App {
                             self.nrsc5 = Some(p);
                         }
                         Err(err) => {
-                            self.app_state.nrsc5_status =
-                                format!("NRSC5 unavailable: {err}");
+                            self.app_state.nrsc5_status = format!("NRSC5 unavailable: {err}");
                             return;
                         }
                     }
@@ -2643,6 +2755,9 @@ impl Nrsc5App {
                     self.config.manual_gain_tenths,
                     antenna,
                     self.config.agc_amp_target_dbfs_override,
+                    self.config.analog_fallback_mode,
+                    self.config.analog_fallback_stereo,
+                    self.config.analog_fallback_rds_enabled,
                 );
 
                 if let Err(err) = result {
@@ -2780,8 +2895,7 @@ impl Nrsc5App {
                         });
 
                         self.retune_task = Some(handle);
-                        self.app_state.nrsc5_status =
-                            format!("retuning to {mhz:.1} MHz...");
+                        self.app_state.nrsc5_status = format!("retuning to {mhz:.1} MHz...");
                         return;
                     }
                 }
@@ -2809,24 +2923,19 @@ impl Nrsc5App {
                     if let Some(nrsc5) = self.nrsc5.as_mut() {
                         match nrsc5.set_active_speaker(clamped) {
                             Ok(()) => {
-                                self.app_state.nrsc5_status = format!(
-                                    "switched to HD{}",
-                                    clamped + 1
-                                );
+                                self.app_state.nrsc5_status =
+                                    format!("switched to HD{}", clamped + 1);
                             }
                             Err(err) => {
-                                self.app_state.nrsc5_status = format!(
-                                    "could not switch to HD{}: {err}",
-                                    clamped + 1
-                                );
+                                self.app_state.nrsc5_status =
+                                    format!("could not switch to HD{}: {err}", clamped + 1);
                             }
                         }
                     }
                     return;
                 }
 
-                self.app_state.nrsc5_status =
-                    format!("selected HD{} (staged)", clamped + 1);
+                self.app_state.nrsc5_status = format!("selected HD{} (staged)", clamped + 1);
             }
             UiCommand::SetShowHd5Hd8(flag) => {
                 self.app_state.show_hd5_hd8 = flag;
@@ -2846,9 +2955,7 @@ impl Nrsc5App {
                 self.app_state.recording_mode = mode;
                 save_config(&self.config);
                 self.app_state.nrsc5_status = match mode {
-                    crate::config::RecordingMode::Off => {
-                        "recording disabled".to_string()
-                    }
+                    crate::config::RecordingMode::Off => "recording disabled".to_string(),
                     crate::config::RecordingMode::On => {
                         "recording enabled (rotates at max minutes)".to_string()
                     }
@@ -2887,8 +2994,7 @@ impl Nrsc5App {
                     short
                 } else if !self.app_state.active_program().artist.is_empty() {
                     self.app_state.active_program().artist.clone()
-                } else if let Some(cs) = self.app_state.station_info.call_sign.clone()
-                {
+                } else if let Some(cs) = self.app_state.station_info.call_sign.clone() {
                     cs
                 } else if !self.app_state.call_sign.is_empty() {
                     self.app_state.call_sign.clone()
@@ -2906,8 +3012,7 @@ impl Nrsc5App {
                 }
                 self.config.presets[slot] = preset;
                 save_config(&self.config);
-                self.app_state.nrsc5_status =
-                    format!("saved preset {}", slot + 1);
+                self.app_state.nrsc5_status = format!("saved preset {}", slot + 1);
             }
             UiCommand::SetPreset(slot, preset) => {
                 let mut preset = preset;
@@ -2918,15 +3023,13 @@ impl Nrsc5App {
                 }
                 self.config.presets[slot] = preset;
                 save_config(&self.config);
-                self.app_state.nrsc5_status =
-                    format!("saved preset {}", slot + 1);
+                self.app_state.nrsc5_status = format!("saved preset {}", slot + 1);
             }
             UiCommand::ClearPreset(slot) => {
                 if slot < self.config.presets.len() {
                     self.config.presets[slot] = crate::config::Preset::default();
                     save_config(&self.config);
-                    self.app_state.nrsc5_status =
-                        format!("cleared preset {}", slot + 1);
+                    self.app_state.nrsc5_status = format!("cleared preset {}", slot + 1);
                 }
             }
             UiCommand::RecallPreset(slot) => {
@@ -2934,12 +3037,8 @@ impl Nrsc5App {
                     let tuned = snap_fm_tune_mhz(preset.frequency_mhz);
                     self.app_state.frequency_mhz = tuned;
                     self.app_state.selected_program = preset.program;
-                    self.app_state.nrsc5_status = format!(
-                        "preset {}: {:.1} HD{}",
-                        slot + 1,
-                        tuned,
-                        preset.program + 1
-                    );
+                    self.app_state.nrsc5_status =
+                        format!("preset {}: {:.1} HD{}", slot + 1, tuned, preset.program + 1);
                     // If streaming, retune to the new station.
                     if self.app_state.is_streaming {
                         self.handle_command(UiCommand::TuneMhz(tuned));
@@ -2989,8 +3088,7 @@ impl Nrsc5App {
             UiCommand::BlockCover(hash) => {
                 // Add to the persistent block list.
                 if self.art_blocklist.insert(hash) {
-                    self.config.art_blocklist =
-                        self.art_blocklist.iter().copied().collect();
+                    self.config.art_blocklist = self.art_blocklist.iter().copied().collect();
                     save_config(&self.config);
                     self.app_state.art_blocklist_count = self.art_blocklist.len();
                 }
@@ -3071,13 +3169,73 @@ impl Nrsc5App {
                     }
                 }
             }
+            UiCommand::SetAnalogFallbackMode(mode) => {
+                if self.config.analog_fallback_mode == mode {
+                    self.app_state.analog_fallback_mode = mode;
+                    return;
+                }
+                self.config.analog_fallback_mode = mode;
+                self.app_state.analog_fallback_mode = mode;
+                save_config(&self.config);
+                if self.app_state.is_streaming {
+                    self.app_state.nrsc5_status = match mode {
+                        crate::config::AnalogFallbackMode::DigitalOnly => {
+                            "restarting stream to disable analog fallback".to_string()
+                        }
+                        crate::config::AnalogFallbackMode::Automatic => {
+                            "restarting stream to apply automatic analog fallback".to_string()
+                        }
+                        crate::config::AnalogFallbackMode::AnalogOnly => {
+                            "restarting stream to force analog fallback".to_string()
+                        }
+                    };
+                    self.handle_command(UiCommand::Stop);
+                    self.handle_command(UiCommand::Start);
+                }
+            }
+            UiCommand::SetAnalogFallbackStereo(stereo) => {
+                if self.config.analog_fallback_stereo == stereo {
+                    self.app_state.analog_fallback_stereo = stereo;
+                    return;
+                }
+                self.config.analog_fallback_stereo = stereo;
+                self.app_state.analog_fallback_stereo = stereo;
+                save_config(&self.config);
+                if self.app_state.is_streaming {
+                    self.app_state.nrsc5_status = if stereo {
+                        "restarting stream to enable stereo analog fallback".to_string()
+                    } else {
+                        "restarting stream to force mono analog fallback".to_string()
+                    };
+                    self.handle_command(UiCommand::Stop);
+                    self.handle_command(UiCommand::Start);
+                }
+            }
+            UiCommand::SetAnalogFallbackRdsEnabled(enabled) => {
+                if self.config.analog_fallback_rds_enabled == enabled {
+                    self.app_state.analog_fallback_rds_enabled = enabled;
+                    return;
+                }
+                self.config.analog_fallback_rds_enabled = enabled;
+                self.app_state.analog_fallback_rds_enabled = enabled;
+                save_config(&self.config);
+                if self.app_state.is_streaming {
+                    self.app_state.nrsc5_status = if enabled {
+                        "restarting stream to enable analog RDS".to_string()
+                    } else {
+                        "restarting stream to disable analog RDS".to_string()
+                    };
+                    self.handle_command(UiCommand::Stop);
+                    self.handle_command(UiCommand::Start);
+                }
+            }
             UiCommand::ExportLogCsv => {
                 // Native Save-As dialog defaults to Documents with a
                 // timestamped filename. User can redirect anywhere (e.g.
                 // OneDrive, a USB stick, the portable bundle's own folder).
                 let suggested_filename = crate::play_log::suggested_csv_filename();
-                let start_dir = crate::paths::documents_dir()
-                    .unwrap_or_else(|| std::path::PathBuf::from("."));
+                let start_dir =
+                    crate::paths::documents_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
                 let chosen = rfd::FileDialog::new()
                     .set_title("Export play log as CSV")
                     .set_directory(&start_dir)
@@ -3094,8 +3252,7 @@ impl Nrsc5App {
                             Some(format!("saved to {}", path.display()));
                     }
                     Err(err) => {
-                        self.app_state.log_export_status =
-                            Some(format!("export failed: {err}"));
+                        self.app_state.log_export_status = Some(format!("export failed: {err}"));
                     }
                 }
             }
@@ -3126,7 +3283,13 @@ impl Nrsc5App {
                 // list; users can hit "Refresh" inside the modal to
                 // re-enumerate on demand.
                 if !self.app_state.show_sdr_settings {
-                    self.refresh_sdr_devices();
+                    if should_auto_refresh_sdr_devices(
+                        self.config.sdr.transport,
+                        self.sdr_refresh_in_flight,
+                        self.app_state.sdr_devices.is_empty(),
+                    ) {
+                        self.refresh_sdr_devices();
+                    }
                 }
                 // Seed the remote-input edit buffers from config so
                 // the Host/Port/Extra-args fields show the persisted
@@ -3135,14 +3298,9 @@ impl Nrsc5App {
                 // (`sdr_remote_buf_seeded`) so we don't clobber an
                 // in-progress edit on a re-open.
                 if !self.app_state.sdr_remote_buf_seeded {
-                    self.app_state.sdr_remote_host_buf = self
-                        .config
-                        .sdr
-                        .remote_host
-                        .clone()
-                        .unwrap_or_default();
-                    self.app_state.sdr_remote_port_buf =
-                        self.config.sdr.effective_remote_port();
+                    self.app_state.sdr_remote_host_buf =
+                        self.config.sdr.remote_host.clone().unwrap_or_default();
+                    self.app_state.sdr_remote_port_buf = self.config.sdr.effective_remote_port();
                     self.app_state.sdr_remote_extra_buf = self
                         .config
                         .sdr
@@ -3180,7 +3338,10 @@ impl Nrsc5App {
             UiCommand::RefreshSdrDevices => {
                 self.refresh_sdr_devices();
             }
-            UiCommand::SelectSdrDevice { driver, device_args } => {
+            UiCommand::SelectSdrDevice {
+                driver,
+                device_args,
+            } => {
                 // Persist immediately. Takes effect on the next piped
                 // Start (we don't restart the stream automatically —
                 // the user might be mid-tune and that would be jarring).
@@ -3247,8 +3408,7 @@ impl Nrsc5App {
                 // match the new transport (1234 for rtl_tcp, 55132 for
                 // SoapyRemote) when the user hasn't pinned an explicit
                 // value.
-                self.app_state.sdr_remote_port_buf =
-                    self.config.sdr.effective_remote_port();
+                self.app_state.sdr_remote_port_buf = self.config.sdr.effective_remote_port();
             }
             UiCommand::SetSdrRemoteHost(host) => {
                 let trimmed = host.trim();
@@ -3288,73 +3448,89 @@ impl Nrsc5App {
     }
 
     /// Re-enumerate SoapySDR devices and refresh the live gain-element
-    /// list for the configured device. Called when the SDR Settings
-    /// modal is first opened, when the user clicks "Refresh", and after
-    /// any config change that affects which device is active.
-    ///
-    /// The enumeration runs synchronously on the UI thread — every
-    /// supported SDR driver currently completes it in well under 50 ms.
-    /// If that becomes a problem (e.g. when SoapyRemote arrives in 0.4.0
-    /// and starts walking the LAN), this should move to a worker thread.
+    /// list for the configured device. The work runs in a background
+    /// thread so opening the Settings modal stays responsive even when a
+    /// Soapy module is slow to enumerate (e.g. SDRplay service startup).
     fn refresh_sdr_devices(&mut self) {
-        let (devices, diagnostics) =
-            crate::sdr::SoapySdr::enumerate_devices_with_diagnostics();
-        self.app_state.sdr_devices = devices;
-        self.app_state.sdr_devices_last_refreshed = Some(Instant::now());
-
-        // Best-effort write of the per-call diagnostic snapshot. When
-        // a user reports "no devices detected" they (or we) can open
-        // this file to see exactly what each module's enumerate pass
-        // returned + which env vars were active. Failure to write the
-        // file is not a reason to drop the device list.
-        //
-        // We **append** rather than truncate so that a subsequent
-        // Refresh click does not wipe the post-`configure` blocks
-        // the SDR backend writes on Start. Triage flow: user clicks
-        // Refresh → enumeration block appended; user clicks Start
-        // → configure marker + state block appended by the SDR
-        // backend; user clicks Open diagnostics → sees the full
-        // chronological log. Without the append change, Refresh
-        // would silently erase the very lines we need.
-        if let Some(path) = crate::paths::sdr_diagnostics_file() {
-            if let Some(parent) = path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            let _ = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)
-                .and_then(|mut f| {
-                    std::io::Write::write_all(&mut f, diagnostics.as_bytes())
-                });
+        if !matches!(
+            self.config.sdr.transport,
+            crate::config::SdrTransport::LocalSoapy
+        ) {
+            return;
+        }
+        if self.sdr_refresh_in_flight {
+            return;
         }
 
-        // For the gain elements we need a live device, not just an
-        // enumeration entry. Open the configured device read-only just
-        // long enough to query its element list, then drop it. Don't
-        // touch a device that's already open for a running stream —
-        // that would race with the I/Q pump.
-        self.app_state.sdr_gain_elements = if self.app_state.is_streaming {
-            // Streaming: ask the live SDR backend through the FFI
-            // wrapper which already holds the device open.
-            self.nrsc5
-                .as_ref()
-                .map(|n| n.sdr_gain_elements())
-                .unwrap_or_default()
-        } else {
-            // Idle: try a quick open-and-close. Errors here just mean
-            // the user's configured device isn't currently attached,
-            // which the modal renders as an empty element list with a
-            // "device not found" hint.
-            let args = self.config.sdr.to_args_string();
-            match crate::sdr::SoapySdr::open(&args) {
-                Ok(sdr) => {
-                    use crate::sdr::Sdr;
-                    sdr.gain_elements()
+        self.sdr_refresh_in_flight = true;
+        self.app_state.sdr_devices_refresh_in_flight = true;
+        self.app_state.sdr_devices_last_refreshed = None;
+
+        let tx = self.sdr_refresh_tx.clone();
+        let args = self.config.sdr.to_args_string();
+        let is_streaming = self.app_state.is_streaming;
+        std::thread::spawn(move || {
+            let (devices, diagnostics) = crate::sdr::SoapySdr::enumerate_devices_with_diagnostics();
+            let gain_elements = if is_streaming {
+                Vec::new()
+            } else {
+                match crate::sdr::SoapySdr::open(&args) {
+                    Ok(sdr) => {
+                        use crate::sdr::Sdr;
+                        sdr.gain_elements()
+                    }
+                    Err(_) => Vec::new(),
                 }
-                Err(_) => Vec::new(),
+            };
+            let _ = tx.send(SdrDeviceRefreshResult {
+                devices,
+                gain_elements,
+                diagnostics,
+            });
+        });
+    }
+
+    fn drain_sdr_refresh_results(&mut self) {
+        let mut latest = None;
+        while let Ok(result) = self.sdr_refresh_rx.try_recv() {
+            latest = Some(result);
+        }
+
+        if let Some(result) = latest {
+            let matching_device = pick_best_sdr_device(
+                &self.config.sdr.driver,
+                &self.config.sdr.device_args,
+                &result.devices,
+            );
+            if let Some(dev) = matching_device {
+                let same_selection = dev.driver == self.config.sdr.driver
+                    && dev.args_after_driver() == self.config.sdr.device_args;
+                if !same_selection {
+                    self.config.sdr.driver = dev.driver.clone();
+                    self.config.sdr.device_args = dev.args_after_driver();
+                    save_config(&self.config);
+                }
             }
-        };
+
+            self.app_state.sdr_devices = result.devices;
+            self.app_state.sdr_devices_last_refreshed = Some(Instant::now());
+            self.app_state.sdr_gain_elements = result.gain_elements;
+            self.app_state.sdr_devices_refresh_in_flight = false;
+            self.sdr_refresh_in_flight = false;
+
+            if let Some(path) = crate::paths::sdr_diagnostics_file() {
+                if let Some(parent) = path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let _ = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
+                    .and_then(|mut f| {
+                        std::io::Write::write_all(&mut f, result.diagnostics.as_bytes())
+                    });
+            }
+        }
     }
 
     /// Render the unified Settings modal. Five tabs in a left rail —
@@ -3369,11 +3545,7 @@ impl Nrsc5App {
     ///
     /// Closing dispatches `HideSdrSettings` rather than mutating state
     /// directly so the next-tick is consistent with other state changes.
-    fn render_sdr_settings_modal(
-        &mut self,
-        ctx: &egui::Context,
-        commands: &mut Vec<UiCommand>,
-    ) {
+    fn render_sdr_settings_modal(&mut self, ctx: &egui::Context, commands: &mut Vec<UiCommand>) {
         use crate::gui::state::SettingsTab;
         let mut open = true;
 
@@ -3385,16 +3557,10 @@ impl Nrsc5App {
         let active_driver = self.config.sdr.driver.clone();
         let current_ppm = self.config.sdr.freq_correction_ppm;
         let show_hd5_hd8 = self.app_state.show_hd5_hd8;
-        let collage_secondary_click_fallback =
-            self.app_state.collage_secondary_click_fallback;
+        let collage_secondary_click_fallback = self.app_state.collage_secondary_click_fallback;
         let transport = self.config.sdr.transport;
         let is_streaming = self.app_state.is_streaming;
-        let config_remote_host = self
-            .config
-            .sdr
-            .remote_host
-            .clone()
-            .unwrap_or_default();
+        let config_remote_host = self.config.sdr.remote_host.clone().unwrap_or_default();
         let config_remote_port = self.config.sdr.effective_remote_port();
         let config_remote_extra = self
             .config
@@ -3402,11 +3568,14 @@ impl Nrsc5App {
             .remote_extra_args
             .clone()
             .unwrap_or_default();
-        let last_refreshed_label = self
-            .app_state
-            .sdr_devices_last_refreshed
-            .map(|t| format!("refreshed {}s ago", t.elapsed().as_secs()))
-            .unwrap_or_else(|| "not yet refreshed".to_string());
+        let last_refreshed_label = if self.app_state.sdr_devices_refresh_in_flight {
+            "refreshing…".to_string()
+        } else {
+            self.app_state
+                .sdr_devices_last_refreshed
+                .map(|t| format!("refreshed {}s ago", t.elapsed().as_secs()))
+                .unwrap_or_else(|| "not yet refreshed".to_string())
+        };
 
         // Short, plain-English summary of the current transport for the
         // header strip. Mirrors what `to_args_string()` produces but in
@@ -3519,16 +3688,12 @@ impl Nrsc5App {
                                     .color(status_color),
                             );
                             ui.separator();
-                            ui.label(
-                                egui::RichText::new(&transport_summary)
-                                    .monospace(),
-                            );
+                            ui.label(egui::RichText::new(&transport_summary).monospace());
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
-                                    ui.code(&active_args).on_hover_text(
-                                        "Effective Soapy args / connection string",
-                                    );
+                                    ui.code(&active_args)
+                                        .on_hover_text("Effective Soapy args / connection string");
                                 },
                             );
                         });
@@ -3546,27 +3711,20 @@ impl Nrsc5App {
                         // label text to the left edge, so the emoji
                         // glyphs (which have varying advance widths)
                         // all start at the same x.
-                        ui.with_layout(
-                            egui::Layout::top_down_justified(egui::Align::LEFT),
-                            |ui| {
-                                for tab in [
-                                    SettingsTab::Connection,
-                                    SettingsTab::Gain,
-                                    SettingsTab::Display,
-                                    SettingsTab::Recording,
-                                ] {
-                                    let selected =
-                                        self.app_state.settings_tab == tab;
-                                    let resp = ui.selectable_label(
-                                        selected,
-                                        tab.label(),
-                                    );
-                                    if resp.clicked() && !selected {
-                                        self.app_state.settings_tab = tab;
-                                    }
+                        ui.with_layout(egui::Layout::top_down_justified(egui::Align::LEFT), |ui| {
+                            for tab in [
+                                SettingsTab::Connection,
+                                SettingsTab::Gain,
+                                SettingsTab::Display,
+                                SettingsTab::Recording,
+                            ] {
+                                let selected = self.app_state.settings_tab == tab;
+                                let resp = ui.selectable_label(selected, tab.label());
+                                if resp.clicked() && !selected {
+                                    self.app_state.settings_tab = tab;
                                 }
-                            },
-                        );
+                            }
+                        });
                     });
 
                 // ---- Center pane (active tab body) -----------------
@@ -3574,42 +3732,37 @@ impl Nrsc5App {
                     egui::ScrollArea::vertical()
                         .id_salt("settings_tab_body")
                         .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            match self.app_state.settings_tab {
-                                SettingsTab::Connection => {
-                                    self.render_settings_connection_tab(
-                                        ui,
-                                        commands,
-                                        transport,
-                                        &active_driver,
-                                        &config_remote_host,
-                                        config_remote_port,
-                                        &config_remote_extra,
-                                        &last_refreshed_label,
-                                    );
-                                }
-                                SettingsTab::Gain => {
-                                    self.render_settings_gain_tab(
-                                        ui,
-                                        commands,
-                                        &active_driver,
-                                        current_ppm,
-                                    );
-                                }
-                                SettingsTab::Display => {
-                                    self.render_settings_display_tab(
-                                        ui,
-                                        commands,
-                                        show_hd5_hd8,
-                                        collage_secondary_click_fallback,
-                                    );
-                                }
-                                SettingsTab::Recording => {
-                                    self.render_settings_recording_tab(
-                                        ui,
-                                        commands,
-                                    );
-                                }
+                        .show(ui, |ui| match self.app_state.settings_tab {
+                            SettingsTab::Connection => {
+                                self.render_settings_connection_tab(
+                                    ui,
+                                    commands,
+                                    transport,
+                                    &active_driver,
+                                    &config_remote_host,
+                                    config_remote_port,
+                                    &config_remote_extra,
+                                    &last_refreshed_label,
+                                );
+                            }
+                            SettingsTab::Gain => {
+                                self.render_settings_gain_tab(
+                                    ui,
+                                    commands,
+                                    &active_driver,
+                                    current_ppm,
+                                );
+                            }
+                            SettingsTab::Display => {
+                                self.render_settings_display_tab(
+                                    ui,
+                                    commands,
+                                    show_hd5_hd8,
+                                    collage_secondary_click_fallback,
+                                );
+                            }
+                            SettingsTab::Recording => {
+                                self.render_settings_recording_tab(ui, commands);
                             }
                         });
                 });
@@ -3640,11 +3793,9 @@ impl Nrsc5App {
         // ---- Transport selector ------------------------------------
         ui.heading("Transport");
         ui.label(
-            egui::RichText::new(
-                "Transport changes take effect on the next Stop/Start cycle.",
-            )
-            .small()
-            .color(egui::Color32::from_gray(140)),
+            egui::RichText::new("Transport changes take effect on the next Stop/Start cycle.")
+                .small()
+                .color(egui::Color32::from_gray(140)),
         );
         ui.add_space(2.0);
 
@@ -3689,12 +3840,7 @@ impl Nrsc5App {
         // ---- Per-transport device section --------------------------
         match transport {
             crate::config::SdrTransport::LocalSoapy => {
-                self.render_local_device_section(
-                    ui,
-                    commands,
-                    active_driver,
-                    last_refreshed_label,
-                );
+                self.render_local_device_section(ui, commands, active_driver, last_refreshed_label);
             }
             crate::config::SdrTransport::SoapyRemote
             | crate::config::SdrTransport::RtlTcpRemote => {
@@ -3725,39 +3871,31 @@ impl Nrsc5App {
         // diagnostics on the right.
         ui.horizontal(|ui| {
             ui.heading("Local devices");
-            ui.with_layout(
-                egui::Layout::right_to_left(egui::Align::Center),
-                |ui| {
-                    if ui
-                        .small_button("Open diagnostics\u{2026}")
-                        .on_hover_text(
-                            "Open the SDR-diagnostics text file (PATH, \
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .small_button("Open diagnostics\u{2026}")
+                    .on_hover_text(
+                        "Open the SDR-diagnostics text file (PATH, \
                              SOAPY_SDR_PLUGIN_PATH, per-driver enumerate \
                              results) so you can paste it into a bug report.",
-                        )
-                        .clicked()
-                    {
-                        if let Some(p) = crate::paths::sdr_diagnostics_file() {
-                            let _ = std::process::Command::new("cmd")
-                                .args([
-                                    "/C",
-                                    "start",
-                                    "",
-                                    p.to_string_lossy().as_ref(),
-                                ])
-                                .spawn();
-                        }
+                    )
+                    .clicked()
+                {
+                    if let Some(p) = crate::paths::sdr_diagnostics_file() {
+                        let _ = std::process::Command::new("cmd")
+                            .args(["/C", "start", "", p.to_string_lossy().as_ref()])
+                            .spawn();
                     }
-                    ui.label(
-                        egui::RichText::new(last_refreshed_label)
-                            .small()
-                            .color(egui::Color32::from_gray(140)),
-                    );
-                    if ui.button("\u{21BB}  Refresh").clicked() {
-                        commands.push(UiCommand::RefreshSdrDevices);
-                    }
-                },
-            );
+                }
+                ui.label(
+                    egui::RichText::new(last_refreshed_label)
+                        .small()
+                        .color(egui::Color32::from_gray(140)),
+                );
+                if ui.button("\u{21BB}  Refresh").clicked() {
+                    commands.push(UiCommand::RefreshSdrDevices);
+                }
+            });
         });
         ui.add_space(4.0);
 
@@ -3777,14 +3915,9 @@ impl Nrsc5App {
                 .show(ui, |ui| {
                     for dev in &self.app_state.sdr_devices {
                         let is_active = dev.driver == active_driver
-                            && self.config.sdr.device_args
-                                == dev.args_after_driver();
+                            && self.config.sdr.device_args == dev.args_after_driver();
                         let label = if dev.label.is_empty() {
-                            format!(
-                                "[{}]  {}",
-                                dev.driver,
-                                dev.args_after_driver()
-                            )
+                            format!("[{}]  {}", dev.driver, dev.args_after_driver())
                         } else {
                             format!("[{}]  {}", dev.driver, dev.label)
                         };
@@ -3812,10 +3945,7 @@ impl Nrsc5App {
 
         if let Some(profile) = crate::sdr::profile::lookup(active_driver) {
             ui.horizontal(|ui| {
-                ui.heading(format!(
-                    "{} ({})",
-                    profile.display_name, profile.driver
-                ));
+                ui.heading(format!("{} ({})", profile.display_name, profile.driver));
                 if !profile.bench_validated {
                     ui.label(
                         egui::RichText::new("\u{26A0} not bench-validated")
@@ -3860,15 +3990,11 @@ impl Nrsc5App {
             .show(ui, |ui| {
                 ui.label("Host:");
                 let resp = ui.add(
-                    egui::TextEdit::singleline(
-                        &mut self.app_state.sdr_remote_host_buf,
-                    )
-                    .desired_width(220.0)
-                    .hint_text("192.168.0.10"),
+                    egui::TextEdit::singleline(&mut self.app_state.sdr_remote_host_buf)
+                        .desired_width(220.0)
+                        .hint_text("192.168.0.10"),
                 );
-                if resp.lost_focus()
-                    && self.app_state.sdr_remote_host_buf != config_remote_host
-                {
+                if resp.lost_focus() && self.app_state.sdr_remote_host_buf != config_remote_host {
                     commands.push(UiCommand::SetSdrRemoteHost(
                         self.app_state.sdr_remote_host_buf.clone(),
                     ));
@@ -3877,10 +4003,7 @@ impl Nrsc5App {
 
                 ui.label("Port:");
                 let resp = ui.add(
-                    egui::DragValue::new(
-                        &mut self.app_state.sdr_remote_port_buf,
-                    )
-                    .range(1..=65535),
+                    egui::DragValue::new(&mut self.app_state.sdr_remote_port_buf).range(1..=65535),
                 );
                 if (resp.drag_stopped() || resp.lost_focus())
                     && self.app_state.sdr_remote_port_buf != config_remote_port
@@ -3894,15 +4017,12 @@ impl Nrsc5App {
                 if transport == crate::config::SdrTransport::SoapyRemote {
                     ui.label("Extra args:");
                     let resp = ui.add(
-                        egui::TextEdit::singleline(
-                            &mut self.app_state.sdr_remote_extra_buf,
-                        )
-                        .desired_width(320.0)
-                        .hint_text("(optional, e.g. remote:driver=rtlsdr)"),
+                        egui::TextEdit::singleline(&mut self.app_state.sdr_remote_extra_buf)
+                            .desired_width(320.0)
+                            .hint_text("(optional, e.g. remote:driver=rtlsdr)"),
                     );
                     if resp.lost_focus()
-                        && self.app_state.sdr_remote_extra_buf
-                            != config_remote_extra
+                        && self.app_state.sdr_remote_extra_buf != config_remote_extra
                     {
                         commands.push(UiCommand::SetSdrRemoteExtraArgs(
                             self.app_state.sdr_remote_extra_buf.clone(),
@@ -3988,25 +4108,15 @@ impl Nrsc5App {
                         } else {
                             0.1
                         };
-                        ui.label(
-                            egui::RichText::new(format!("{:>6}", elem.name))
-                                .monospace(),
-                        );
+                        ui.label(egui::RichText::new(format!("{:>6}", elem.name)).monospace());
                         let resp = ui.add(
-                            egui::Slider::new(
-                                &mut value,
-                                elem.min_db..=elem.max_db,
-                            )
-                            .step_by(step)
-                            .suffix(" dB")
-                            .clamp_to_range(true),
+                            egui::Slider::new(&mut value, elem.min_db..=elem.max_db)
+                                .step_by(step)
+                                .suffix(" dB")
+                                .clamp_to_range(true),
                         );
-                        if resp.drag_stopped()
-                            || resp.lost_focus()
-                            || resp.changed()
-                        {
-                            let prev =
-                                self.config.sdr.gains.get(&elem.name).copied();
+                        if resp.drag_stopped() || resp.lost_focus() || resp.changed() {
+                            let prev = self.config.sdr.gains.get(&elem.name).copied();
                             if prev.map_or(true, |p| (p - value).abs() > 1e-6) {
                                 commands.push(UiCommand::SetSdrGainElement {
                                     element: elem.name.clone(),
@@ -4099,22 +4209,16 @@ impl Nrsc5App {
                 );
                 ui.add_space(6.0);
 
-                let mut override_enabled =
-                    self.app_state.agc_amp_target_dbfs_override.is_some();
+                let mut override_enabled = self.app_state.agc_amp_target_dbfs_override.is_some();
                 let mut override_value = self
                     .app_state
                     .agc_amp_target_dbfs_override
                     .unwrap_or(profile_default);
 
-                let checkbox_resp = ui.checkbox(
-                    &mut override_enabled,
-                    "Use a custom target",
-                );
+                let checkbox_resp = ui.checkbox(&mut override_enabled, "Use a custom target");
                 if checkbox_resp.changed() {
                     if override_enabled {
-                        commands.push(UiCommand::SetAgcAmpTargetDbfs(Some(
-                            override_value,
-                        )));
+                        commands.push(UiCommand::SetAgcAmpTargetDbfs(Some(override_value)));
                     } else {
                         commands.push(UiCommand::SetAgcAmpTargetDbfs(None));
                     }
@@ -4134,9 +4238,7 @@ impl Nrsc5App {
                     {
                         let prev = self.app_state.agc_amp_target_dbfs_override;
                         if prev.map_or(true, |p| (p - override_value).abs() > 1e-3) {
-                            commands.push(UiCommand::SetAgcAmpTargetDbfs(Some(
-                                override_value,
-                            )));
+                            commands.push(UiCommand::SetAgcAmpTargetDbfs(Some(override_value)));
                         }
                     }
                 });
@@ -4226,9 +4328,7 @@ impl Nrsc5App {
             if (resp.drag_stopped() || resp.lost_focus() || resp.changed())
                 && (slot_count as u32) != self.app_state.preset_slot_count
             {
-                commands.push(UiCommand::SetPresetSlotCount(
-                    slot_count.clamp(1, 48) as u32,
-                ));
+                commands.push(UiCommand::SetPresetSlotCount(slot_count.clamp(1, 48) as u32));
             }
         });
         ui.label(
@@ -4291,19 +4391,13 @@ impl Nrsc5App {
             .color(egui::Color32::from_gray(140)),
         );
         if fallback_resp.changed() {
-            commands.push(UiCommand::SetCollageSecondaryClickFallback(
-                fallback,
-            ));
+            commands.push(UiCommand::SetCollageSecondaryClickFallback(fallback));
         }
     }
 
     /// Recording tab: mode, output folder, max minutes per file, per-
     /// station subfolders.
-    fn render_settings_recording_tab(
-        &mut self,
-        ui: &mut egui::Ui,
-        commands: &mut Vec<UiCommand>,
-    ) {
+    fn render_settings_recording_tab(&mut self, ui: &mut egui::Ui, commands: &mut Vec<UiCommand>) {
         ui.heading("Recording");
         ui.label(
             egui::RichText::new(
@@ -4326,15 +4420,11 @@ impl Nrsc5App {
             .spacing([12.0, 6.0])
             .show(ui, |ui| {
                 ui.label("Folder:");
-                let current_dir = self
-                    .config
-                    .recording_dir
-                    .clone()
-                    .unwrap_or_else(|| {
-                        crate::paths::default_recording_dir()
-                            .map(|p| p.display().to_string())
-                            .unwrap_or_else(|| "<unresolved>".to_string())
-                    });
+                let current_dir = self.config.recording_dir.clone().unwrap_or_else(|| {
+                    crate::paths::default_recording_dir()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "<unresolved>".to_string())
+                });
                 ui.horizontal(|ui| {
                     ui.add(
                         egui::TextEdit::singleline(&mut current_dir.clone())
@@ -4348,8 +4438,8 @@ impl Nrsc5App {
                             .as_ref()
                             .map(std::path::PathBuf::from)
                             .or_else(crate::paths::default_recording_dir);
-                        let mut dialog = rfd::FileDialog::new()
-                            .set_title("Choose recordings folder");
+                        let mut dialog =
+                            rfd::FileDialog::new().set_title("Choose recordings folder");
                         if let Some(d) = start_dir.as_ref() {
                             dialog = dialog.set_directory(d);
                         }
@@ -4362,9 +4452,7 @@ impl Nrsc5App {
                     if self.config.recording_dir.is_some()
                         && ui
                             .button("Reset")
-                            .on_hover_text(
-                                "Revert to the default recordings folder",
-                            )
+                            .on_hover_text("Revert to the default recordings folder")
                             .clicked()
                     {
                         commands.push(UiCommand::SetRecordingDir(None));
@@ -4373,8 +4461,7 @@ impl Nrsc5App {
                 ui.end_row();
 
                 ui.label("Max minutes per file:");
-                let mut max_minutes =
-                    self.config.recording_max_minutes as i32;
+                let mut max_minutes = self.config.recording_max_minutes as i32;
                 let resp = ui.add(
                     egui::DragValue::new(&mut max_minutes)
                         .range(1..=240)
@@ -4383,7 +4470,7 @@ impl Nrsc5App {
                 );
                 if resp.changed() {
                     commands.push(UiCommand::SetRecordingMaxMinutes(
-                        max_minutes.clamp(1, 240) as u32,
+                        max_minutes.clamp(1, 240) as u32
                     ));
                 }
                 ui.end_row();
@@ -4401,10 +4488,7 @@ impl Nrsc5App {
 
         ui.add_space(10.0);
         let mut subfolder = self.config.recording_subfolder_per_station;
-        let resp = ui.checkbox(
-            &mut subfolder,
-            "Group files into per-station subfolders",
-        );
+        let resp = ui.checkbox(&mut subfolder, "Group files into per-station subfolders");
         if resp.changed() {
             commands.push(UiCommand::SetRecordingSubfolderPerStation(subfolder));
         }
@@ -4413,11 +4497,7 @@ impl Nrsc5App {
     /// Render the About dialog. Shows version (from `CARGO_PKG_VERSION`
     /// — set by Cargo at build time), license, attribution, and a few
     /// quick-reference links to project URLs.
-    fn render_about_dialog(
-        &mut self,
-        ctx: &egui::Context,
-        commands: &mut Vec<UiCommand>,
-    ) {
+    fn render_about_dialog(&mut self, ctx: &egui::Context, commands: &mut Vec<UiCommand>) {
         let mut open = true;
         egui::Window::new(egui::RichText::new("\u{2139}  About").size(18.0))
             .open(&mut open)
@@ -4477,10 +4557,7 @@ impl Nrsc5App {
                         ui.end_row();
 
                         ui.label(egui::RichText::new("egui / eframe").strong());
-                        ui.hyperlink_to(
-                            "github.com/emilk/egui",
-                            "https://github.com/emilk/egui",
-                        );
+                        ui.hyperlink_to("github.com/emilk/egui", "https://github.com/emilk/egui");
                         ui.end_row();
                     });
 
@@ -4498,14 +4575,11 @@ impl Nrsc5App {
 
                 ui.add_space(12.0);
                 ui.separator();
-                ui.with_layout(
-                    egui::Layout::right_to_left(egui::Align::Center),
-                    |ui| {
-                        if ui.button("Close").clicked() {
-                            commands.push(UiCommand::HideAbout);
-                        }
-                    },
-                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Close").clicked() {
+                        commands.push(UiCommand::HideAbout);
+                    }
+                });
             });
 
         if !open {
@@ -4514,36 +4588,202 @@ impl Nrsc5App {
     }
 }
 
-/// Derive the broadcaster call sign from an AAS LOT filename.
-///
-/// nrsc5 writes files as `{lot}_{name}` where `name` typically looks like
-/// `KEGLHD01da41.jpg` (call sign + "HD" + 2-digit subchannel + hex). We
-/// strip the leading lot prefix, find the "HD" marker, and return the
-/// 3-5 uppercase ASCII letters preceding it.
-/// Parse the subchannel and FCC call sign out of a station-logo LOT
-/// filename of the form `{lot}_SL<CALLSIGN>$$<NN><image#>.<ext>`, where
-/// `<NN>` is the 1-based zero-padded subchannel (`01`=HD1, `02`=HD2…).
-/// Examples: `SLKJKK$$010005.jpg` (KJKK HD1), `SLKEGL$$0211540000.png`
-/// (KEGL HD2). The embedded call sign is the real FCC sign even when SIS
-/// reports a vanity name (100.3 reports "JACK" but the logo is
-/// `SLKJKK$$…`).
-///
-/// Returns `(zero-based program, call sign)`, or `None` for names that
-/// don't match the `SL…$$` convention or whose subchannel digits are
-/// missing / out of the HD1–HD8 range. Album-art names
-/// (e.g. `MT0001764873_1440144.jpg`) never match.
-fn parse_station_logo_filename(filename: &str) -> Option<(u32, String)> {
-    let raw = filename
+#[derive(Debug, Clone, Copy)]
+enum LotImageClass {
+    StationLogo {
+        definitive: bool,
+        source: &'static str,
+    },
+    CoverArt {
+        source: &'static str,
+    },
+    GenericImage {
+        source: &'static str,
+    },
+    Other,
+}
+
+fn mime_hex(mime: u32) -> String {
+    format!("0x{mime:08X}")
+}
+
+fn station_logo_source_sidecar_path(path: &std::path::Path) -> std::path::PathBuf {
+    let mut with_suffix = path.as_os_str().to_os_string();
+    with_suffix.push(".src");
+    std::path::PathBuf::from(with_suffix)
+}
+
+fn lot_name_without_prefix(filename: &str) -> &str {
+    filename
         .split_once('_')
         .map(|(_, rest)| rest)
-        .unwrap_or(filename);
-    let (callsign, rest) = raw.strip_prefix("SL")?.split_once("$$")?;
-    let digits: String = rest.chars().take(2).collect();
-    let sub: u32 = digits.parse().ok()?;
-    if !(1..=8).contains(&sub) {
+        .unwrap_or(filename)
+}
+
+/// Parse any `HD<n>` / `HD0<n>` token from a broadcaster-provided LOT name.
+/// Returns the zero-based subchannel index (HD1 => 0 ... HD8 => 7).
+fn parse_hd_program_token(text_upper: &str) -> Option<u32> {
+    let bytes = text_upper.as_bytes();
+    let len = bytes.len();
+    if len < 3 {
         return None;
     }
-    Some((sub - 1, callsign.to_string()))
+    for i in 0..(len - 2) {
+        if bytes[i] != b'H' || bytes[i + 1] != b'D' {
+            continue;
+        }
+        let mut j = i + 2;
+        if j < len && bytes[j] == b'0' {
+            j += 1;
+        }
+        if j < len {
+            let d = bytes[j];
+            if (b'1'..=b'8').contains(&d) {
+                return Some((d - b'1') as u32);
+            }
+        }
+    }
+    None
+}
+
+/// Filename fallback heuristic for station logos. This is intentionally
+/// best-effort and only used when LOT metadata is generic/missing.
+///
+/// Recognized families include:
+/// - `SL<CALLSIGN>$$<NN>...` (legacy/known-good)
+/// - `SLHD<n>...` (seen in external markets)
+/// - `<CALLSIGN>HD0<n>...` / `<CALLSIGN>HD<n>...`
+fn parse_station_logo_filename(filename: &str) -> Option<(u32, String)> {
+    let raw = lot_name_without_prefix(filename);
+    let upper = raw.to_ascii_uppercase();
+
+    // Strongest signal: SL<CALLSIGN>$$<NN>...
+    if let Some(rest) = upper.strip_prefix("SL") {
+        if let Some((callsign, after)) = rest.split_once("$$") {
+            let digits: String = after.chars().take(2).collect();
+            if let Ok(sub) = digits.parse::<u32>() {
+                if (1..=8).contains(&sub) {
+                    return Some((sub - 1, callsign.to_string()));
+                }
+            }
+        }
+    }
+
+    // SLHD<n> / SL...HD<n>
+    if upper.starts_with("SL") {
+        if let Some(program) = parse_hd_program_token(&upper) {
+            let callsign = if let Some(hd_idx) = upper.find("HD") {
+                let maybe = upper[2..hd_idx].trim();
+                if (3..=5).contains(&maybe.len())
+                    && maybe.chars().all(|c| c.is_ascii_uppercase())
+                {
+                    maybe.to_string()
+                } else {
+                    String::new()
+                }
+            } else {
+                String::new()
+            };
+            return Some((program, callsign));
+        }
+    }
+
+    // <CALLSIGN>HD<n>...
+    if let Some(program) = parse_hd_program_token(&upper) {
+        if let Some(hd_idx) = upper.find("HD") {
+            let prefix = upper[..hd_idx].trim();
+            if (3..=5).contains(&prefix.len())
+                && prefix.chars().all(|c| c.is_ascii_uppercase())
+            {
+                return Some((program, prefix.to_string()));
+            }
+        }
+    }
+
+    None
+}
+
+fn is_likely_station_logo_filename(filename: &str) -> bool {
+    let raw = lot_name_without_prefix(filename);
+    let upper = raw.to_ascii_uppercase();
+
+    let mut score: i32 = 0;
+    if upper.starts_with("SL") && upper.contains("$$") {
+        score += 5;
+    }
+    if upper.starts_with("SL") && parse_hd_program_token(&upper).is_some() {
+        score += 3;
+    }
+    if let Some(hd_idx) = upper.find("HD") {
+        let prefix = upper[..hd_idx].trim();
+        if (3..=5).contains(&prefix.len())
+            && prefix.chars().all(|c| c.is_ascii_uppercase())
+        {
+            score += 2;
+        }
+    }
+    if upper.starts_with("MT") || upper.starts_with("MN") || upper.starts_with("SD") {
+        score -= 2;
+    }
+
+    score >= 3
+}
+
+fn classify_lot_image(
+    filename: &str,
+    lot_mime: u32,
+    lot_component_mime: Option<u32>,
+) -> LotImageClass {
+    use crate::ffi::nrsc5_sys::{
+        NRSC5_MIME_JPEG, NRSC5_MIME_PNG, NRSC5_MIME_PRIMARY_IMAGE,
+        NRSC5_MIME_STATION_LOGO,
+    };
+
+    if lot_mime == NRSC5_MIME_STATION_LOGO {
+        return LotImageClass::StationLogo {
+            definitive: true,
+            source: "lot.mime",
+        };
+    }
+    if lot_component_mime == Some(NRSC5_MIME_STATION_LOGO) {
+        return LotImageClass::StationLogo {
+            definitive: true,
+            source: "lot.component.data.mime",
+        };
+    }
+    if lot_mime == NRSC5_MIME_PRIMARY_IMAGE {
+        return LotImageClass::CoverArt { source: "lot.mime" };
+    }
+    if lot_component_mime == Some(NRSC5_MIME_PRIMARY_IMAGE) {
+        return LotImageClass::CoverArt {
+            source: "lot.component.data.mime",
+        };
+    }
+    let is_generic = lot_mime == NRSC5_MIME_JPEG
+        || lot_mime == NRSC5_MIME_PNG
+        || lot_component_mime == Some(NRSC5_MIME_JPEG)
+        || lot_component_mime == Some(NRSC5_MIME_PNG);
+
+    if is_generic {
+        if is_likely_station_logo_filename(filename) {
+            return LotImageClass::StationLogo {
+                definitive: false,
+                source: "filename_heuristic",
+            };
+        }
+        return LotImageClass::GenericImage {
+            source: "generic_image_mime",
+        };
+    }
+
+    if is_likely_station_logo_filename(filename) {
+        return LotImageClass::StationLogo {
+            definitive: false,
+            source: "filename_heuristic",
+        };
+    }
+
+    LotImageClass::Other
 }
 
 /// Lower-cased file extension for a logo filename, defaulting to `png`
@@ -4557,7 +4797,10 @@ fn logo_ext(filename: &str) -> String {
 }
 
 fn extract_call_sign(filename: &str) -> Option<String> {
-    let raw = filename.split_once('_').map(|(_, rest)| rest).unwrap_or(filename);
+    let raw = filename
+        .split_once('_')
+        .map(|(_, rest)| rest)
+        .unwrap_or(filename);
 
     // Find "HD" followed by an ASCII digit.
     let mut search_from = 0;
@@ -4565,7 +4808,12 @@ fn extract_call_sign(filename: &str) -> Option<String> {
         let hd_pos = raw[search_from..].find("HD")?;
         let abs = search_from + hd_pos;
         let after = &raw[abs + 2..];
-        if after.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+        if after
+            .chars()
+            .next()
+            .map(|c| c.is_ascii_digit())
+            .unwrap_or(false)
+        {
             let call_sign = &raw[..abs];
             if (3..=5).contains(&call_sign.len())
                 && call_sign.chars().all(|c| c.is_ascii_uppercase())
@@ -4780,11 +5028,7 @@ fn restore_art_history(
             continue;
         }
         if let Some(front) = plays.front() {
-            oldest_play = Some(
-                oldest_play
-                    .map(|cur| cur.min(*front))
-                    .unwrap_or(*front),
-            );
+            oldest_play = Some(oldest_play.map(|cur| cur.min(*front)).unwrap_or(*front));
         }
         let path = abs_path.to_string_lossy().into_owned();
         map.insert(
@@ -4829,9 +5073,7 @@ fn default_dock_state() -> DockState<DockTab> {
         return ds;
     }
 
-    eprintln!(
-        "warning: failed to parse embedded default dock layout; using built-in fallback"
-    );
+    eprintln!("warning: failed to parse embedded default dock layout; using built-in fallback");
     let mut ds = DockState::new(vec![DockTab::NowPlaying]);
     let tree = ds.main_surface_mut();
     let [_old, left] = tree.split_left(NodeIndex::root(), 0.25, vec![DockTab::Tuner]);
@@ -4839,8 +5081,7 @@ fn default_dock_state() -> DockState<DockTab> {
     // numeric MER/BER readout and the visual scope without rearranging.
     let [_old_left, _left_bottom] =
         tree.split_below(left, 0.35, vec![DockTab::Signal, DockTab::Constellation]);
-    let [_old_root, right] =
-        tree.split_right(NodeIndex::root(), 0.32, vec![DockTab::Traffic]);
+    let [_old_root, right] = tree.split_right(NodeIndex::root(), 0.32, vec![DockTab::Traffic]);
     let [_old_right, _right_bottom] = tree.split_below(right, 0.5, vec![DockTab::Weather]);
     let [_old_center, _center_bottom] =
         tree.split_below(NodeIndex::root(), 0.67, vec![DockTab::Collage]);
@@ -4955,7 +5196,10 @@ mod tests {
 
     #[test]
     fn collage_tile_cap_clamps_to_hard_max() {
-        assert_eq!(collage_tile_cap(&cfg_with_tiles(100_000)), ART_TILES_HARD_MAX);
+        assert_eq!(
+            collage_tile_cap(&cfg_with_tiles(100_000)),
+            ART_TILES_HARD_MAX
+        );
         assert_eq!(collage_tile_cap(&cfg_with_tiles(512)), 512);
     }
 
