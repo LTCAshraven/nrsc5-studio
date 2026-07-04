@@ -25,6 +25,13 @@ adheres to [Semantic Versioning](https://semver.org/).
   subcarrier to surface the Program Service name and RadioText in a full-width
   ticker and as the now-playing fallback when no HD metadata is present. The
   mode, stereo, and RDS toggles all persist in the config.
+- **Station-logo discovery via three-step MIME detection.** Station logos now
+  surface reliably even when LOT metadata is incomplete or uses generic image
+  MIME types. The app cascades through direct MIME tags (`NRSC5_MIME_STATION_LOGO`),
+  album-art vs. generic JPEG/PNG disambiguation, and finally filename heuristics
+  (recognizing `SL<CALLSIGN>$$<NN>`, `SL...HD<n>`, and `<CALLSIGN>HD<n>` patterns)
+  to classify LOT payloads. Logos are cached by content hash with a `.json` sidecar
+  tracking the classification method for transparency.
 
 ### Fixed
 

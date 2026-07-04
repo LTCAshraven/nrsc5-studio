@@ -48,6 +48,27 @@ The analog path is a full stereo receive chain built on the shared I/Q bus:
 
 All three toggles (mode, stereo, RDS) persist in the config.
 
+### Station-logo discovery via three-step MIME detection
+
+Station logos now surface reliably even when LOT metadata is incomplete or
+uses generic image MIME types. The app uses a three-step fallback cascade:
+
+1. **Direct MIME tags** — if the LOT payload's own MIME field or the
+   associated SIG component's MIME says **`NRSC5_MIME_STATION_LOGO`**,
+   classify it as a station logo immediately.
+2. **Album-art vs. generic image MIME** — check for **`NRSC5_MIME_PRIMARY_IMAGE`**
+   (album art) or generic **JPEG/PNG** MIME tags to distinguish cover art
+   from logos.
+3. **Filename heuristic** — when MIME is generic or missing, parse the LOT
+   filename for station-logo naming patterns:
+   - `SL<CALLSIGN>$$<NN>` (legacy/known-good)
+   - `SL...HD<n>` (SLHD variants)
+   - `<CALLSIGN>HD<n>` (bare callsign + subchannel)
+
+   If a match is found, recover the station logo even without explicit MIME
+   tagging. All logos are cached by content hash and keyed with a `.json`
+   sidecar tracking the classification method for transparency.
+
 ## What's fixed
 
 ### FM service-mode badge no longer mislabeled as an AM mode
