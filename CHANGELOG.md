@@ -8,6 +8,24 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [0.6.4] - 2026-07-04
 
+### Added
+
+- **Analog-FM fallback path with stereo and RDS.** When the HD signal can't
+  lock (a weak fringe station, a deep fade, or a non-HD FM broadcast), NRSC5
+  Studio can now demodulate the underlying analog FM signal from the same
+  I/Q stream and keep audio flowing. A new **Mode Select** control on the
+  Station Information panel chooses the source: **Digital Only** (analog path
+  stays silent — the default, so existing setups are unchanged), **Automatic**
+  (HD while synced, then falls back down the HD → analog-stereo → mono →
+  squelch ladder and climbs back when the signal recovers), or **Analog Only**
+  (forces the analog demod to own the audio). The analog chain locks the
+  19 kHz pilot with a PLL for **stereo** decode and blends stereo width toward
+  mono as the pilot weakens (so it degrades continuously instead of getting
+  noisy), applies 75 µs de-emphasis, and decodes the 57 kHz **RDS**
+  subcarrier to surface the Program Service name and RadioText in a full-width
+  ticker and as the now-playing fallback when no HD metadata is present. The
+  mode, stereo, and RDS toggles all persist in the config.
+
 ### Fixed
 
 - **FM service-mode badge no longer mislabeled as an AM mode.** The
