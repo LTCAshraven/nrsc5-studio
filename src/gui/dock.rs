@@ -1492,12 +1492,29 @@ impl DockViewer<'_> {
             if let Some(psmi) = info.sync_psmi {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("PSMI:").color(muted));
-                    let mode_code = match psmi {
-                        1 => "MA1",
-                        2 => "MA3",
-                        3 => "MP3",
-                        11 => "MP11",
-                        _ => "Unknown",
+                    // AM and FM reuse overlapping PSMI values, so the band
+                    // decides the prefix: MA* for AM tunes, MP* for FM.
+                    // (nrsc5 defines.h: SERVICE_MODE_MA1 = 1, MA3 = 2; FM
+                    // PSMI values 1/2/3/5/6/11 map directly to MP1…MP11.)
+                    // `am_sync` is populated on the same SYNC event as the
+                    // PSMI for AM tunes, matching `sync_psmi_label()`'s
+                    // discriminator so the badge and description agree.
+                    let mode_code = if info.am_sync.is_some() {
+                        match psmi {
+                            1 => "MA1",
+                            2 => "MA3",
+                            _ => "Unknown",
+                        }
+                    } else {
+                        match psmi {
+                            1 => "MP1",
+                            2 => "MP2",
+                            3 => "MP3",
+                            5 => "MP5",
+                            6 => "MP6",
+                            11 => "MP11",
+                            _ => "Unknown",
+                        }
                     };
                     let mode_desc = info.sync_psmi_label().unwrap_or("Unknown mode");
                     let mode_text = if mode_desc.eq_ignore_ascii_case(mode_code) {

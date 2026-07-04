@@ -6,6 +6,21 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.6.4] - 2026-07-04
+
+### Fixed
+
+- **FM service-mode badge no longer mislabeled as an AM mode.** The
+  Engineering Info panel mapped raw PSMI values to service-mode codes
+  without accounting for the tuned band, so a standard FM hybrid station
+  (PSMI 1) was shown as **MA1** — an AM-only mode — instead of **MP1**.
+  The badge is now band-aware: AM tunes report `MA1` / `MA3` and FM tunes
+  report `MP1` / `MP2` / `MP3` / `MP5` / `MP6` / `MP11`, matching nrsc5's
+  own `SERVICE_MODE_*` definitions. Thanks to
+  [@TechnicalLee](https://github.com/TechnicalLee) for catching the
+  incorrect descriptor
+  ([#16](https://github.com/LTCAshraven/nrsc5-studio/issues/16)).
+
 ## [0.6.3] - 2026-06-28
 
 ### Added
