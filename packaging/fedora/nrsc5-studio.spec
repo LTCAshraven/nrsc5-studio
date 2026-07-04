@@ -25,8 +25,8 @@
 %global debug_package %{nil}
 
 Name:           %{appname}
-Version:        0.6.3
-Release:        2%{?dist}
+Version:        0.6.4
+Release:        1%{?dist}
 Summary:        HD Radio FM receiver and station explorer built on nrsc5 and SoapySDR
 
 License:        MIT
@@ -93,7 +93,7 @@ install -D -m 0755 target/release/%{appname} \
 # Bundled self-contained HD Radio decoder; the binary finds it via the
 # %{_libdir}/%{appname} rpath baked in at link time (build.rs emits
 # /usr/lib/nrsc5-studio).
-install -D -m 0755 bin/libnrsc5.so \
+install -D -m 0644 bin/libnrsc5.so \
     %{buildroot}%{_prefix}/lib/%{appname}/libnrsc5.so
 
 install -D -m 0644 packaging/linux/%{appname}.desktop \
@@ -136,6 +136,14 @@ appstream-util validate-relax --nonet \
 %{_mandir}/man1/%{appname}.1*
 
 %changelog
+* Fri Jul 03 2026 LTCAshraven <LTCAshraven@users.noreply.github.com> - 0.6.4-1
+- Automatic fallback now uses MER hysteresis and true audible-source
+  reporting in the Signal panel's Current Source label
+- AM Analog and Digital work on-hold due to no available on-air HD
+  signals in range
+- Publish am-radio branch for community handoff so contributors with
+  local AM HD coverage can continue validation and iteration
+
 * Sun Jun 28 2026 LTCAshraven <LTCAshraven@users.noreply.github.com> - 0.6.3-1
 - HERE traffic & weather data-service support alongside the existing Total
   Traffic Network (TTN) feed: HERE traffic tiles and weather images now

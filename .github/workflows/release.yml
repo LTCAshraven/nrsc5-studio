@@ -1,0 +1,43 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build release binary (gnullvm)
+        shell: pwsh
+        run: |
+          ./scripts/cargo-gnu.ps1 -Configuration release -Command build
+
+      - name: Package portable zip
+        id: package
+        shell: pwsh
+        run: |
+          ./scripts/package-portable.ps1 -Configuration release -Zip
+          $zip = Get-ChildItem -Path ./dist -Filter *.zip -File |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -First 1
+          if (-not $zip) {
+            throw "No zip package found under dist/."
+          }
+          "zip_path=$($zip.FullName)" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Publish draft release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          generate_release_notes: true
+          files: |
+            ${{ steps.package.outputs.zip_path }}

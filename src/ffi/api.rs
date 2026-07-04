@@ -83,6 +83,8 @@ pub enum Nrsc5ApiError {
     SetFrequencyFailed(i32),
     #[error("nrsc5_pipe_samples_cu8 failed (rc={0})")]
     PipeFailed(i32),
+    #[error("nrsc5_pipe_samples_cs16 failed (rc={0})")]
+    PipeCs16Failed(i32),
     /// `pipe_samples_cu8` received a slice larger than `u32::MAX`
     /// bytes. The C API takes a `uint32_t` length so we can't pass
     /// anything bigger in a single call; split the buffer caller-side.
@@ -282,6 +284,23 @@ impl Nrsc5Session {
         let rc = unsafe { sys::nrsc5_pipe_samples_cu8(self.st, samples.as_ptr(), len) };
         if rc != 0 {
             Err(Nrsc5ApiError::PipeFailed(rc))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Push a chunk of signed-16-bit complex I/Q samples (interleaved I, Q).
+    /// FM expects [`NRSC5_SAMPLE_RATE_CS16_FM`] and AM expects
+    /// [`NRSC5_SAMPLE_RATE_CS16_AM`]. Must be called while the worker is
+    /// running (between `start` and `stop`).
+    pub fn pipe_samples_cs16(&self, samples: &[i16]) -> Result<(), Nrsc5ApiError> {
+        let len: u32 = samples
+            .len()
+            .try_into()
+            .map_err(|_| Nrsc5ApiError::PipeChunkTooLarge { len: samples.len() })?;
+        let rc = unsafe { sys::nrsc5_pipe_samples_cs16(self.st, samples.as_ptr(), len) };
+        if rc != 0 {
+            Err(Nrsc5ApiError::PipeCs16Failed(rc))
         } else {
             Ok(())
         }

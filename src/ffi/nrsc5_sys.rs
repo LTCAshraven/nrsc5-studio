@@ -693,11 +693,11 @@ pub type nrsc5_callback_t =
     Option<unsafe extern "C" fn(evt: *const nrsc5_event_t, opaque: *mut c_void)>;
 
 // =====================================================================
-// Function prototypes — only the 9 symbols we actually call.
+// Function prototypes — only the symbols we actually call.
 // Other libnrsc5 exports (nrsc5_open, nrsc5_open_file, nrsc5_open_rtltcp,
-// nrsc5_pipe_samples_cs16, the tuner controls, the *_name helpers) are
-// intentionally omitted; the Soapy layer owns the device so we feed
-// libnrsc5 cu8 samples via a pipe session and let it run blind.
+// the tuner controls, the *_name helpers) are intentionally omitted; the
+// Soapy layer owns the device so we feed libnrsc5 through a pipe session and
+// let it run blind.
 // =====================================================================
 
 #[link(name = "nrsc5")]
@@ -745,6 +745,16 @@ unsafe extern "C" {
     pub fn nrsc5_pipe_samples_cu8(
         st: *mut nrsc5_t,
         samples: *const u8,
+        length: c_uint,
+    ) -> c_int;
+
+    /// Push `length` signed-16-bit complex I/Q samples (interleaved I, Q)
+    /// into the demodulator. The expected sample rate depends on mode:
+    /// [`NRSC5_SAMPLE_RATE_CS16_FM`] for FM and [`NRSC5_SAMPLE_RATE_CS16_AM`]
+    /// for AM.
+    pub fn nrsc5_pipe_samples_cs16(
+        st: *mut nrsc5_t,
+        samples: *const i16,
         length: c_uint,
     ) -> c_int;
 

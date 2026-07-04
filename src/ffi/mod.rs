@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use thiserror::Error;
 
-use crate::config::{GainMode, SdrTransport};
+use crate::config::{GainMode, RadioBand, SdrTransport};
 use crate::dsp::{AgcConfig, AgcController, AgcSnapshot, AgcStatus, SearchPhase};
 use crate::sdr::profile::DeviceProfile;
 use crate::sdr::{GainCache, GainCacheEntry, GainCacheKey, IqBus, Sdr, SdrConfig, SdrError, StreamControl};
@@ -471,6 +471,10 @@ pub struct Nrsc5Process {
     last_analog_fallback_stereo: Option<bool>,
     /// Whether RDS decode is enabled for the current/last piped stream.
     last_analog_fallback_rds_enabled: Option<bool>,
+    /// Optional minimum MER required for HD to own the sink.
+    last_analog_fallback_mer_threshold_db: Option<f32>,
+    /// AM analog bandwidth preset for the current/last piped stream.
+    last_am_analog_filter: Option<crate::config::AmAnalogFilter>,
     /// Transport selection (local Soapy, SoapyRemote, native rtl_tcp)
     /// active for the current/last piped stream. Preserved across
     /// `stop()` so [`retune`](Self::retune) can re-open the same kind
@@ -486,6 +490,8 @@ pub struct Nrsc5Process {
     /// `start_piped`. Preserved across `stop()` for `retune`
     /// convenience. `None` until the first piped Start.
     last_frequency_mhz: Option<f32>,
+    /// Radio band in effect for the current/last piped stream.
+    last_radio_band: RadioBand,
     /// Per-frequency gain cache (Phase 3 of the v0.4.0 AGC overhaul).
     /// Loaded once at `Nrsc5Process::new` from
     /// [`crate::paths::gain_cache_path`]; survives across
@@ -685,9 +691,12 @@ impl Nrsc5Process {
             last_analog_fallback_mode: None,
             last_analog_fallback_stereo: None,
             last_analog_fallback_rds_enabled: None,
+            last_analog_fallback_mer_threshold_db: None,
+            last_am_analog_filter: None,
             last_transport: SdrTransport::LocalSoapy,
             last_remote: None,
             last_frequency_mhz: None,
+            last_radio_band: RadioBand::Fm,
             gain_cache: Arc::new(Mutex::new(gain_cache)),
             tx,
             rx,
@@ -789,6 +798,20 @@ impl Nrsc5Process {
     /// speakers, or `None` when no piped session is active.
     pub fn active_speaker(&self) -> Option<u32> {
         self.active_speaker
+    }
+
+    /// True when HD has recently owned the audio sink (i.e. HD is the
+    /// currently audible source). This is source-of-truth for UI labels;
+    /// it accounts for fallback gating and handoff hysteresis, not just
+    /// decoder sync state.
+    pub fn hd_audio_active(&self) -> bool {
+        if !self.is_streaming() {
+            return false;
+        }
+        if self.last_analog_fallback_mode == Some(crate::config::AnalogFallbackMode::AnalogOnly) {
+            return false;
+        }
+        self.analog_handoff.hd_owns_sink_recently(HD_HANDOFF_WINDOW_MS)
     }
 
     /// Route `program`'s decoded PCM to the speakers. The previous
@@ -951,8 +974,19 @@ impl Nrsc5Process {
         match event {
             NrscEvent::Sync { .. } => self.analog_handoff.set_hd_synced(true),
             NrscEvent::LostSync => self.analog_handoff.set_hd_synced(false),
+            NrscEvent::Mer { lower, upper } => {
+                self.analog_handoff
+                    .set_hd_mer_db(Some((lower + upper) * 0.5));
+            }
             _ => {}
         }
+    }
+
+    /// Hot-apply the optional MER threshold for automatic HD→analog
+    /// fallback gating. `None` disables MER-based gating.
+    pub fn set_analog_fallback_mer_threshold_db(&self, threshold_db: Option<f32>) {
+        self.analog_handoff
+            .set_hd_min_mer_db(threshold_db.map(|v| v.clamp(0.0, 30.0)));
     }
 
     /// Apply a manual per-element gain on the live SDR if a piped
@@ -1095,13 +1129,22 @@ impl Nrsc5Process {
         &self,
         iq_bus: &Arc<IqBus>,
         frequency_mhz: f32,
+        radio_band: RadioBand,
     ) -> Result<ActiveSession, Nrsc5Error> {
         // Build + configure the session. All configuration calls must
         // precede `start`; the session moves into the feeder thread
         // immediately after `start`, so this is the only chance.
         let mut session = Nrsc5Session::open_pipe()?;
-        session.set_mode(Mode::Fm)?;
-        session.set_frequency_hz(frequency_mhz * 1_000_000.0)?;
+        let session_mode = match radio_band {
+            RadioBand::Fm => Mode::Fm,
+            RadioBand::Am => Mode::Am,
+        };
+        let frequency_hz = match radio_band {
+            RadioBand::Fm => frequency_mhz * 1_000_000.0,
+            RadioBand::Am => frequency_mhz * 1_000.0,
+        };
+        session.set_mode(session_mode)?;
+        session.set_frequency_hz(frequency_hz)?;
 
         // Event callback: forward every libnrsc5 event verbatim to
         // the shared `self.tx` channel. Events already carry their
@@ -1220,6 +1263,91 @@ impl Nrsc5Process {
         })
     }
 
+    fn spawn_session_cs16(
+        &self,
+        sample_rx: crossbeam_channel::Receiver<Vec<i16>>,
+        frequency_mhz: f32,
+        radio_band: RadioBand,
+    ) -> Result<ActiveSession, Nrsc5Error> {
+        let mut session = Nrsc5Session::open_pipe()?;
+        let session_mode = match radio_band {
+            RadioBand::Fm => Mode::Fm,
+            RadioBand::Am => Mode::Am,
+        };
+        let frequency_hz = match radio_band {
+            RadioBand::Fm => frequency_mhz * 1_000_000.0,
+            RadioBand::Am => frequency_mhz * 1_000.0,
+        };
+        session.set_mode(session_mode)?;
+        session.set_frequency_hz(frequency_hz)?;
+
+        let event_tx = self.tx.clone();
+        session.set_event_callback(move |ev| {
+            let _ = event_tx.send(ev);
+        })?;
+
+        let audio_started: [Arc<AtomicBool>; MAX_PROGRAMS] = std::array::from_fn(|_| {
+            Arc::new(AtomicBool::new(false))
+        });
+
+        let rings: Option<[Arc<crate::audio::PcmRing>; MAX_PROGRAMS]> =
+            if self.audio_sink.is_some() {
+                Some(std::array::from_fn(|_| Arc::new(crate::audio::PcmRing::new())))
+            } else {
+                None
+            };
+
+        let pcm_tx = self.tx.clone();
+        let pcm_audio_started = audio_started.clone();
+        let pcm_rings = rings.clone();
+        session.set_pcm_sink(move |pcm_program, samples| {
+            let idx = pcm_program as usize;
+            if idx >= MAX_PROGRAMS {
+                return;
+            }
+            if !pcm_audio_started[idx].swap(true, Ordering::Relaxed) {
+                let _ = pcm_tx.send(NrscEvent::AudioStarted { program: pcm_program });
+            }
+            if let Some(rs) = pcm_rings.as_ref() {
+                rs[idx].push(samples);
+            }
+        })?;
+
+        session.start();
+
+        let (shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<()>(1);
+        let child_exit_tx = self.tx.clone();
+        let feeder_thread = std::thread::spawn(move || {
+            let session = session;
+            'pump: loop {
+                crossbeam_channel::select! {
+                    recv(sample_rx) -> msg => {
+                        match msg {
+                            Ok(payload) => {
+                                if session.pipe_samples_cs16(&payload).is_err() {
+                                    break 'pump;
+                                }
+                            }
+                            Err(_) => break 'pump,
+                        }
+                    }
+                    recv(shutdown_rx) -> _ => {
+                        break 'pump;
+                    }
+                }
+            }
+            drop(session);
+            let _ = child_exit_tx.send(NrscEvent::ChildExited);
+        });
+
+        Ok(ActiveSession {
+            feeder_thread,
+            shutdown_tx,
+            rings,
+            audio_started,
+        })
+    }
+
     /// Start with the SDR driven in-process: open the device, retune,
     /// and bring up an in-process libnrsc5 session fed from our I/Q
     /// pump via the shared [`IqBus`].
@@ -1232,6 +1360,7 @@ impl Nrsc5Process {
     /// (the modern librtlsdr.dll handles this cleanly).
     pub fn start_piped(
         &mut self,
+        radio_band: RadioBand,
         frequency_mhz: f32,
         program: u32,
         transport: SdrTransport,
@@ -1245,6 +1374,8 @@ impl Nrsc5Process {
         analog_fallback_mode: crate::config::AnalogFallbackMode,
         analog_fallback_stereo: bool,
         analog_fallback_rds_enabled: bool,
+        analog_fallback_mer_threshold_db: Option<f32>,
+        am_analog_filter: crate::config::AmAnalogFilter,
     ) -> Result<(), Nrsc5Error> {
         if (program as usize) >= MAX_PROGRAMS {
             return Err(Nrsc5Error::InvalidProgram(program));
@@ -1281,17 +1412,40 @@ impl Nrsc5Process {
                 // case; backends that don't expose runtime PPM return
                 // Ok(()) silently.
                 let _ = soapy.set_frequency_correction_ppm(ppm_correction);
+                let target_sample_rate_sps = match radio_band {
+                    RadioBand::Fm => 1_488_375,
+                    RadioBand::Am => nrsc5_sys::NRSC5_SAMPLE_RATE_CS16_AM.round() as u32,
+                };
+                // AM on RTL-SDR requires direct sampling to cover the
+                // MW band (< 24 MHz). Reuse the existing Soapy backend
+                // support (`direct_samp`) rather than introducing a
+                // separate AM-only backend path.
+                let direct_sampling = if radio_band == RadioBand::Am
+                    && soapy.driver().eq_ignore_ascii_case("rtlsdr")
+                {
+                    2 // Q-ADC path (common rtl_sdr direct-sampling setting)
+                } else {
+                    0
+                };
                 soapy.configure(&SdrConfig {
-                    center_freq_hz: (frequency_mhz * 1_000_000.0) as u32,
-                    sample_rate_sps: 1_488_375,
+                    center_freq_hz: match radio_band {
+                        RadioBand::Fm => (frequency_mhz * 1_000_000.0) as u32,
+                        RadioBand::Am => (frequency_mhz * 1_000.0) as u32,
+                    },
+                    sample_rate_sps: target_sample_rate_sps,
                     ppm_correction: 0,
-                    direct_sampling: 0,
+                    direct_sampling,
                     initial_gain_tenths,
                     antenna: antenna.clone(),
                 })?;
                 Arc::new(soapy)
             }
             SdrTransport::RtlTcpRemote => {
+                if radio_band == RadioBand::Am {
+                    return Err(Nrsc5Error::Sdr(SdrError::UnsupportedOperation(
+                        "AM streaming over rtl_tcp",
+                    )));
+                }
                 let (host, port) = remote.ok_or_else(|| {
                     Nrsc5Error::Sdr(crate::sdr::SdrError::RtlTcpConnect {
                         addr: "<unset>".to_string(),
@@ -1470,23 +1624,46 @@ impl Nrsc5Process {
         // below), one consumer (the libnrsc5 feeder thread spawned in
         // `spawn_session`). Built first so the session can subscribe
         // before the SDR thread starts publishing.
-        let bus = Arc::new(IqBus::new());
-
-        // Spawn the single libnrsc5 session for this tune. It owns
-        // the session, the per-program PCM rings, and the feeder
-        // thread that pumps I/Q from `bus` into it. Event + PCM
-        // callbacks fire on libnrsc5's worker thread and forward
-        // through `self.tx` (events) or per-program rings (PCM).
-        let session = self.spawn_session(&bus, frequency_mhz)?;
+        let bus = if radio_band == RadioBand::Fm {
+            Some(Arc::new(IqBus::new()))
+        } else {
+            None
+        };
 
         let analog_runtime_enabled = analog_fallback_runtime_enabled(
             self.audio_sink.is_some(),
             analog_fallback_mode,
         );
-        let analog_rx = if analog_runtime_enabled {
-            Some(bus.subscribe(64))
+
+        let analog_fm_rx = if analog_runtime_enabled && radio_band == RadioBand::Fm {
+            bus.as_ref().map(|bus| bus.subscribe(64))
         } else {
             None
+        };
+
+        let (am_cs16_tx, am_cs16_rx) = if radio_band == RadioBand::Am {
+            let (tx, rx) = crossbeam_channel::bounded::<Vec<i16>>(64);
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
+
+        let (am_analog_cs16_tx, am_analog_cs16_rx) =
+            if analog_runtime_enabled && radio_band == RadioBand::Am {
+                let (tx, rx) = crossbeam_channel::bounded::<Vec<i16>>(64);
+                (Some(tx), Some(rx))
+            } else {
+                (None, None)
+            };
+
+        let session = if let Some(bus) = bus.as_ref() {
+            self.spawn_session(bus, frequency_mhz, radio_band)?
+        } else {
+            self.spawn_session_cs16(
+                am_cs16_rx.expect("AM cs16 receiver must exist"),
+                frequency_mhz,
+                radio_band,
+            )?
         };
 
         let analog_sink = if analog_runtime_enabled {
@@ -1502,34 +1679,52 @@ impl Nrsc5Process {
         // session's feeder thread sees `Disconnected` on `recv` and
         // exits cleanly.
         let sdr_for_thread: Arc<dyn Sdr> = Arc::clone(&sdr);
-        let bus_for_sdr = Arc::clone(&bus);
+        let bus_for_sdr = bus.clone();
         let evt_tx = self.tx.clone();
         let evt_tx_for_iq = evt_tx.clone();
         // Optional FFT tap clone for the Spectrum panel. `None` when the
         // GUI side hasn't installed one (e.g. headless test builds).
         let spectrum_tap = self.spectrum_tap.clone();
         if let Some(tap) = spectrum_tap.as_ref() {
-            tap.set_center_freq_hz((frequency_mhz as f64) * 1_000_000.0);
+            tap.set_sample_rate_sps(match radio_band {
+                RadioBand::Fm => 1_488_375.0,
+                RadioBand::Am => nrsc5_sys::NRSC5_SAMPLE_RATE_CS16_AM as f32,
+            });
+            tap.set_center_freq_hz(match radio_band {
+                RadioBand::Fm => (frequency_mhz as f64) * 1_000_000.0,
+                RadioBand::Am => (frequency_mhz as f64) * 1_000.0,
+            });
         }
         let iq_thread = std::thread::spawn(move || {
-            let run_res = sdr_for_thread.run_stream(&mut |bytes| {
-                // Spectrum tap first — it's cheap (and internally
-                // throttled) and we want the panel to keep updating
-                // regardless of any consumer back-pressure on the bus.
-                if let Some(tap) = spectrum_tap.as_ref() {
-                    tap.feed(bytes);
-                }
-                // Non-blocking publish. Slow / dead subscribers are
-                // handled inside the bus (drop payload on Full, prune
-                // on Disconnected). The SDR pump itself never blocks.
-                bus_for_sdr.publish(bytes);
-                StreamControl::Continue
-            });
-            // Tear down every subscriber so each decoder's feeder
-            // thread wakes from its blocking `recv` with
-            // `Err(RecvError)` and exits. Idempotent; safe even if a
-            // subscriber already pruned itself.
-            bus_for_sdr.shutdown();
+            let run_res = match radio_band {
+                RadioBand::Fm => sdr_for_thread.run_stream(&mut |bytes| {
+                    if let Some(tap) = spectrum_tap.as_ref() {
+                        tap.feed(bytes);
+                    }
+                    if let Some(bus) = bus_for_sdr.as_ref() {
+                        bus.publish(bytes);
+                    }
+                    StreamControl::Continue
+                }),
+                RadioBand::Am => sdr_for_thread.run_stream_cs16(&mut |samples| {
+                    if let Some(tap) = spectrum_tap.as_ref() {
+                        tap.feed_cs16(samples);
+                    }
+                    if let Some(tx) = am_cs16_tx.as_ref() {
+                        let payload = samples.to_vec();
+                        if tx.send(payload.clone()).is_err() {
+                            return StreamControl::Stop;
+                        }
+                        if let Some(analog_tx) = am_analog_cs16_tx.as_ref() {
+                            let _ = analog_tx.send(payload);
+                        }
+                    }
+                    StreamControl::Continue
+                }),
+            };
+            if let Some(bus) = bus_for_sdr.as_ref() {
+                bus.shutdown();
+            }
             // `run_stream` returns Err on real backend failure (e.g.
             // USB unplugged). A user-initiated Stop trips the cancel
             // flag, which the rtl backend translates to Ok per
@@ -1594,80 +1789,120 @@ impl Nrsc5Process {
             .set_analog_only(analog_fallback_mode == crate::config::AnalogFallbackMode::AnalogOnly);
         self.analog_handoff
             .set_agc_ready(gain_mode != GainMode::Auto);
+        let mer_threshold = if radio_band == RadioBand::Fm {
+            analog_fallback_mer_threshold_db.map(|v| v.clamp(0.0, 30.0))
+        } else {
+            None
+        };
+        self.analog_handoff.set_hd_min_mer_db(mer_threshold);
 
         let analog_thread = if analog_enabled {
-            if let Some(rx) = analog_rx {
-                if let Some(sink) = analog_sink {
-                    let handoff = self.analog_handoff.clone();
-                    let evt_tx_for_analog = evt_tx.clone();
-                    let analog_mode = analog_fallback_mode;
-                    let analog_stereo = analog_fallback_stereo;
-                    let analog_rds_enabled = analog_fallback_rds_enabled;
-                    Some(std::thread::spawn(move || {
-                        let mut demod = crate::dsp::FmDemod::new();
-                        demod.set_stereo_enabled(analog_stereo);
-                        demod.set_rds_enabled(analog_rds_enabled);
-                        let mut batch = Vec::with_capacity(2048);
-                        let mut last_ps: Option<String> = None;
-                        let mut last_rt: Option<String> = None;
-                        loop {
-                            match rx.recv() {
-                                Ok(payload) => {
-                                    // The speaker router forwards HD
-                                    // PCM (and stamps the handoff) only
-                                    // while HD is allowed to own the
-                                    // sink -- the AGC is trustworthy AND
-                                    // the decoder is locked. So a recent
-                                    // stamp means HD genuinely owns the
-                                    // sink; keep demodulating to stay
-                                    // warm but drop our output. Analog
-                                    // resumes once HD has been silent for
-                                    // the handoff window (AGC still
-                                    // searching, or sync lost).
-                                    let hd_owns = if analog_mode == crate::config::AnalogFallbackMode::AnalogOnly {
-                                        false
-                                    } else {
-                                        handoff.suppress_analog(HD_HANDOFF_WINDOW_MS)
-                                    };
-                                    for pair in payload.chunks_exact(2) {
-                                        let i = (pair[0] as f32 - 127.5) / 127.5;
-                                        let q = (pair[1] as f32 - 127.5) / 127.5;
-                                        if let Some([l, r]) = demod.push_complex(i, q) {
-                                            if let Some(ps) = demod.take_rds_program_service() {
-                                                if last_ps.as_deref() != Some(ps.as_str()) {
-                                                    last_ps = Some(ps.clone());
-                                                    let _ = evt_tx_for_analog.send(NrscEvent::RdsProgramService(ps));
+            if let Some(sink) = analog_sink {
+                let handoff = self.analog_handoff.clone();
+                let analog_mode = analog_fallback_mode;
+                match radio_band {
+                    RadioBand::Fm => {
+                        if let Some(rx) = analog_fm_rx {
+                            let evt_tx_for_analog = evt_tx.clone();
+                            let analog_stereo = analog_fallback_stereo;
+                            let analog_rds_enabled = analog_fallback_rds_enabled;
+                            Some(std::thread::spawn(move || {
+                                let mut demod = crate::dsp::FmDemod::new();
+                                demod.set_stereo_enabled(analog_stereo);
+                                demod.set_rds_enabled(analog_rds_enabled);
+                                let mut batch = Vec::with_capacity(2048);
+                                let mut last_ps: Option<String> = None;
+                                let mut last_rt: Option<String> = None;
+                                loop {
+                                    match rx.recv() {
+                                        Ok(payload) => {
+                                            // The speaker router forwards HD
+                                            // PCM (and stamps the handoff) only
+                                            // while HD is allowed to own the
+                                            // sink -- the AGC is trustworthy AND
+                                            // the decoder is locked. So a recent
+                                            // stamp means HD genuinely owns the
+                                            // sink; keep demodulating to stay
+                                            // warm but drop our output. Analog
+                                            // resumes once HD has been silent for
+                                            // the handoff window (AGC still
+                                            // searching, or sync lost).
+                                            let hd_owns = if analog_mode == crate::config::AnalogFallbackMode::AnalogOnly {
+                                                false
+                                            } else {
+                                                handoff.suppress_analog(HD_HANDOFF_WINDOW_MS)
+                                            };
+                                            for pair in payload.chunks_exact(2) {
+                                                let i = (pair[0] as f32 - 127.5) / 127.5;
+                                                let q = (pair[1] as f32 - 127.5) / 127.5;
+                                                if let Some([l, r]) = demod.push_complex(i, q) {
+                                                    if let Some(ps) = demod.take_rds_program_service() {
+                                                        if last_ps.as_deref() != Some(ps.as_str()) {
+                                                            last_ps = Some(ps.clone());
+                                                            let _ = evt_tx_for_analog.send(NrscEvent::RdsProgramService(ps));
+                                                        }
+                                                    }
+                                                    if let Some(rt) = demod.take_rds_radiotext() {
+                                                        if last_rt.as_deref() != Some(rt.as_str()) {
+                                                            last_rt = Some(rt.clone());
+                                                            let _ = evt_tx_for_analog.send(NrscEvent::RdsRadioText(rt));
+                                                        }
+                                                    }
+                                                    if !hd_owns {
+                                                        batch.push(l);
+                                                        batch.push(r);
+                                                        if batch.len() >= 2048 {
+                                                            sink.push(&batch);
+                                                            batch.clear();
+                                                        }
+                                                    }
                                                 }
                                             }
-                                            if let Some(rt) = demod.take_rds_radiotext() {
-                                                if last_rt.as_deref() != Some(rt.as_str()) {
-                                                    last_rt = Some(rt.clone());
-                                                    let _ = evt_tx_for_analog.send(NrscEvent::RdsRadioText(rt));
-                                                }
-                                            }
-                                            if !hd_owns {
-                                                batch.push(l);
-                                                batch.push(r);
-                                                if batch.len() >= 2048 {
-                                                    sink.push(&batch);
-                                                    batch.clear();
-                                                }
+                                            if hd_owns {
+                                                batch.clear();
+                                            } else if !batch.is_empty() {
+                                                sink.push(&batch);
+                                                batch.clear();
                                             }
                                         }
-                                    }
-                                    if hd_owns {
-                                        batch.clear();
-                                    } else if !batch.is_empty() {
-                                        sink.push(&batch);
-                                        batch.clear();
+                                        Err(_) => break,
                                     }
                                 }
-                                Err(_) => break,
-                            }
+                            }))
+                        } else {
+                            None
                         }
-                    }))
-                } else {
-                    None
+                    }
+                    RadioBand::Am => {
+                        if let Some(rx) = am_analog_cs16_rx {
+                            let am_cutoff_hz = am_analog_filter.cutoff_hz();
+                            Some(std::thread::spawn(move || {
+                                let mut demod = crate::dsp::AmDemod::new_with_if_cutoff_hz(am_cutoff_hz);
+                                let mut batch = Vec::with_capacity(2048);
+                                loop {
+                                    match rx.recv() {
+                                        Ok(payload) => {
+                                            let hd_owns = if analog_mode == crate::config::AnalogFallbackMode::AnalogOnly {
+                                                false
+                                            } else {
+                                                handoff.suppress_analog(HD_HANDOFF_WINDOW_MS)
+                                            };
+                                            demod.push_cs16_block(&payload, &mut batch);
+                                            if hd_owns {
+                                                batch.clear();
+                                            } else if !batch.is_empty() {
+                                                sink.push(&batch);
+                                                batch.clear();
+                                            }
+                                        }
+                                        Err(_) => break,
+                                    }
+                                }
+                            }))
+                        } else {
+                            None
+                        }
+                    }
                 }
             } else {
                 None
@@ -1679,7 +1914,7 @@ impl Nrsc5Process {
         self.session = Some(session);
         self.iq_thread = Some(iq_thread);
         self.analog_thread = analog_thread;
-        self.iq_bus = Some(bus);
+        self.iq_bus = bus;
         self.sdr = Some(sdr);
         self.last_mode = Some(LastStartMode::Piped);
         self.last_gain_mode = Some(gain_mode);
@@ -1690,10 +1925,13 @@ impl Nrsc5Process {
         self.last_transport = transport;
         self.last_remote = remote.map(|(h, p)| (h.to_string(), p));
         self.last_frequency_mhz = Some(frequency_mhz);
+        self.last_radio_band = radio_band;
         self.last_agc_amp_target_dbfs_override = agc_amp_target_dbfs_override;
         self.last_analog_fallback_mode = Some(analog_fallback_mode);
         self.last_analog_fallback_stereo = Some(analog_fallback_stereo);
         self.last_analog_fallback_rds_enabled = Some(analog_fallback_rds_enabled);
+        self.last_analog_fallback_mer_threshold_db = mer_threshold;
+        self.last_am_analog_filter = Some(am_analog_filter);
 
         // ----- AGC driver thread (only when AGC is active) ----------
         // Ticks the controller every ~500 ms and applies any gain
@@ -2117,11 +2355,15 @@ impl Nrsc5Process {
                 let antenna = self.last_antenna.clone();
                 let transport = self.last_transport;
                 let remote = self.last_remote.clone();
+                let radio_band = self.last_radio_band;
                 let amp_override = self.last_agc_amp_target_dbfs_override;
                 let analog_mode = self.last_analog_fallback_mode.unwrap_or_default();
                 let analog_stereo = self.last_analog_fallback_stereo.unwrap_or(true);
                 let analog_rds_enabled = self.last_analog_fallback_rds_enabled.unwrap_or(true);
+                let analog_mer_threshold = self.last_analog_fallback_mer_threshold_db;
+                let am_filter = self.last_am_analog_filter.unwrap_or_default();
                 self.start_piped(
+                    radio_band,
                     frequency_mhz,
                     program,
                     transport,
@@ -2135,6 +2377,8 @@ impl Nrsc5Process {
                     analog_mode,
                     analog_stereo,
                     analog_rds_enabled,
+                    analog_mer_threshold,
+                    am_filter,
                 )
             }
             None => Ok(()),

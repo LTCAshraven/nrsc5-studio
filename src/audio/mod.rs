@@ -31,7 +31,7 @@
 //! that design.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -210,6 +210,17 @@ pub struct AnalogHandoff {
     /// In this mode the speaker router must never let HD PCM claim the
     /// sink, even when AGC and sync are otherwise healthy.
     analog_only: Arc<AtomicBool>,
+    /// Optional minimum MER (tenths of dB) required for HD audio to own
+    /// the sink. `i32::MIN` means disabled. Driven from the UI/config.
+    hd_min_mer_tenths: Arc<AtomicI32>,
+    /// Most recently observed MER (tenths of dB), typically the average of
+    /// lower/upper sideband MER from `NrscEvent::Mer`. `i32::MIN` means
+    /// unknown/not observed yet this stream.
+    hd_mer_tenths: Arc<AtomicI32>,
+    /// Latch for MER-threshold hysteresis. `true` means HD already owns the
+    /// sink via MER gating and can stay there until MER drops below the lower
+    /// release edge.
+    hd_mer_gate_open: Arc<AtomicBool>,
     /// Common monotonic origin so both clones compute the same
     /// elapsed time. `Instant` is `Copy`, so each clone carries the
     /// same value.
@@ -235,6 +246,9 @@ impl AnalogHandoff {
             // event flips this true.
             hd_synced: Arc::new(AtomicBool::new(false)),
             analog_only: Arc::new(AtomicBool::new(false)),
+            hd_min_mer_tenths: Arc::new(AtomicI32::new(i32::MIN)),
+            hd_mer_tenths: Arc::new(AtomicI32::new(i32::MIN)),
+            hd_mer_gate_open: Arc::new(AtomicBool::new(false)),
             origin: std::time::Instant::now(),
         }
     }
@@ -275,6 +289,57 @@ impl AnalogHandoff {
         self.analog_only.store(analog_only, Ordering::Relaxed);
     }
 
+    /// Configure the optional minimum MER required for HD to own the sink.
+    /// `None` disables the MER gate.
+    pub fn set_hd_min_mer_db(&self, min_mer_db: Option<f32>) {
+        let tenths = min_mer_db
+            .map(|v| (v.clamp(-20.0, 40.0) * 10.0).round() as i32)
+            .unwrap_or(i32::MIN);
+        self.hd_min_mer_tenths.store(tenths, Ordering::Relaxed);
+        if tenths == i32::MIN {
+            self.hd_mer_gate_open.store(true, Ordering::Relaxed);
+        } else {
+            self.hd_mer_gate_open.store(false, Ordering::Relaxed);
+        }
+    }
+
+    /// Update the latest observed HD MER. `None` marks MER unknown.
+    pub fn set_hd_mer_db(&self, mer_db: Option<f32>) {
+        let tenths = mer_db
+            .map(|v| (v.clamp(-20.0, 40.0) * 10.0).round() as i32)
+            .unwrap_or(i32::MIN);
+        self.hd_mer_tenths.store(tenths, Ordering::Relaxed);
+    }
+
+    fn hd_mer_ok(&self) -> bool {
+        let min_tenths = self.hd_min_mer_tenths.load(Ordering::Relaxed);
+        if min_tenths == i32::MIN {
+            return true;
+        }
+        let mer_tenths = self.hd_mer_tenths.load(Ordering::Relaxed);
+        if mer_tenths == i32::MIN {
+            self.hd_mer_gate_open.store(false, Ordering::Relaxed);
+            return false;
+        }
+
+        // Hysteresis around the configured threshold to prevent source
+        // flapping near the edge. Enter-HD requires crossing the high edge;
+        // staying on HD only requires staying above the lower release edge.
+        const MER_HYSTERESIS_TENTHS: i32 = 15; // 1.5 dB
+        let high_edge = min_tenths;
+        let low_edge = min_tenths.saturating_sub(MER_HYSTERESIS_TENTHS);
+        let was_open = self.hd_mer_gate_open.load(Ordering::Relaxed);
+        let is_open = if was_open {
+            mer_tenths >= low_edge
+        } else {
+            mer_tenths >= high_edge
+        };
+        if is_open != was_open {
+            self.hd_mer_gate_open.store(is_open, Ordering::Relaxed);
+        }
+        is_open
+    }
+
     /// True when the HD speaker path is allowed to feed the sink:
     /// the gain stage is trustworthy (AGC settled / bailed, or no
     /// search running), the decoder is currently locked, and the
@@ -286,6 +351,7 @@ impl AnalogHandoff {
         !self.analog_only.load(Ordering::Relaxed)
             && self.agc_ready.load(Ordering::Relaxed)
             && self.hd_synced.load(Ordering::Relaxed)
+            && self.hd_mer_ok()
     }
 
     /// True if HD audio was forwarded within the last `window_ms`.
@@ -308,12 +374,20 @@ impl AnalogHandoff {
         self.analog_only.load(Ordering::Relaxed) || self.hd_recent(window_ms)
     }
 
+    /// True when HD audio has owned the sink recently enough to be considered
+    /// the current audible source.
+    pub fn hd_owns_sink_recently(&self, window_ms: u64) -> bool {
+        self.hd_recent(window_ms)
+    }
+
     /// Forget any HD-audio history and clear the sync flag. Called on
     /// stream start so a fresh tune begins with analog enabled until
     /// the HD decoder locks.
     pub fn reset(&self) {
         self.last_hd_ms.store(0, Ordering::Relaxed);
         self.hd_synced.store(false, Ordering::Relaxed);
+        self.hd_mer_tenths.store(i32::MIN, Ordering::Relaxed);
+        self.hd_mer_gate_open.store(false, Ordering::Relaxed);
     }
 }
 
@@ -336,6 +410,19 @@ mod tests {
         handoff.set_agc_ready(true);
         handoff.set_hd_synced(true);
         handoff.set_analog_only(false);
+        assert!(handoff.hd_output_allowed());
+    }
+
+    #[test]
+    fn hd_output_requires_mer_when_threshold_is_enabled() {
+        let handoff = AnalogHandoff::new();
+        handoff.set_agc_ready(true);
+        handoff.set_hd_synced(true);
+        handoff.set_analog_only(false);
+        handoff.set_hd_min_mer_db(Some(8.0));
+        handoff.set_hd_mer_db(Some(7.5));
+        assert!(!handoff.hd_output_allowed());
+        handoff.set_hd_mer_db(Some(8.1));
         assert!(handoff.hd_output_allowed());
     }
 }

@@ -76,6 +76,11 @@ pub struct IqResampler {
     out_q: Vec<f32>,
 }
 
+pub enum ResamplerOutput<'a> {
+    Cu8(&'a mut Vec<u8>),
+    Cs16(&'a mut Vec<i16>),
+}
+
 impl IqResampler {
     /// Construct a new resampler converting `src_rate` → `dst_rate`.
     ///
@@ -148,6 +153,16 @@ impl IqResampler {
     /// `127.5` represents zero. The conversion clamps to the byte
     /// range so out-of-bounds float inputs don't wrap silently.
     pub fn feed(&mut self, samples: &[Complex<f32>], out: &mut Vec<u8>) {
+        self.feed_output(samples, ResamplerOutput::Cu8(out));
+    }
+
+    /// Feed a block of IQ samples into the resampler and append any ready
+    /// interleaved CS16 output samples to `out`.
+    pub fn feed_cs16(&mut self, samples: &[Complex<f32>], out: &mut Vec<i16>) {
+        self.feed_output(samples, ResamplerOutput::Cs16(out));
+    }
+
+    fn feed_output(&mut self, samples: &[Complex<f32>], mut out: ResamplerOutput<'_>) {
         // Deinterleave the input into our pending-buffer channels.
         // We pay one copy here to convert from interleaved complex
         // to rubato's per-channel layout; this is unavoidable given
@@ -197,14 +212,24 @@ impl IqResampler {
                 }
             };
 
-            // Convert the f32 output back to CU8 and append. Saturate
-            // anything outside [-1, 1] so a momentary clip doesn't
-            // wrap around to the opposite rail.
-            for n in 0..n_out {
-                let i_byte = float_to_cu8(self.out_i[n]);
-                let q_byte = float_to_cu8(self.out_q[n]);
-                out.push(i_byte);
-                out.push(q_byte);
+            match &mut out {
+                ResamplerOutput::Cu8(out) => {
+                    // Convert the f32 output back to CU8 and append. Saturate
+                    // anything outside [-1, 1] so a momentary clip doesn't
+                    // wrap around to the opposite rail.
+                    for n in 0..n_out {
+                        let i_byte = float_to_cu8(self.out_i[n]);
+                        let q_byte = float_to_cu8(self.out_q[n]);
+                        out.push(i_byte);
+                        out.push(q_byte);
+                    }
+                }
+                ResamplerOutput::Cs16(out) => {
+                    for n in 0..n_out {
+                        out.push(float_to_i16(self.out_i[n]));
+                        out.push(float_to_i16(self.out_q[n]));
+                    }
+                }
             }
 
             // Drop the consumed input frames. `drain(..n)` is O(n)
@@ -230,6 +255,11 @@ fn float_to_cu8(f: f32) -> u8 {
     // The clamp above guarantees `scaled` is in [0.5, 255.5] so the
     // cast is well-defined.
     scaled as u8
+}
+
+#[inline]
+fn float_to_i16(f: f32) -> i16 {
+    (f.clamp(-1.0, 1.0) * i16::MAX as f32) as i16
 }
 
 #[cfg(test)]

@@ -1,3 +1,14 @@
+nrsc5-studio (0.6.4-1) unstable; urgency=medium
+
+  * Automatic fallback now uses MER hysteresis and true audible-source
+    reporting in the Signal panel's Current Source label
+  * AM Analog and Digital work on-hold due to no available on-air HD
+    signals in range
+  * Publish am-radio branch for community handoff so contributors with
+    local AM HD coverage can continue validation and iteration
+
+ -- LTCAshraven <ltcashraven@users.noreply.github.com>  Fri, 03 Jul 2026 18:00:00 +0000
+
 nrsc5-studio (0.6.3-1) unstable; urgency=medium
 
   * HERE traffic & weather data-service support, alongside the existing

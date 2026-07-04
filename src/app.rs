@@ -1,5 +1,5 @@
 use crate::collage::CollageEngine;
-use crate::config::{load_config, save_config, AppConfig};
+use crate::config::{load_config, save_config, AppConfig, RadioBand};
 use crate::ffi::{Nrsc5Process, NrscEvent};
 use crate::gui::dock::{DockTab, DockViewer, UiCommand};
 use crate::gui::state::{AppState, ArtTile, NowPlayingImageMode};
@@ -49,6 +49,14 @@ const FM_TUNE_MAX_MHZ: f32 = 107.9;
 const FM_TUNE_STEP_MHZ: f32 = 0.2;
 const FM_TUNE_BASE_MHZ: f32 = 87.9;
 
+/// US AM channel raster and band edges, expressed in kHz. We keep the
+/// dial value in the existing `frequency_mhz` field for now even when the
+/// band is AM; in AM mode the field semantically carries kHz.
+const AM_TUNE_MIN_KHZ: f32 = 530.0;
+const AM_TUNE_MAX_KHZ: f32 = 1710.0;
+const AM_TUNE_STEP_KHZ: f32 = 10.0;
+const AM_TUNE_BASE_KHZ: f32 = 530.0;
+
 /// Resolve the user's preferred collage tile cap from config, clamping to
 /// the supported range and snapping to the nearest power of two. The UI
 /// only emits exact powers of two, so this only matters for hand-edited
@@ -66,6 +74,27 @@ fn snap_fm_tune_mhz(mhz: f32) -> f32 {
     let slots = ((clamped - FM_TUNE_BASE_MHZ) / FM_TUNE_STEP_MHZ).round();
     let snapped = FM_TUNE_BASE_MHZ + slots * FM_TUNE_STEP_MHZ;
     (snapped * 10.0).round() / 10.0
+}
+
+/// Clamp + snap an AM frequency to the 10 kHz channel raster.
+fn snap_am_tune_khz(khz: f32) -> f32 {
+    let clamped = khz.clamp(AM_TUNE_MIN_KHZ, AM_TUNE_MAX_KHZ);
+    let slots = ((clamped - AM_TUNE_BASE_KHZ) / AM_TUNE_STEP_KHZ).round();
+    AM_TUNE_BASE_KHZ + slots * AM_TUNE_STEP_KHZ
+}
+
+fn snap_tune_by_band(freq: f32, band: RadioBand) -> f32 {
+    match band {
+        RadioBand::Fm => snap_fm_tune_mhz(freq),
+        RadioBand::Am => snap_am_tune_khz(freq),
+    }
+}
+
+fn format_tuned_frequency(freq: f32, band: RadioBand) -> String {
+    match band {
+        RadioBand::Fm => format!("{freq:.1} MHz"),
+        RadioBand::Am => format!("{freq:.0} kHz"),
+    }
 }
 
 fn should_auto_refresh_sdr_devices(
@@ -326,7 +355,7 @@ impl Nrsc5App {
         egui_extras::install_image_loaders(&_cc.egui_ctx);
         Self::install_fonts(&_cc.egui_ctx);
         let mut config = load_config();
-        let snapped_boot_freq = snap_fm_tune_mhz(config.frequency_mhz);
+        let snapped_boot_freq = snap_tune_by_band(config.frequency_mhz, config.radio_band);
         if (config.frequency_mhz - snapped_boot_freq).abs() > f32::EPSILON {
             config.frequency_mhz = snapped_boot_freq;
             save_config(&config);
@@ -395,6 +424,7 @@ impl Nrsc5App {
 
         let mut app = Self {
             app_state: AppState {
+                radio_band: config.radio_band,
                 frequency_mhz: config.frequency_mhz,
                 selected_program: config.selected_program,
                 dark_mode: config.dark_mode,
@@ -420,6 +450,8 @@ impl Nrsc5App {
                 analog_fallback_mode: config.analog_fallback_mode,
                 analog_fallback_stereo: config.analog_fallback_stereo,
                 analog_fallback_rds_enabled: config.analog_fallback_rds_enabled,
+                analog_fallback_mer_threshold_db: config.analog_fallback_mer_threshold_db,
+                am_analog_filter: config.am_analog_filter,
                 collage_tile_cap: collage_tile_cap(&config) as u32,
                 spectrum_tap: Some(spectrum_tap),
                 ..AppState::default()
@@ -660,7 +692,11 @@ impl eframe::App for Nrsc5App {
             );
             ui.separator();
             ui.label(
-                egui::RichText::new(format!("{:.1} MHz", self.app_state.frequency_mhz)).monospace(),
+                egui::RichText::new(format_tuned_frequency(
+                    self.app_state.frequency_mhz,
+                    self.app_state.radio_band,
+                ))
+                .monospace(),
             );
             ui.separator();
             // Active SDR device chip — clickable shortcut to the SDR
@@ -1023,6 +1059,11 @@ impl Nrsc5App {
             .map(|n| n.sdr_antennas())
             .unwrap_or_default();
         self.app_state.active_antenna = self.nrsc5.as_ref().and_then(|n| n.active_antenna());
+        self.app_state.hd_audio_active = self
+            .nrsc5
+            .as_ref()
+            .map(|n| n.hd_audio_active())
+            .unwrap_or(false);
     }
 
     /// Push the current `app_state.volume` into the audio player. Wait-
@@ -2745,6 +2786,7 @@ impl Nrsc5App {
                     })
                 };
                 let result = nrsc5.start_piped(
+                    self.config.radio_band,
                     mhz,
                     program,
                     transport,
@@ -2758,6 +2800,8 @@ impl Nrsc5App {
                     self.config.analog_fallback_mode,
                     self.config.analog_fallback_stereo,
                     self.config.analog_fallback_rds_enabled,
+                    self.config.analog_fallback_mer_threshold_db,
+                    self.config.am_analog_filter,
                 );
 
                 if let Err(err) = result {
@@ -2775,7 +2819,8 @@ impl Nrsc5App {
                 // "wipe collage" affordance can live on the Collage tab if
                 // we ever need one.
                 self.app_state.nrsc5_status = format!(
-                    "started {mhz:.1} MHz HD{}; waiting for sync...",
+                    "started {} HD{}; waiting for sync...",
+                    format_tuned_frequency(mhz, self.app_state.radio_band),
                     program + 1
                 );
             }
@@ -2829,7 +2874,7 @@ impl Nrsc5App {
                 self.app_state.nrsc5_status = "stream stopped".to_string();
             }
             UiCommand::TuneMhz(mhz) => {
-                let mhz = snap_fm_tune_mhz(mhz);
+                let mhz = snap_tune_by_band(mhz, self.app_state.radio_band);
                 self.app_state.frequency_mhz = mhz;
                 // Phase 4: a tune is a station change — the recording's
                 // station-identity metadata (and the per-station
@@ -3121,6 +3166,30 @@ impl Nrsc5App {
                 self.app_state.gain_mode = mode;
                 save_config(&self.config);
             }
+            UiCommand::SetRadioBand(band) => {
+                if self.config.radio_band == band {
+                    self.app_state.radio_band = band;
+                    return;
+                }
+                self.config.radio_band = band;
+                self.app_state.radio_band = band;
+                let snapped = snap_tune_by_band(self.app_state.frequency_mhz, band);
+                self.app_state.frequency_mhz = snapped;
+                self.config.frequency_mhz = snapped;
+                save_config(&self.config);
+                if self.app_state.is_streaming {
+                    self.app_state.nrsc5_status = match band {
+                        RadioBand::Fm => {
+                            "restarting stream in FM mode".to_string()
+                        }
+                        RadioBand::Am => {
+                            "restarting stream in AM mode".to_string()
+                        }
+                    };
+                    self.handle_command(UiCommand::Stop);
+                    self.handle_command(UiCommand::Start);
+                }
+            }
             UiCommand::SetAgcAmpTargetDbfs(target) => {
                 // Clamp at the boundary so a hand-edited config can't
                 // sneak past the UI's [-30, -10] window. None clears
@@ -3225,6 +3294,34 @@ impl Nrsc5App {
                     } else {
                         "restarting stream to disable analog RDS".to_string()
                     };
+                    self.handle_command(UiCommand::Stop);
+                    self.handle_command(UiCommand::Start);
+                }
+            }
+            UiCommand::SetAnalogFallbackMerThresholdDb(threshold_db) => {
+                let normalized = threshold_db.map(|v| v.clamp(0.0, 30.0));
+                if self.config.analog_fallback_mer_threshold_db == normalized {
+                    self.app_state.analog_fallback_mer_threshold_db = normalized;
+                    return;
+                }
+                self.config.analog_fallback_mer_threshold_db = normalized;
+                self.app_state.analog_fallback_mer_threshold_db = normalized;
+                save_config(&self.config);
+                if let Some(nrsc5) = self.nrsc5.as_ref() {
+                    nrsc5.set_analog_fallback_mer_threshold_db(normalized);
+                }
+            }
+            UiCommand::SetAmAnalogFilter(filter) => {
+                if self.config.am_analog_filter == filter {
+                    self.app_state.am_analog_filter = filter;
+                    return;
+                }
+                self.config.am_analog_filter = filter;
+                self.app_state.am_analog_filter = filter;
+                save_config(&self.config);
+                if self.app_state.is_streaming && self.config.radio_band == RadioBand::Am {
+                    self.app_state.nrsc5_status =
+                        format!("restarting stream to set AM filter {}", filter.label());
                     self.handle_command(UiCommand::Stop);
                     self.handle_command(UiCommand::Start);
                 }
@@ -5142,6 +5239,27 @@ mod tests {
             );
             mhz += 0.01;
         }
+    }
+
+    #[test]
+    fn snap_am_tune_clamps_below_band() {
+        assert_eq!(snap_am_tune_khz(400.0), AM_TUNE_MIN_KHZ);
+        assert_eq!(snap_am_tune_khz(0.0), AM_TUNE_MIN_KHZ);
+        assert_eq!(snap_am_tune_khz(f32::NEG_INFINITY), AM_TUNE_MIN_KHZ);
+    }
+
+    #[test]
+    fn snap_am_tune_clamps_above_band() {
+        assert_eq!(snap_am_tune_khz(2000.0), AM_TUNE_MAX_KHZ);
+        assert_eq!(snap_am_tune_khz(f32::INFINITY), AM_TUNE_MAX_KHZ);
+    }
+
+    #[test]
+    fn snap_am_tune_rounds_to_10khz_raster() {
+        assert_eq!(snap_am_tune_khz(1083.0), 1080.0);
+        assert_eq!(snap_am_tune_khz(1066.0), 1070.0);
+        assert_eq!(snap_am_tune_khz(530.0), 530.0);
+        assert_eq!(snap_am_tune_khz(1710.0), 1710.0);
     }
 
     // =================================================================

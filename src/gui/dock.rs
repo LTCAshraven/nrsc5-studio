@@ -110,6 +110,7 @@ pub enum UiCommand {
     Start,
     Stop,
     TuneMhz(f32),
+    SetRadioBand(crate::config::RadioBand),
     SelectProgram(u32),
     /// Show / hide the HD5..HD8 row of the program selector.
     /// Persisted via `AppConfig::show_hd5_hd8`.
@@ -167,6 +168,8 @@ pub enum UiCommand {
     SetAnalogFallbackMode(crate::config::AnalogFallbackMode),
     SetAnalogFallbackStereo(bool),
     SetAnalogFallbackRdsEnabled(bool),
+    SetAnalogFallbackMerThresholdDb(Option<f32>),
+    SetAmAnalogFilter(crate::config::AmAnalogFilter),
     /// v0.6.0 — override the amplitude pre-stage RMS target (dBFS).
     /// `None` clears the override and reverts to the per-device profile
     /// default. `Some(x)` is clamped to [−30, −10] on apply. Takes
@@ -381,12 +384,48 @@ impl DockViewer<'_> {
     fn tuner_ui(&mut self, ui: &mut Ui) {
         ui.add_space(2.0);
         ui.horizontal(|ui| {
+            let mut radio_band = self.app_state.radio_band;
+            ui.label(RichText::new("Band").strong());
+            ui.selectable_value(
+                &mut radio_band,
+                crate::config::RadioBand::Fm,
+                crate::config::RadioBand::Fm.label(),
+            );
+            ui.selectable_value(
+                &mut radio_band,
+                crate::config::RadioBand::Am,
+                crate::config::RadioBand::Am.label(),
+            );
+            if radio_band != self.app_state.radio_band {
+                self.commands.push(UiCommand::SetRadioBand(radio_band));
+            }
+
+            let (freq_suffix, freq_range, freq_speed, tune_step, step_label, unit_label) =
+                match self.app_state.radio_band {
+                    crate::config::RadioBand::Fm => (
+                        " MHz",
+                        87.9..=107.9,
+                        0.2,
+                        0.2,
+                        "0.2",
+                        "MHz",
+                    ),
+                    crate::config::RadioBand::Am => (
+                        " kHz",
+                        530.0..=1710.0,
+                        10.0,
+                        10.0,
+                        "10",
+                        "kHz",
+                    ),
+                };
+
             ui.label(RichText::new("Frequency").strong());
             let freq_resp = ui.add(
                 DragValue::new(&mut self.app_state.frequency_mhz)
-                    .speed(0.2)
-                    .suffix(" MHz")
-                    .range(87.9..=107.9),
+                    .speed(freq_speed)
+                    .suffix(freq_suffix)
+                    .range(freq_range),
             );
             // Treat <Enter> in the Frequency field as a Tune click so the
             // user doesn't have to grab the mouse after typing a freq.
@@ -394,18 +433,26 @@ impl DockViewer<'_> {
             // for text-editable widgets including `DragValue`.
             let enter_pressed = freq_resp.lost_focus()
                 && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            if ui.button("<").on_hover_text("Tune down 0.2 MHz").clicked() {
+            if ui
+                .button("<")
+                .on_hover_text(format!("Tune down {step_label} {unit_label}"))
+                .clicked()
+            {
                 self.commands.push(UiCommand::TuneMhz(
-                    self.app_state.frequency_mhz - 0.2,
+                    self.app_state.frequency_mhz - tune_step,
                 ));
             }
             if ui.button("Tune").clicked() || enter_pressed {
                 self.commands
                     .push(UiCommand::TuneMhz(self.app_state.frequency_mhz));
             }
-            if ui.button(">").on_hover_text("Tune up 0.2 MHz").clicked() {
+            if ui
+                .button(">")
+                .on_hover_text(format!("Tune up {step_label} {unit_label}"))
+                .clicked()
+            {
                 self.commands.push(UiCommand::TuneMhz(
-                    self.app_state.frequency_mhz + 0.2,
+                    self.app_state.frequency_mhz + tune_step,
                 ));
             }
         });
@@ -1492,12 +1539,29 @@ impl DockViewer<'_> {
             if let Some(psmi) = info.sync_psmi {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("PSMI:").color(muted));
-                    let mode_code = match psmi {
-                        1 => "MA1",
-                        2 => "MA3",
-                        3 => "MP3",
-                        11 => "MP11",
-                        _ => "Unknown",
+                    // AM and FM reuse overlapping PSMI values, so the band
+                    // decides the prefix: MA* for AM tunes, MP* for FM.
+                    // (nrsc5 defines.h: SERVICE_MODE_MA1 = 1, MA3 = 2; FM
+                    // PSMI values 1/2/3/5/6/11 map directly to MP1…MP11.)
+                    // `am_sync` is populated on the same SYNC event as the
+                    // PSMI for AM tunes, matching `sync_psmi_label()`'s
+                    // discriminator so the badge and description agree.
+                    let mode_code = if info.am_sync.is_some() {
+                        match psmi {
+                            1 => "MA1",
+                            2 => "MA3",
+                            _ => "Unknown",
+                        }
+                    } else {
+                        match psmi {
+                            1 => "MP1",
+                            2 => "MP2",
+                            3 => "MP3",
+                            5 => "MP5",
+                            6 => "MP6",
+                            11 => "MP11",
+                            _ => "Unknown",
+                        }
                     };
                     let mode_desc = info.sync_psmi_label().unwrap_or("Unknown mode");
                     let mode_text = if mode_desc.eq_ignore_ascii_case(mode_code) {
@@ -1951,9 +2015,10 @@ impl DockViewer<'_> {
     /// triangle strip mesh, with a faint dB grid and a channel-raster
     /// frequency scale overlaid. Left-clicking the spectrum tunes to the
     /// clicked frequency (snapped server-side to the 200 kHz FM raster via
-    /// `UiCommand::TuneMhz` handling). The HD digital sidebands (±129..±199 kHz from carrier)
-    /// are highlighted as faint colored regions so the user can see the
-    /// shoulders rise above the FM analog signal.
+    /// `UiCommand::TuneMhz` handling). A center-band analog passband
+    /// overlay marks which part of the spectrum is currently emphasized by
+    /// the active analog path: AM follows the selected 3.5/4.2/5.0 kHz
+    /// filter preset; FM uses the analog channel filter width.
     ///
     /// Bottom half: rolling waterfall, 256 rows × 1024 bins. Each row is
     /// a snapshot of the FFT mapped through a turbo-style colormap. The
@@ -1974,24 +2039,27 @@ impl DockViewer<'_> {
         };
 
         let dim = Color32::from_gray(140);
+        let is_am_band = self.app_state.radio_band == crate::config::RadioBand::Am;
+        let am_target_half_span_hz =
+            (self.app_state.am_analog_filter.cutoff_hz() * 6.0).clamp(18_000.0, 60_000.0);
+        let sample_rate = self.app_state.spectrum_snapshot.sample_rate_sps.max(1.0);
 
-        // Header: live frequency + sample rate readout.
+        // Header: band-aware frequency and span readout.
         ui.add_space(2.0);
         ui.horizontal(|ui| {
-            ui.label(
-                RichText::new(format!(
-                    "{:.4} MHz",
-                    self.app_state.frequency_mhz
-                ))
-                .monospace()
-                .strong(),
-            );
+            let freq_label = if is_am_band {
+                format!("{:.0} khz", self.app_state.frequency_mhz)
+            } else {
+                format!("{:.3} MHz", self.app_state.frequency_mhz)
+            };
+            ui.label(RichText::new(freq_label).monospace().strong());
             ui.add_space(8.0);
-            ui.label(
-                RichText::new("span 1.488 Msps")
-                    .small()
-                    .color(dim),
-            );
+            let span_label = if is_am_band {
+                format!("view {:.0} khz", (am_target_half_span_hz * 2.0) / 1000.0)
+            } else {
+                format!("view {:.3} MHz", sample_rate / 1_000_000.0)
+            };
+            ui.label(RichText::new(span_label).small().color(dim));
             ui.add_space(8.0);
             if !self.app_state.is_streaming {
                 ui.label(
@@ -2072,119 +2140,253 @@ impl DockViewer<'_> {
             db_mark -= 20.0;
         }
 
-        // HD sideband shading: the digital sidebands are bands of
-        // 0.129..0.199 of the sample rate either side of center.
-        let sample_rate = self.app_state.spectrum_snapshot.sample_rate_sps;
+        // Per-band visible span. FM keeps the full Nyquist width; AM is
+        // zoomed in around center so its much narrower analog bandwidth is
+        // easier to inspect.
         if sample_rate > 1.0 {
-            let bin_hz = sample_rate / FFT_SIZE as f32;
             let nyquist = sample_rate * 0.5;
-            // Convert a "Hz from center" offset to a pixel x.
+            let display_half_span_hz = if is_am_band {
+                am_target_half_span_hz.min(nyquist)
+            } else {
+                nyquist
+            };
+            if display_half_span_hz <= 0.0 {
+                return;
+            }
+
+            // Convert a "Hz from center" offset to a pixel x within the
+            // currently visible span (which may be AM-zoomed).
             let hz_to_x = |hz: f32| -> f32 {
-                let t = (hz + nyquist) / (2.0 * nyquist);
+                let t = (hz + display_half_span_hz) / (2.0 * display_half_span_hz);
                 spec_rect.left() + t.clamp(0.0, 1.0) * spec_rect.width()
             };
-            let hd_inner = 129_000.0;
-            let hd_outer = 199_000.0;
-            let hd_color = Color32::from_rgba_unmultiplied(80, 160, 255, 18);
-            painter.rect_filled(
-                Rect::from_min_max(
-                    pos2(hz_to_x(-hd_outer), spec_rect.top()),
-                    pos2(hz_to_x(-hd_inner), spec_rect.bottom()),
-                ),
-                egui::CornerRadius::ZERO,
-                hd_color,
-            );
-            painter.rect_filled(
-                Rect::from_min_max(
-                    pos2(hz_to_x(hd_inner), spec_rect.top()),
-                    pos2(hz_to_x(hd_outer), spec_rect.bottom()),
-                ),
-                egui::CornerRadius::ZERO,
-                hd_color,
-            );
-            let _ = bin_hz;
-        }
 
-        // Build the spectrum line + filled triangle strip. We sample
-        // FFT_SIZE bins across the rect width; if the rect is narrower
-        // than FFT_SIZE we downsample by stepping.
-        let spec = &self.app_state.spectrum_snapshot.spectrum_db;
-        let n = spec.len().max(1);
-        let width = spec_rect.width().max(1.0);
-        let columns = (width.round() as usize).clamp(64, n);
-        let trace_color = Color32::from_rgb(220, 230, 255);
-        let fill_top = Color32::from_rgba_unmultiplied(80, 150, 255, 200);
-        let fill_bottom = Color32::from_rgba_unmultiplied(20, 50, 120, 30);
+            // Source-aware shading: FM analog audio = center passband;
+            // FM digital audio = HD sidebands. AM keeps center passband
+            // when analog is active.
+            let analog_source = match self.app_state.analog_fallback_mode {
+                crate::config::AnalogFallbackMode::AnalogOnly => true,
+                crate::config::AnalogFallbackMode::Automatic => !self.app_state.hd_audio_active,
+                crate::config::AnalogFallbackMode::DigitalOnly => false,
+            };
+            let digital_source = self.app_state.hd_audio_active && !analog_source;
 
-        let mut mesh = Mesh::default();
-        let mut trace_pts: Vec<Pos2> = Vec::with_capacity(columns);
-        for i in 0..columns {
-            let x = spec_rect.left() + (i as f32 / (columns as f32 - 1.0)) * width;
-            // Pick the max bin in this column's slice for a "peak hold"
-            // feel that doesn't average away thin carrier spikes.
-            let bin_start = (i * n) / columns;
-            let bin_end = (((i + 1) * n) / columns).max(bin_start + 1).min(n);
-            let mut peak = f32::NEG_INFINITY;
-            for k in bin_start..bin_end {
-                if spec[k] > peak {
-                    peak = spec[k];
+            if !is_am_band && digital_source {
+                let hd_inner = 129_000.0;
+                let hd_outer = 199_000.0;
+                let hd_color = Color32::from_rgba_unmultiplied(80, 160, 255, 18);
+                let hd_edge = Color32::from_rgba_unmultiplied(110, 190, 255, 90);
+
+                painter.rect_filled(
+                    Rect::from_min_max(
+                        pos2(hz_to_x(-hd_outer), spec_rect.top()),
+                        pos2(hz_to_x(-hd_inner), spec_rect.bottom()),
+                    ),
+                    egui::CornerRadius::ZERO,
+                    hd_color,
+                );
+                painter.rect_filled(
+                    Rect::from_min_max(
+                        pos2(hz_to_x(hd_inner), spec_rect.top()),
+                        pos2(hz_to_x(hd_outer), spec_rect.bottom()),
+                    ),
+                    egui::CornerRadius::ZERO,
+                    hd_color,
+                );
+                for hz in [-hd_outer, -hd_inner, hd_inner, hd_outer] {
+                    let x = hz_to_x(hz);
+                    painter.line_segment(
+                        [pos2(x, spec_rect.top()), pos2(x, spec_rect.bottom())],
+                        Stroke::new(1.0, hd_edge),
+                    );
+                }
+                painter.text(
+                    pos2(spec_rect.center().x, spec_rect.top() + 4.0),
+                    egui::Align2::CENTER_TOP,
+                    "FM digital sidebands",
+                    egui::FontId::monospace(10.0),
+                    hd_edge,
+                );
+            } else if analog_source || is_am_band {
+                let (half_bw_hz, band_label, shade_color, edge_color) = if is_am_band {
+                    let bw = self.app_state.am_analog_filter.cutoff_hz();
+                    (
+                        bw,
+                        format!("AM analog passband ±{:.1} kHz", bw / 1000.0),
+                        Color32::from_rgba_unmultiplied(220, 170, 70, 24),
+                        Color32::from_rgba_unmultiplied(230, 190, 90, 90),
+                    )
+                } else {
+                    // Keep this in sync with `src/dsp/fm_analog.rs`
+                    // (`CHANNEL_CUTOFF_HZ = 100_000.0`).
+                    let bw = 100_000.0;
+                    (
+                        bw,
+                        format!("FM analog passband ±{:.0} kHz", bw / 1000.0),
+                        Color32::from_rgba_unmultiplied(80, 160, 255, 20),
+                        Color32::from_rgba_unmultiplied(110, 190, 255, 90),
+                    )
+                };
+
+                let left = hz_to_x(-half_bw_hz);
+                let right = hz_to_x(half_bw_hz);
+                let passband_rect = Rect::from_min_max(
+                    pos2(left, spec_rect.top()),
+                    pos2(right, spec_rect.bottom()),
+                );
+
+                painter.rect_filled(
+                    passband_rect,
+                    egui::CornerRadius::ZERO,
+                    shade_color,
+                );
+                painter.line_segment(
+                    [pos2(left, spec_rect.top()), pos2(left, spec_rect.bottom())],
+                    Stroke::new(1.0, edge_color),
+                );
+                painter.line_segment(
+                    [pos2(right, spec_rect.top()), pos2(right, spec_rect.bottom())],
+                    Stroke::new(1.0, edge_color),
+                );
+                painter.text(
+                    pos2(spec_rect.center().x, spec_rect.top() + 4.0),
+                    egui::Align2::CENTER_TOP,
+                    band_label,
+                    egui::FontId::monospace(10.0),
+                    edge_color,
+                );
+            }
+
+            // Build the spectrum line + filled triangle strip. We sample only
+            // the currently visible frequency window, which is AM-zoomed.
+            let spec = &self.app_state.spectrum_snapshot.spectrum_db;
+            let n = spec.len().max(1);
+            let width = spec_rect.width().max(1.0);
+            let columns = (width.round() as usize).clamp(64, n);
+            let trace_color = Color32::from_rgb(220, 230, 255);
+            let fill_top = Color32::from_rgba_unmultiplied(80, 150, 255, 200);
+            let fill_bottom = Color32::from_rgba_unmultiplied(20, 50, 120, 30);
+
+            let bin_hz = sample_rate / n as f32;
+            let half_bins = (display_half_span_hz / bin_hz).round() as usize;
+            let center_bin = n / 2;
+            let vis_start = center_bin.saturating_sub(half_bins.max(1));
+            let vis_end = (center_bin + half_bins.max(1)).min(n);
+            let vis_n = (vis_end - vis_start).max(1);
+
+            let mut mesh = Mesh::default();
+            let mut trace_pts: Vec<Pos2> = Vec::with_capacity(columns);
+            for i in 0..columns {
+                let x = spec_rect.left() + (i as f32 / (columns as f32 - 1.0)) * width;
+                let rel_start = (i * vis_n) / columns;
+                let rel_end = (((i + 1) * vis_n) / columns)
+                    .max(rel_start + 1)
+                    .min(vis_n);
+                let bin_start = vis_start + rel_start;
+                let bin_end = vis_start + rel_end;
+                let mut peak = f32::NEG_INFINITY;
+                for k in bin_start..bin_end {
+                    if spec[k] > peak {
+                        peak = spec[k];
+                    }
+                }
+                let y_top = db_to_y(peak);
+                let y_bot = spec_rect.bottom();
+                let h = ((peak - DB_BOT) / (DB_TOP - DB_BOT)).clamp(0.0, 1.0);
+                let top_col = lerp_color(fill_bottom, fill_top, h);
+                let idx_top = mesh.vertices.len() as u32;
+                mesh.vertices.push(Vertex {
+                    pos: pos2(x, y_top),
+                    uv: egui::epaint::WHITE_UV,
+                    color: top_col,
+                });
+                mesh.vertices.push(Vertex {
+                    pos: pos2(x, y_bot),
+                    uv: egui::epaint::WHITE_UV,
+                    color: fill_bottom,
+                });
+                if i > 0 {
+                    let p = idx_top - 2;
+                    let q = idx_top - 1;
+                    let r = idx_top;
+                    let s = idx_top + 1;
+                    mesh.indices.extend_from_slice(&[p, q, s, p, s, r]);
+                }
+                trace_pts.push(pos2(x, y_top));
+            }
+            painter.add(Shape::mesh(mesh));
+            painter.add(Shape::line(trace_pts, Stroke::new(1.2, trace_color)));
+
+            // Frequency scale: FM keeps 200 kHz raster; AM shows local kHz ticks.
+            let center_hz = self.app_state.spectrum_snapshot.center_freq_hz;
+            let view_min_hz = center_hz - display_half_span_hz as f64;
+            let view_max_hz = center_hz + display_half_span_hz as f64;
+            if !is_am_band {
+                let view_min_mhz = view_min_hz / 1_000_000.0;
+                let view_max_mhz = view_max_hz / 1_000_000.0;
+                const FM_BASE_MHZ: f64 = 87.9;
+                const FM_STEP_MHZ: f64 = 0.2;
+                if view_max_mhz > view_min_mhz {
+                    let first = ((view_min_mhz - FM_BASE_MHZ) / FM_STEP_MHZ).ceil() as i32;
+                    let last = ((view_max_mhz - FM_BASE_MHZ) / FM_STEP_MHZ).floor() as i32;
+                    for slot in first..=last {
+                        let mhz = FM_BASE_MHZ + (slot as f64) * FM_STEP_MHZ;
+                        let t = ((mhz - view_min_mhz) / (view_max_mhz - view_min_mhz)).clamp(0.0, 1.0) as f32;
+                        let x = spec_rect.left() + t * spec_rect.width();
+                        painter.line_segment(
+                            [pos2(x, spec_rect.top()), pos2(x, spec_rect.bottom())],
+                            Stroke::new(0.6, Color32::from_rgb(36, 48, 70)),
+                        );
+                        painter.text(
+                            pos2(x, spec_rect.bottom() - 2.0),
+                            egui::Align2::CENTER_BOTTOM,
+                            format!("{:.1}", mhz),
+                            egui::FontId::monospace(10.0),
+                            Color32::from_rgb(150, 170, 200),
+                        );
+                    }
+                }
+            } else {
+                let view_min_khz = view_min_hz / 1_000.0;
+                let view_max_khz = view_max_hz / 1_000.0;
+                let step_khz = if display_half_span_hz <= 30_000.0 { 5.0 } else { 10.0 };
+                let first = (view_min_khz / step_khz).ceil() as i32;
+                let last = (view_max_khz / step_khz).floor() as i32;
+                if view_max_khz > view_min_khz {
+                    for slot in first..=last {
+                        let khz = (slot as f64) * step_khz;
+                        let t = ((khz - view_min_khz) / (view_max_khz - view_min_khz)).clamp(0.0, 1.0) as f32;
+                        let x = spec_rect.left() + t * spec_rect.width();
+                        painter.line_segment(
+                            [pos2(x, spec_rect.top()), pos2(x, spec_rect.bottom())],
+                            Stroke::new(0.6, Color32::from_rgb(60, 52, 34)),
+                        );
+                        painter.text(
+                            pos2(x, spec_rect.bottom() - 2.0),
+                            egui::Align2::CENTER_BOTTOM,
+                            format!("{:.0}", khz),
+                            egui::FontId::monospace(10.0),
+                            Color32::from_rgb(190, 165, 110),
+                        );
+                    }
                 }
             }
-            let y_top = db_to_y(peak);
-            let y_bot = spec_rect.bottom();
-            // Top vertex (line color, alpha fade based on dB height).
-            let h = ((peak - DB_BOT) / (DB_TOP - DB_BOT)).clamp(0.0, 1.0);
-            let top_col = lerp_color(fill_bottom, fill_top, h);
-            let idx_top = mesh.vertices.len() as u32;
-            mesh.vertices.push(Vertex {
-                pos: pos2(x, y_top),
-                uv: egui::epaint::WHITE_UV,
-                color: top_col,
-            });
-            mesh.vertices.push(Vertex {
-                pos: pos2(x, y_bot),
-                uv: egui::epaint::WHITE_UV,
-                color: fill_bottom,
-            });
-            if i > 0 {
-                // Two triangles per quad between this column and the previous.
-                let p = idx_top - 2; // previous top
-                let q = idx_top - 1; // previous bottom
-                let r = idx_top; // this top
-                let s = idx_top + 1; // this bottom
-                mesh.indices.extend_from_slice(&[p, q, s, p, s, r]);
-            }
-            trace_pts.push(pos2(x, y_top));
-        }
-        painter.add(Shape::mesh(mesh));
-        // Crisp trace line on top of the fill.
-        painter.add(Shape::line(trace_pts, Stroke::new(1.2, trace_color)));
 
-        // Frequency scale pinned to the FM 200 kHz raster (87.9 + n*0.2).
-        let center_mhz = self.app_state.spectrum_snapshot.center_freq_hz / 1_000_000.0;
-        let half_span_mhz = sample_rate as f64 / 2.0 / 1_000_000.0;
-        let view_min_mhz = center_mhz - half_span_mhz;
-        let view_max_mhz = center_mhz + half_span_mhz;
-        const FM_BASE_MHZ: f64 = 87.9;
-        const FM_STEP_MHZ: f64 = 0.2;
-        if view_max_mhz > view_min_mhz {
-            let first = ((view_min_mhz - FM_BASE_MHZ) / FM_STEP_MHZ).ceil() as i32;
-            let last = ((view_max_mhz - FM_BASE_MHZ) / FM_STEP_MHZ).floor() as i32;
-            for slot in first..=last {
-                let mhz = FM_BASE_MHZ + (slot as f64) * FM_STEP_MHZ;
-                let t = ((mhz - view_min_mhz) / (view_max_mhz - view_min_mhz)).clamp(0.0, 1.0) as f32;
-                let x = spec_rect.left() + t * spec_rect.width();
-                painter.line_segment(
-                    [pos2(x, spec_rect.top()), pos2(x, spec_rect.bottom())],
-                    Stroke::new(0.6, Color32::from_rgb(36, 48, 70)),
-                );
-            painter.text(
-                pos2(x, spec_rect.bottom() - 2.0),
-                    egui::Align2::CENTER_BOTTOM,
-                    format!("{:.1}", mhz),
-                egui::FontId::monospace(10.0),
-                Color32::from_rgb(150, 170, 200),
-            );
+            // Click-to-tune in the visible span; AM uses kHz units in
+            // `UiCommand::TuneMhz` despite the legacy name.
+            if panel_resp.clicked() {
+                if let Some(pos) = panel_resp.interact_pointer_pos() {
+                    if spec_rect.contains(pos) {
+                        let t = ((pos.x - spec_rect.left()) / spec_rect.width()).clamp(0.0, 1.0);
+                        let clicked_hz = center_hz + (2.0 * t as f64 - 1.0) * display_half_span_hz as f64;
+                        let clicked = if is_am_band {
+                            (clicked_hz / 1_000.0) as f32
+                        } else {
+                            (clicked_hz / 1_000_000.0) as f32
+                        };
+                        self.commands.push(UiCommand::TuneMhz(clicked));
+                    }
+                }
             }
         }
 
@@ -2250,17 +2452,8 @@ impl DockViewer<'_> {
             Stroke::new(0.7, Color32::from_rgba_unmultiplied(255, 60, 60, 110)),
         );
 
-        // Click-to-tune: map x-position in the spectrum pane to frequency.
-        if panel_resp.clicked() {
-            if let Some(pos) = panel_resp.interact_pointer_pos() {
-                if spec_rect.contains(pos) && sample_rate > 1.0 {
-                    let t = ((pos.x - spec_rect.left()) / spec_rect.width()).clamp(0.0, 1.0);
-                    let clicked_mhz =
-                        center_mhz - half_span_mhz + (t as f64) * 2.0 * half_span_mhz;
-                    self.commands.push(UiCommand::TuneMhz(clicked_mhz as f32));
-                }
-            }
-        }
+        // Click-to-tune is handled in the span/shading block above so AM
+        // can tune in kHz while FM tunes in MHz.
 
         // Keep repainting while the panel is on screen so we get smooth
         // waterfall scroll even when no other UI is animating.
@@ -2518,12 +2711,15 @@ impl DockViewer<'_> {
         let mut analog_fallback_mode = self.app_state.analog_fallback_mode;
         let mut analog_fallback_stereo = self.app_state.analog_fallback_stereo;
         let mut analog_fallback_rds_enabled = self.app_state.analog_fallback_rds_enabled;
+        let mut analog_fallback_mer_threshold_db = self.app_state.analog_fallback_mer_threshold_db;
+        let mut am_analog_filter = self.app_state.am_analog_filter;
+        let is_am_band = self.app_state.radio_band == crate::config::RadioBand::Am;
         let analog_audible = self.app_state.analog_fallback_mode.is_analog_audible();
         // What's actually reaching the speakers depends on both sync *and*
         // the fallback mode. In Analog Only the audio stays on the FM path
         // even when HD locks (HD subchannels only feed metadata there), so
         // sync alone can't decide the label.
-        let currently_synced = self.app_state.currently_synced;
+        let hd_audio_active = self.app_state.hd_audio_active;
         let source_mode = self.app_state.analog_fallback_mode;
         let mode_select_id = ui.make_persistent_id("mode_select_section");
         egui::collapsing_header::CollapsingState::load_with_default_open(
@@ -2535,13 +2731,17 @@ impl DockViewer<'_> {
             ui.label(RichText::new("Mode Select").small().strong().color(dim));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let (source_text, source_color) = match source_mode {
-                    // Analog Only: always the FM path, regardless of HD sync.
+                    // Analog Only: always the analog path, regardless of HD sync.
                     crate::config::AnalogFallbackMode::AnalogOnly => {
-                        ("Analog FM", Color32::from_rgb(200, 160, 50))
+                        if is_am_band {
+                            ("Analog AM", Color32::from_rgb(200, 160, 50))
+                        } else {
+                            ("Analog FM", Color32::from_rgb(200, 160, 50))
+                        }
                     }
                     // Digital Only: HD when locked, otherwise nothing audible.
                     crate::config::AnalogFallbackMode::DigitalOnly => {
-                        if currently_synced {
+                        if hd_audio_active {
                             ("HD Radio", Color32::from_rgb(60, 170, 90))
                         } else {
                             ("No Signal", Color32::from_rgb(200, 70, 70))
@@ -2549,10 +2749,14 @@ impl DockViewer<'_> {
                     }
                     // Automatic: HD once locked, analog fallback until then.
                     crate::config::AnalogFallbackMode::Automatic => {
-                        if currently_synced {
+                        if hd_audio_active {
                             ("HD Radio", Color32::from_rgb(60, 170, 90))
                         } else {
-                            ("Analog FM", Color32::from_rgb(200, 160, 50))
+                            if is_am_band {
+                                ("Analog AM", Color32::from_rgb(200, 160, 50))
+                            } else {
+                                ("Analog FM", Color32::from_rgb(200, 160, 50))
+                            }
                         }
                     }
                 };
@@ -2581,29 +2785,88 @@ impl DockViewer<'_> {
                         );
                     });
                 });
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Stereo FM").small().strong().color(dim));
-                    let stereo_response = ui.add_enabled(analog_audible, egui::RadioButton::new(analog_fallback_stereo, "Stereo"));
-                    let mono_response = ui.add_enabled(analog_audible, egui::RadioButton::new(!analog_fallback_stereo, "Mono"));
-                    if stereo_response.clicked() {
-                        analog_fallback_stereo = true;
-                    }
-                    if mono_response.clicked() {
-                        analog_fallback_stereo = false;
-                    }
-                });
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("RDS").small().strong().color(dim));
-                    ui.add_enabled(
-                        analog_audible,
-                        egui::Checkbox::new(&mut analog_fallback_rds_enabled, "On"),
+                if is_am_band {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("AM Filter").small().strong().color(dim));
+                        for preset in [
+                            crate::config::AmAnalogFilter::Narrow35,
+                            crate::config::AmAnalogFilter::Medium42,
+                            crate::config::AmAnalogFilter::Wide50,
+                            crate::config::AmAnalogFilter::UltraWide100,
+                        ] {
+                            let resp = ui.add_enabled(
+                                analog_audible,
+                                egui::RadioButton::new(am_analog_filter == preset, preset.label()),
+                            );
+                            if resp.clicked() {
+                                am_analog_filter = preset;
+                            }
+                        }
+                    });
+                    ui.label(
+                        RichText::new("Choose how AM analog fallback behaves when HD is unavailable.")
+                            .small()
+                            .color(dim),
                     );
-                });
-                ui.label(
-                    RichText::new("Choose how the analog FM fallback behaves when HD is unavailable. Stereo and RDS are only active when analog audio is audible.")
-                        .small()
-                        .color(dim),
-                );
+                    ui.label(
+                        RichText::new("AM filter presets are active only when analog audio is audible.")
+                            .small()
+                            .color(dim),
+                    );
+                } else {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Stereo FM").small().strong().color(dim));
+                        let stereo_response = ui.add_enabled(analog_audible, egui::RadioButton::new(analog_fallback_stereo, "Stereo"));
+                        let mono_response = ui.add_enabled(analog_audible, egui::RadioButton::new(!analog_fallback_stereo, "Mono"));
+                        if stereo_response.clicked() {
+                            analog_fallback_stereo = true;
+                        }
+                        if mono_response.clicked() {
+                            analog_fallback_stereo = false;
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("RDS").small().strong().color(dim));
+                        ui.add_enabled(
+                            analog_audible,
+                            egui::Checkbox::new(&mut analog_fallback_rds_enabled, "On"),
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("HD→Analog MER").small().strong().color(dim));
+                        let automatic =
+                            analog_fallback_mode == crate::config::AnalogFallbackMode::Automatic;
+                        let mut enabled = analog_fallback_mer_threshold_db.is_some();
+                        let enable_resp = ui.add_enabled(
+                            automatic,
+                            egui::Checkbox::new(&mut enabled, "Use threshold"),
+                        );
+                        if enable_resp.changed() {
+                            analog_fallback_mer_threshold_db = if enabled {
+                                Some(analog_fallback_mer_threshold_db.unwrap_or(6.0).clamp(0.0, 30.0))
+                            } else {
+                                None
+                            };
+                        }
+                        let mut threshold =
+                            analog_fallback_mer_threshold_db.unwrap_or(6.0).clamp(0.0, 30.0);
+                        let threshold_resp = ui.add_enabled(
+                            automatic && enabled,
+                            egui::DragValue::new(&mut threshold)
+                                .speed(0.2)
+                                .range(0.0..=30.0)
+                                .suffix(" dB"),
+                        );
+                        if threshold_resp.changed() && enabled {
+                            analog_fallback_mer_threshold_db = Some(threshold.clamp(0.0, 30.0));
+                        }
+                    });
+                    ui.label(
+                        RichText::new("Choose how the analog FM fallback behaves when HD is unavailable. Stereo/RDS are active only when analog audio is audible; MER threshold applies in Automatic mode.")
+                            .small()
+                            .color(dim),
+                    );
+                }
             });
         if analog_fallback_mode != self.app_state.analog_fallback_mode {
             self.commands.push(UiCommand::SetAnalogFallbackMode(analog_fallback_mode));
@@ -2613,6 +2876,14 @@ impl DockViewer<'_> {
         }
         if analog_fallback_rds_enabled != self.app_state.analog_fallback_rds_enabled {
             self.commands.push(UiCommand::SetAnalogFallbackRdsEnabled(analog_fallback_rds_enabled));
+        }
+        if analog_fallback_mer_threshold_db != self.app_state.analog_fallback_mer_threshold_db {
+            self.commands.push(UiCommand::SetAnalogFallbackMerThresholdDb(
+                analog_fallback_mer_threshold_db,
+            ));
+        }
+        if am_analog_filter != self.app_state.am_analog_filter {
+            self.commands.push(UiCommand::SetAmAnalogFilter(am_analog_filter));
         }
         ui.separator();
         ui.label(

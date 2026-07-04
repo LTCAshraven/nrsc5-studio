@@ -44,6 +44,23 @@ pub enum GainMode {
     HardwareAgc,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RadioBand {
+    #[default]
+    Fm,
+    Am,
+}
+
+impl RadioBand {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Fm => "FM",
+            Self::Am => "AM",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AnalogFallbackMode {
@@ -74,6 +91,36 @@ impl AnalogFallbackMode {
 
     pub fn is_analog_audible(self) -> bool {
         !matches!(self, Self::DigitalOnly)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AmAnalogFilter {
+    Narrow35,
+    #[default]
+    Medium42,
+    Wide50,
+    UltraWide100,
+}
+
+impl AmAnalogFilter {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Narrow35 => "3.5 kHz",
+            Self::Medium42 => "4.2 kHz",
+            Self::Wide50 => "5.0 kHz",
+            Self::UltraWide100 => "10.0 kHz",
+        }
+    }
+
+    pub fn cutoff_hz(self) -> f32 {
+        match self {
+            Self::Narrow35 => 3_500.0,
+            Self::Medium42 => 4_200.0,
+            Self::Wide50 => 5_000.0,
+            Self::UltraWide100 => 10_000.0,
+        }
     }
 }
 
@@ -128,6 +175,8 @@ pub struct Preset {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
+    #[serde(default)]
+    pub radio_band: RadioBand,
     pub frequency_mhz: f32,
     pub selected_program: u32,
     pub dark_mode: bool,
@@ -251,6 +300,15 @@ pub struct AppConfig {
     /// surfaces Program Service text in the UI.
     #[serde(default = "default_true")]
     pub analog_fallback_rds_enabled: bool,
+    /// Optional minimum MER required for HD to own the sink while in
+    /// `Automatic` mode. `None` disables MER-based fallback and keeps the
+    /// legacy sync/AGC-only handoff behavior.
+    #[serde(default)]
+    pub analog_fallback_mer_threshold_db: Option<f32>,
+    /// AM analog front-end bandwidth preset. Values are per-sideband
+    /// cutoffs from carrier (e.g. 5.0 kHz => ~10 kHz total RF span).
+    #[serde(default)]
+    pub am_analog_filter: AmAnalogFilter,
     /// Legacy flag kept only for config migration from the old boolean
     /// surface. The new `analog_fallback_mode` drives runtime behavior.
     #[serde(default, skip_serializing)]
@@ -479,6 +537,7 @@ fn default_preset_slot_count() -> u32 {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
+            radio_band: RadioBand::default(),
             frequency_mhz: 101.1,
             selected_program: 0,
             dark_mode: true,
@@ -507,6 +566,8 @@ impl Default for AppConfig {
             analog_fallback_mode: AnalogFallbackMode::default(),
             analog_fallback_stereo: true,
             analog_fallback_rds_enabled: true,
+            analog_fallback_mer_threshold_db: None,
+            am_analog_filter: AmAnalogFilter::default(),
             analog_fallback_enabled: false,
         }
     }
@@ -544,6 +605,9 @@ fn sanitize(cfg: &mut AppConfig) {
     if cfg.analog_fallback_enabled && cfg.analog_fallback_mode == AnalogFallbackMode::default() {
         cfg.analog_fallback_mode = AnalogFallbackMode::Automatic;
     }
+    cfg.analog_fallback_mer_threshold_db = cfg
+        .analog_fallback_mer_threshold_db
+        .map(|v| v.clamp(0.0, 30.0));
     migrate_legacy_sdr(cfg);
 }
 
@@ -740,6 +804,18 @@ mod tests {
         assert_eq!(decoded.analog_fallback_mode, AnalogFallbackMode::AnalogOnly);
         assert!(!decoded.analog_fallback_stereo);
         assert!(!decoded.analog_fallback_rds_enabled);
+    }
+
+    #[test]
+    fn radio_band_round_trips_through_toml() {
+        let mut cfg = AppConfig::default();
+        cfg.radio_band = RadioBand::Am;
+
+        let raw = toml::to_string_pretty(&cfg).expect("serialize config");
+        assert!(raw.contains("radio_band = \"am\""));
+
+        let decoded: AppConfig = toml::from_str(&raw).expect("deserialize config");
+        assert_eq!(decoded.radio_band, RadioBand::Am);
     }
 
     #[test]

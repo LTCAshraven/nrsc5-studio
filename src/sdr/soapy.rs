@@ -970,6 +970,38 @@ impl Sdr for SoapySdr {
         self.stop_flag.store(true, Ordering::Release);
         Ok(())
     }
+
+    fn run_stream_cs16(
+        &self,
+        cb: &mut dyn FnMut(&[i16]) -> StreamControl,
+    ) -> Result<(), SdrError> {
+        let _guard = self
+            .stream_guard
+            .try_lock()
+            .map_err(|_| SdrError::AlreadyStreaming)?;
+        self.stop_flag.store(false, Ordering::Release);
+
+        let resample_plan = self.resample_rates.lock().ok().and_then(|g| *g);
+
+        let mut rx = self
+            .device
+            .rx_stream::<Complex<i16>>(&[CH])
+            .map_err(|e| SdrError::SoapyCall {
+                func: "rx_stream",
+                detail: format!("CS16 native/resample path: {e}"),
+            })?;
+
+        if let Some((src_rate, dst_rate)) = resample_plan {
+            let resampler = IqResampler::new(src_rate, dst_rate)
+                .map_err(|e| SdrError::SoapyCall {
+                    func: "IqResampler::new",
+                    detail: format!("{src_rate} -> {dst_rate}: {e}"),
+                })?;
+            run_resample_cs16_loop(&mut rx, &self.stop_flag, resampler, cb)
+        } else {
+            run_native_cs16_loop(&mut rx, &self.stop_flag, cb)
+        }
+    }
 }
 
 /// CS8 stream loop. The driver hands us `Complex<i8>` pairs at the
@@ -1127,6 +1159,66 @@ fn run_cs16_loop(
     }
 }
 
+fn run_native_cs16_loop(
+    rx: &mut RxStream<Complex<i16>>,
+    stop_flag: &AtomicBool,
+    cb: &mut dyn FnMut(&[i16]) -> StreamControl,
+) -> Result<(), SdrError> {
+    let mtu = rx.mtu().unwrap_or(16384);
+    rx.activate(None).map_err(|e| SdrError::SoapyCall {
+        func: "activate",
+        detail: e.to_string(),
+    })?;
+
+    let mut i16_buf: Vec<Complex<i16>> = vec![Complex::new(0, 0); mtu];
+
+    let mut error: Option<SdrError> = None;
+    let mut overflow_warned = false;
+    while !stop_flag.load(Ordering::Acquire) {
+        let n = match rx.read(&mut [&mut i16_buf], 1_000_000) {
+            Ok(n) => n,
+            Err(e) => {
+                let detail = e.to_string();
+                if is_overflow_error(&detail) {
+                    if !overflow_warned {
+                        eprintln!(
+                            "[sdr] transient overflow in native CS16 read path; continuing"
+                        );
+                        overflow_warned = true;
+                    }
+                    continue;
+                }
+                error = Some(SdrError::SoapyCall {
+                    func: "rx_stream.read",
+                    detail,
+                });
+                break;
+            }
+        };
+        if n == 0 {
+            continue;
+        }
+
+        let samples = unsafe {
+            std::slice::from_raw_parts(i16_buf.as_ptr() as *const i16, n * 2)
+        };
+        if matches!(cb(samples), StreamControl::Stop) {
+            break;
+        }
+    }
+
+    let _ = rx.deactivate(None);
+    if let Some(err) = error {
+        if stop_flag.load(Ordering::Acquire) {
+            Ok(())
+        } else {
+            Err(err)
+        }
+    } else {
+        Ok(())
+    }
+}
+
 /// Resampling stream loop used by devices whose hardware can't hit
 /// `nrsc5`'s 1.488375 Msps directly (currently SDRplay only). The
 /// driver hands us `Complex<i16>` at whatever native rate
@@ -1219,6 +1311,80 @@ fn run_resample_loop(
         }
 
         if matches!(cb(&cu8_buf), StreamControl::Stop) {
+            break;
+        }
+    }
+
+    let _ = rx.deactivate(None);
+    if let Some(err) = error {
+        if stop_flag.load(Ordering::Acquire) {
+            Ok(())
+        } else {
+            Err(err)
+        }
+    } else {
+        Ok(())
+    }
+}
+
+fn run_resample_cs16_loop(
+    rx: &mut RxStream<Complex<i16>>,
+    stop_flag: &AtomicBool,
+    mut resampler: IqResampler,
+    cb: &mut dyn FnMut(&[i16]) -> StreamControl,
+) -> Result<(), SdrError> {
+    let mtu = rx.mtu().unwrap_or(16384);
+    rx.activate(None).map_err(|e| SdrError::SoapyCall {
+        func: "activate",
+        detail: e.to_string(),
+    })?;
+
+    let mut i16_buf: Vec<Complex<i16>> = vec![Complex::new(0, 0); mtu];
+    let mut f32_buf: Vec<Complex<f32>> = vec![Complex::new(0.0, 0.0); mtu];
+    let mut cs16_buf: Vec<i16> = Vec::with_capacity(mtu * 2);
+
+    const I16_NORM: f32 = 1.0 / 32767.0;
+
+    let mut error: Option<SdrError> = None;
+    let mut overflow_warned = false;
+    while !stop_flag.load(Ordering::Acquire) {
+        let n = match rx.read(&mut [&mut i16_buf], 1_000_000) {
+            Ok(n) => n,
+            Err(e) => {
+                let detail = e.to_string();
+                if is_overflow_error(&detail) {
+                    if !overflow_warned {
+                        eprintln!(
+                            "[sdr] transient overflow in CS16 resample read path; continuing"
+                        );
+                        overflow_warned = true;
+                    }
+                    continue;
+                }
+                error = Some(SdrError::SoapyCall {
+                    func: "rx_stream.read",
+                    detail,
+                });
+                break;
+            }
+        };
+        if n == 0 {
+            continue;
+        }
+
+        for i in 0..n {
+            let s = i16_buf[i];
+            f32_buf[i].re = s.re as f32 * I16_NORM;
+            f32_buf[i].im = s.im as f32 * I16_NORM;
+        }
+
+        cs16_buf.clear();
+        resampler.feed_cs16(&f32_buf[..n], &mut cs16_buf);
+        if cs16_buf.is_empty() {
+            continue;
+        }
+
+        if matches!(cb(&cs16_buf), StreamControl::Stop) {
             break;
         }
     }

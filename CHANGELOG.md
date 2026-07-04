@@ -6,6 +6,45 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.6.4] - 2026-07-03
+
+### Added
+
+- **FM analog audio path (Stereo + RDS) is now first-class.** NRSC5 Studio is
+  no longer effectively HD-digital-only in practice. The app now ships with a
+  custom FM analog demodulation path integrated alongside HD decode, including
+  Stereo controls and RDS support in the fallback experience.
+
+- **Community AM handoff branch published.** The `am-radio` branch is now
+  published on origin so contributors with nearby on-air AM HD service can
+  continue analog/digital validation and iterate on the existing AM
+  scaffolding.
+
+### Changed
+
+- **AM Analog and Digital work on-hold due to no available on-air HD signals
+  in range.**
+
+### Fixed
+
+- **FM service-mode badge no longer mislabeled as an AM mode.** The
+  Engineering Info panel mapped raw PSMI values to service-mode codes
+  without accounting for the tuned band, so a standard FM hybrid station
+  (PSMI 1) was shown as **MA1** — an AM-only mode — instead of **MP1**.
+  The badge is now band-aware: AM tunes report `MA1` / `MA3` and FM tunes
+  report `MP1` / `MP2` / `MP3` / `MP5` / `MP6` / `MP11`, matching nrsc5's
+  own `SERVICE_MODE_*` definitions. Thanks to
+  [@TechnicalLee](https://github.com/TechnicalLee) for catching the
+  incorrect descriptor
+  ([#16](https://github.com/LTCAshraven/nrsc5-studio/issues/16)).
+- **Automatic fallback now uses MER hysteresis and true audible-source reporting.**
+  In Automatic mode, HD-to-analog fallback no longer flaps near the MER
+  threshold: HD ownership now uses a hysteresis latch (enter-HD at the
+  configured threshold, release-HD below a lower edge). The Signal panel's
+  **Current Source** label now reflects the actual sink owner (audible HD vs
+  audible analog) instead of sync-lock state alone, so prolonged sync lock at
+  low MER correctly continues to report analog when analog is what you hear.
+
 ## [0.6.3] - 2026-06-28
 
 ### Added

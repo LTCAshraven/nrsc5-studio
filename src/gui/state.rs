@@ -121,6 +121,7 @@ impl ProgramRuntime {
 
 #[derive(Default)]
 pub struct AppState {
+    pub radio_band: crate::config::RadioBand,
     pub frequency_mhz: f32,
     pub selected_program: u32,
     pub dark_mode: bool,
@@ -267,6 +268,14 @@ pub struct AppState {
     pub analog_fallback_stereo: bool,
     /// Mirrors the analog RDS preference from config.
     pub analog_fallback_rds_enabled: bool,
+    /// Optional minimum MER threshold (dB) that allows HD audio to own
+    /// the sink while in automatic fallback mode.
+    pub analog_fallback_mer_threshold_db: Option<f32>,
+    /// True when HD currently owns the audio sink (as reported by the
+    /// backend handoff gate), not merely when decoder sync is present.
+    pub hd_audio_active: bool,
+    /// Mirrors the AM analog bandwidth preset from config.
+    pub am_analog_filter: crate::config::AmAnalogFilter,
     /// Preset slot currently being edited via the popup (None = no popup).
     pub editing_preset: Option<usize>,
     /// In-progress name text for the preset editor.

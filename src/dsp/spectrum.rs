@@ -171,6 +171,13 @@ impl SpectrumTap {
         }
     }
 
+    /// Update the sample rate used for x-axis span math.
+    pub fn set_sample_rate_sps(&self, sample_rate_sps: f32) {
+        if let Ok(mut g) = self.inner.lock() {
+            g.sample_rate_sps = sample_rate_sps.max(1.0);
+        }
+    }
+
     /// Feed raw interleaved 8-bit unsigned I/Q from the RTL-SDR.
     ///
     /// Throttled internally: most calls become a single timestamp check
@@ -238,6 +245,60 @@ impl SpectrumTap {
             let power = (c.re * c.re + c.im * c.im) * (norm * norm);
             // 10*log10 with a tiny floor to keep -inf out of the
             // arithmetic when a bin is exactly zero.
+            let db = 10.0 * (power + 1e-30).log10();
+            g.spectrum_db[shifted] = db;
+
+            let clamped = db.clamp(DB_FLOOR, DB_CEIL);
+            let norm01 = (clamped - DB_FLOOR) / (DB_CEIL - DB_FLOOR);
+            g.waterfall[row_offset + shifted] = (norm01 * 255.0).round() as u8;
+        }
+
+        g.waterfall_head = (waterfall_head + 1) % WATERFALL_ROWS;
+        g.generation = g.generation.wrapping_add(1);
+        g.samples_have = 0;
+    }
+
+    /// Feed interleaved CS16 I/Q samples (`[i0, q0, i1, q1, ...]`).
+    pub fn feed_cs16(&self, samples: &[i16]) {
+        if samples.len() < 2 * FFT_SIZE {
+            return;
+        }
+
+        let now = Instant::now();
+        let Ok(mut g) = self.inner.lock() else { return };
+
+        if let Some(last) = g.last_fft_at {
+            if now.duration_since(last) < g.min_period {
+                return;
+            }
+        }
+        g.last_fft_at = Some(now);
+
+        let start = samples.len() - 2 * FFT_SIZE;
+        let slice = &samples[start..];
+
+        for n in 0..FFT_SIZE {
+            let i = slice[2 * n] as f32 * (1.0 / 32768.0);
+            let q = slice[2 * n + 1] as f32 * (1.0 / 32768.0);
+            let w = g.window[n];
+            g.samples[n] = Complex::new(i * w, q * w);
+        }
+
+        let mut samples = std::mem::take(&mut g.samples);
+        let mut scratch = std::mem::take(&mut g.scratch);
+        let fft = Arc::clone(&g.fft);
+        fft.process_with_scratch(&mut samples, &mut scratch);
+        g.samples = samples;
+        g.scratch = scratch;
+
+        let norm = 1.0 / (FFT_SIZE as f32);
+        let half = FFT_SIZE / 2;
+        let waterfall_head = g.waterfall_head;
+        let row_offset = waterfall_head * FFT_SIZE;
+        for shifted in 0..FFT_SIZE {
+            let natural = if shifted < half { shifted + half } else { shifted - half };
+            let c = g.samples[natural];
+            let power = (c.re * c.re + c.im * c.im) * (norm * norm);
             let db = 10.0 * (power + 1e-30).log10();
             g.spectrum_db[shifted] = db;
 

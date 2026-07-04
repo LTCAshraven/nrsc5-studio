@@ -33,6 +33,8 @@ use thiserror::Error;
 pub enum SdrError {
     #[error("stream is already running on this device")]
     AlreadyStreaming,
+    #[error("SDR backend does not support {0}")]
+    UnsupportedOperation(&'static str),
     // === SoapySDR backend (v0.3.0) ===
     #[error("SoapySDR could not open device `{args}`: {reason}")]
     OpenFailedArgs { args: String, reason: String },
@@ -177,6 +179,16 @@ pub trait Sdr: Send + Sync {
         &self,
         cb: &mut dyn FnMut(&[u8]) -> StreamControl,
     ) -> Result<(), SdrError>;
+
+    /// Block this thread and pump interleaved CS16 I/Q samples into `cb`.
+    /// Used by the AM HD path, where libnrsc5 expects a lower-rate CS16 pipe
+    /// instead of the FM CU8 path.
+    fn run_stream_cs16(
+        &self,
+        _cb: &mut dyn FnMut(&[i16]) -> StreamControl,
+    ) -> Result<(), SdrError> {
+        Err(SdrError::UnsupportedOperation("cs16 streaming"))
+    }
 
     /// Request the in-flight `run_stream` (if any) to stop. Returns
     /// immediately; the worker thread will see the request on its next

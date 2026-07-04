@@ -4,9 +4,11 @@
 //! * [`agc`] — closed-loop AGC state machine driven by nrsc5's MER stream.
 
 pub mod agc;
+pub mod am_analog;
 pub mod fm_analog;
 pub mod spectrum;
 
 pub use agc::{AgcAction, AgcConfig, AgcController, AgcSnapshot, AgcStatus, SearchPhase};
+pub use am_analog::AmDemod;
 pub use fm_analog::FmDemod;
 pub use spectrum::{SpectrumSnapshot, SpectrumTap, FFT_SIZE, WATERFALL_ROWS};
