@@ -1,0 +1,95 @@
+name: Bug report
+description: Report a defect in NRSC5 Studio
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug! Please fill in the fields
+        below so we can reproduce and fix it.
+
+        **Security issue?** Do **not** file it here — follow
+        [SECURITY.md](../blob/main/SECURITY.md) to report privately.
+  - type: input
+    id: version
+    attributes:
+      label: App version
+      description: See **Help → About** in the app, or the release tag.
+      placeholder: "0.6.4"
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Windows
+        - Linux (Debian/Ubuntu)
+        - Linux (Fedora)
+        - Linux (other)
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: hardware
+    attributes:
+      label: SDR hardware
+      description: Device model, and tuner chip if known.
+      placeholder: "RTL-SDR Blog V3 (R820T2) / SDRplay RSPdx / HackRF One"
+    validations:
+      required: true
+  - type: dropdown
+    id: transport
+    attributes:
+      label: SDR transport
+      description: How the app is connected to the device (SDR Settings → Connection).
+      options:
+        - Local SoapySDR
+        - SoapyRemote
+        - rtl_tcp
+        - Not sure
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: A clear description of the bug and its impact.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Tune to 97.1 MHz
+        2. Switch to HD2
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: false
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: >
+        Paste relevant output from the in-app **Log** panel and/or
+        `agc-trace.log`. Redact anything sensitive first. This will be
+        rendered as code, so no backticks are needed.
+      render: text
+    validations:
+      required: false
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Confirmation
+      options:
+        - label: I searched existing issues and this hasn't been reported yet.
+          required: true
+        - label: This is not a security vulnerability (those go through SECURITY.md).
+          required: true

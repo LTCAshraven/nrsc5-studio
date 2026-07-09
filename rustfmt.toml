@@ -1,0 +1,9 @@
+# rustfmt configuration for NRSC5 Studio.
+#
+# These values match rustfmt's stable defaults, so pinning them here does not
+# reformat the existing tree — it just makes the style explicit and stable
+# across rustfmt versions and contributor machines. Nightly-only options
+# (e.g. imports_granularity, group_imports) are intentionally omitted so
+# `cargo fmt` works on the stable toolchain the project builds with.
+edition = "2021"
+max_width = 100

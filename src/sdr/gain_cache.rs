@@ -75,12 +75,7 @@ impl GainCacheKey {
     /// Build a key from raw inputs, normalizing PPM to the `ppm_x10`
     /// bucket. Floating-point PPM values from config are rounded once
     /// here rather than at every call site.
-    pub fn new(
-        freq_hz: u32,
-        driver: impl Into<String>,
-        antenna: Option<String>,
-        ppm: f32,
-    ) -> Self {
+    pub fn new(freq_hz: u32, driver: impl Into<String>, antenna: Option<String>, ppm: f32) -> Self {
         Self {
             freq_hz,
             driver: driver.into(),
@@ -284,18 +279,8 @@ mod tests {
     fn key_includes_antenna_disambiguator() {
         // RSP Duo Ant A vs Ant B at the same frequency are distinct
         // entries — they cannot share a gain optimum.
-        let ant_a = GainCacheKey::new(
-            97_100_000,
-            "sdrplay",
-            Some("Tuner 1 50ohm".into()),
-            0.0,
-        );
-        let ant_b = GainCacheKey::new(
-            97_100_000,
-            "sdrplay",
-            Some("Tuner 2 50ohm".into()),
-            0.0,
-        );
+        let ant_a = GainCacheKey::new(97_100_000, "sdrplay", Some("Tuner 1 50ohm".into()), 0.0);
+        let ant_b = GainCacheKey::new(97_100_000, "sdrplay", Some("Tuner 2 50ohm".into()), 0.0);
         assert_ne!(ant_a, ant_b);
         // Single-antenna (None) is also distinct from either.
         let no_ant = GainCacheKey::new(97_100_000, "sdrplay", None, 0.0);
@@ -324,10 +309,7 @@ mod tests {
         // TTL of 1 hour; entry recorded 2 hours ago is dead on lookup.
         let mut cache = GainCache::with_ttl(Duration::from_secs(3600));
         let key = GainCacheKey::new(97_100_000, "rtlsdr", None, 0.0);
-        cache.record(
-            key.clone(),
-            entry_at(254, 22.5, Duration::from_secs(7200)),
-        );
+        cache.record(key.clone(), entry_at(254, 22.5, Duration::from_secs(7200)));
         assert!(
             cache.lookup(&key).is_none(),
             "2-hour-old entry should be expired under 1-hour TTL"
@@ -339,10 +321,7 @@ mod tests {
         // Same setup as above but the entry is well inside the window.
         let mut cache = GainCache::with_ttl(Duration::from_secs(3600));
         let key = GainCacheKey::new(97_100_000, "rtlsdr", None, 0.0);
-        cache.record(
-            key.clone(),
-            entry_at(254, 22.5, Duration::from_secs(600)),
-        );
+        cache.record(key.clone(), entry_at(254, 22.5, Duration::from_secs(600)));
         assert!(cache.lookup(&key).is_some());
     }
 
@@ -376,21 +355,14 @@ mod tests {
 
     #[test]
     fn save_load_round_trips_entries() {
-        let tmpdir = std::env::temp_dir().join(format!(
-            "nrsc5-gain-cache-test-{}",
-            std::process::id()
-        ));
+        let tmpdir =
+            std::env::temp_dir().join(format!("nrsc5-gain-cache-test-{}", std::process::id()));
         let _ = fs::create_dir_all(&tmpdir);
         let path = tmpdir.join("gain-cache.ron");
 
         let mut cache = GainCache::new();
         let key_a = GainCacheKey::new(97_100_000, "rtlsdr", None, 0.0);
-        let key_b = GainCacheKey::new(
-            93_300_000,
-            "sdrplay",
-            Some("Tuner 1 50ohm".into()),
-            -1.2,
-        );
+        let key_b = GainCacheKey::new(93_300_000, "sdrplay", Some("Tuner 1 50ohm".into()), -1.2);
         cache.record(key_a.clone(), entry_now(254, 22.5));
         cache.record(key_b.clone(), entry_now(380, 18.7));
         cache.save(&path);
@@ -418,10 +390,8 @@ mod tests {
 
     #[test]
     fn load_malformed_file_yields_empty_cache() {
-        let tmpdir = std::env::temp_dir().join(format!(
-            "nrsc5-malformed-test-{}",
-            std::process::id()
-        ));
+        let tmpdir =
+            std::env::temp_dir().join(format!("nrsc5-malformed-test-{}", std::process::id()));
         let _ = fs::create_dir_all(&tmpdir);
         let path = tmpdir.join("gain-cache.ron");
         fs::write(&path, "this is not valid RON syntax @!#$").unwrap();
@@ -435,10 +405,8 @@ mod tests {
 
     #[test]
     fn load_wrong_version_yields_empty_cache() {
-        let tmpdir = std::env::temp_dir().join(format!(
-            "nrsc5-wrongver-test-{}",
-            std::process::id()
-        ));
+        let tmpdir =
+            std::env::temp_dir().join(format!("nrsc5-wrongver-test-{}", std::process::id()));
         let _ = fs::create_dir_all(&tmpdir);
         let path = tmpdir.join("gain-cache.ron");
         // Hand-craft an OnDiskFormat with a bogus version.
@@ -449,11 +417,7 @@ mod tests {
                 entry_now(254, 22.5),
             )],
         };
-        fs::write(
-            &path,
-            ron::ser::to_string(&bogus).expect("ser ok"),
-        )
-        .unwrap();
+        fs::write(&path, ron::ser::to_string(&bogus).expect("ser ok")).unwrap();
         let cache = GainCache::load(&path);
         assert!(
             cache.is_empty(),

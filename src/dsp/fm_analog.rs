@@ -173,7 +173,11 @@ impl FirDecimator {
 
         let mut acc_i = 0.0f32;
         let mut acc_q = 0.0f32;
-        for (tap, (hist_i, hist_q)) in self.taps.iter().zip(self.hist_i.iter().zip(self.hist_q.iter())) {
+        for (tap, (hist_i, hist_q)) in self
+            .taps
+            .iter()
+            .zip(self.hist_i.iter().zip(self.hist_q.iter()))
+        {
             acc_i += tap * hist_i;
             acc_q += tap * hist_q;
         }
@@ -373,7 +377,11 @@ fn is_rds_printable(byte: u8) -> bool {
 }
 
 fn ps_to_string(ps: &[u8; 8]) -> String {
-    ps.iter().map(|&b| b as char).collect::<String>().trim_end().to_string()
+    ps.iter()
+        .map(|&b| b as char)
+        .collect::<String>()
+        .trim_end()
+        .to_string()
 }
 
 /// Recovers one channel bit per two half-bit levels using the RDS
@@ -386,7 +394,10 @@ struct ManchesterBitGen {
 
 impl ManchesterBitGen {
     fn new() -> Self {
-        Self { have_first: false, first: 0 }
+        Self {
+            have_first: false,
+            first: 0,
+        }
     }
 
     fn push_half(&mut self, level: u8) -> Option<u8> {
@@ -891,7 +902,8 @@ impl FmDemod {
     pub fn with_sample_rate(sample_rate_hz: u32) -> Self {
         let stage1_rate = SDR_SAMPLE_RATE_HZ as f32 / CHANNEL_DECIM as f32;
         let stage2_rate = stage1_rate / AUDIO_DECIM as f32;
-        let channel_kernel = lowpass_kernel(CHANNEL_TAPS, CHANNEL_CUTOFF_HZ / SDR_SAMPLE_RATE_HZ as f32);
+        let channel_kernel =
+            lowpass_kernel(CHANNEL_TAPS, CHANNEL_CUTOFF_HZ / SDR_SAMPLE_RATE_HZ as f32);
         let audio_kernel = lowpass_kernel(AUDIO_TAPS, AUDIO_CUTOFF_HZ / stage1_rate);
 
         Self {
@@ -976,8 +988,8 @@ impl FmDemod {
         // the mono path.
         let side = if self.stereo_enabled {
             let mag = self.pll.pilot_magnitude();
-            let stereo_gain = ((mag - STEREO_BLEND_LO) / (STEREO_BLEND_HI - STEREO_BLEND_LO))
-                .clamp(0.0, 1.0);
+            let stereo_gain =
+                ((mag - STEREO_BLEND_LO) / (STEREO_BLEND_HI - STEREO_BLEND_LO)).clamp(0.0, 1.0);
             side_raw * stereo_gain
         } else {
             0.0
@@ -1004,10 +1016,10 @@ impl FmDemod {
             return None;
         }
 
-        let l = (soft_clip(left * MAKEUP_GAIN * OUTPUT_GAIN) * 32767.0)
-            .clamp(-32768.0, 32767.0) as i16;
-        let r = (soft_clip(right * MAKEUP_GAIN * OUTPUT_GAIN) * 32767.0)
-            .clamp(-32768.0, 32767.0) as i16;
+        let l =
+            (soft_clip(left * MAKEUP_GAIN * OUTPUT_GAIN) * 32767.0).clamp(-32768.0, 32767.0) as i16;
+        let r = (soft_clip(right * MAKEUP_GAIN * OUTPUT_GAIN) * 32767.0).clamp(-32768.0, 32767.0)
+            as i16;
         Some([l, r])
     }
 
@@ -1041,7 +1053,7 @@ mod tests {
         let i = 0.70710677;
         let q = 0.70710677;
         let delta = phase_delta(prev_i, prev_q, i, q);
-        assert!((delta - 0.7853982).abs() < 1e-5);
+        assert!((delta - std::f32::consts::FRAC_PI_4).abs() < 1e-5);
     }
 
     #[test]
@@ -1051,7 +1063,7 @@ mod tests {
         let i = 0.70710677;
         let q = -0.70710677;
         let delta = phase_delta(prev_i, prev_q, i, q);
-        assert!((delta + 0.7853982).abs() < 1e-5);
+        assert!((delta + std::f32::consts::FRAC_PI_4).abs() < 1e-5);
     }
 
     #[test]
@@ -1091,12 +1103,14 @@ mod tests {
                 emits += 1;
             }
         }
-        let expected = (40_000.0 * super::DEFAULT_SAMPLE_RATE_HZ as f64 / super::SDR_SAMPLE_RATE_HZ as f64).round() as i32;
+        let expected = (40_000.0 * super::DEFAULT_SAMPLE_RATE_HZ as f64
+            / super::SDR_SAMPLE_RATE_HZ as f64)
+            .round() as i32;
         // Tolerance covers the multi-stage FIR warmup latency (the
         // channel + audio decimators each emit nothing until their
         // history fills), which sits the steady-state count a handful
         // of samples below the ideal ratio.
-        assert!((emits as i32 - expected).abs() <= 24);
+        assert!((emits - expected).abs() <= 24);
     }
 
     #[test]
@@ -1108,7 +1122,7 @@ mod tests {
                 emits += 1;
             }
         }
-        assert!((emits as i32 - 29).abs() <= 1);
+        assert!((emits - 29_i32).abs() <= 1);
     }
 
     #[test]
@@ -1270,9 +1284,7 @@ mod tests {
             if idx >= chips.len() {
                 break;
             }
-            if let Some(super::RdsUpdate::ProgramService(text)) =
-                ch.push(chips[idx], cos3, sin3)
-            {
+            if let Some(super::RdsUpdate::ProgramService(text)) = ch.push(chips[idx], cos3, sin3) {
                 emitted = Some(text);
             }
         }
@@ -1342,5 +1354,4 @@ mod tests {
         }
         assert_eq!(emitted.as_deref(), Some("Now Playing: Song Title"));
     }
-
 }

@@ -1080,10 +1080,7 @@ mod tests {
         }
         let got = out.lock().unwrap();
         assert_eq!(got.len(), 1);
-        assert!(matches!(
-            got[0],
-            NrscEvent::AudioBitRate { program: 0, .. }
-        ));
+        assert!(matches!(got[0], NrscEvent::AudioBitRate { program: 0, .. }));
     }
 
     #[test]
@@ -1170,7 +1167,9 @@ mod tests {
             other => panic!("expected Metadata, got {other:?}"),
         }
         match &got[1] {
-            NrscEvent::Xhdr { mime, param, lot, .. } => {
+            NrscEvent::Xhdr {
+                mime, param, lot, ..
+            } => {
                 assert_eq!(*mime, sys::NRSC5_MIME_JPEG);
                 assert_eq!(*param, 1);
                 assert_eq!(lot, "42");
@@ -1273,10 +1272,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(*mime, sys::NRSC5_MIME_PNG);
-                assert_eq!(
-                    *lot_component_mime,
-                    Some(sys::NRSC5_MIME_STATION_LOGO)
-                );
+                assert_eq!(*lot_component_mime, Some(sys::NRSC5_MIME_STATION_LOGO));
             }
             other => panic!("expected LotFile, got {other:?}"),
         }
@@ -1436,6 +1432,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::type_complexity)] // test-local capture buffer; a type alias would add indirection for one use
     fn pcm_sink_receives_samples() {
         let captured: Arc<Mutex<Vec<(u32, Vec<i16>)>>> = Arc::new(Mutex::new(Vec::new()));
         let cap = captured.clone();
@@ -1505,7 +1502,10 @@ mod tests {
     #[test]
     fn program_type_name_known_and_unknown() {
         assert_eq!(program_type_name(sys::NRSC5_PROGRAM_TYPE_ROCK), "Rock");
-        assert_eq!(program_type_name(sys::NRSC5_PROGRAM_TYPE_TRAFFIC), "Traffic");
+        assert_eq!(
+            program_type_name(sys::NRSC5_PROGRAM_TYPE_TRAFFIC),
+            "Traffic"
+        );
         // Value 27 is in the upstream gap between HIP_HOP (26) and
         // WEATHER (29); should fall through to the stringified form.
         assert_eq!(program_type_name(27), "Type 27");
@@ -1608,7 +1608,11 @@ mod tests {
             },
             &mut ctx,
         );
-        assert_eq!(*calls.lock().unwrap(), 0, "sink must not fire on empty buffer");
+        assert_eq!(
+            *calls.lock().unwrap(),
+            0,
+            "sink must not fire on empty buffer"
+        );
     }
 
     #[test]
@@ -1651,7 +1655,9 @@ mod tests {
         // the log without a debugger.
         assert!(Nrsc5ApiError::OpenFailed(-3).to_string().contains("-3"));
         assert!(Nrsc5ApiError::PipeFailed(7).to_string().contains('7'));
-        assert!(Nrsc5ApiError::SetFrequencyFailed(2).to_string().contains('2'));
+        assert!(Nrsc5ApiError::SetFrequencyFailed(2)
+            .to_string()
+            .contains('2'));
         assert!(Nrsc5ApiError::SetModeFailed(9).to_string().contains('9'));
         let big = Nrsc5ApiError::PipeChunkTooLarge { len: 9_000_000_000 };
         assert!(big.to_string().contains("9000000000"));
@@ -1679,6 +1685,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::type_complexity)] // test-local capture buffer; a type alias would add indirection for one use
     fn normal_decode_flow_delivers_metadata_then_audio() {
         // End-to-end happy path through one shared callback context,
         // the way libnrsc5 drives it on its worker thread: lock
@@ -1690,7 +1697,9 @@ mod tests {
         let pcm_out = pcm.clone();
         let mut ctx = CallbackCtx {
             event_cb: Some(Box::new(move |e| ev_out.lock().unwrap().push(e))),
-            pcm_sink: Some(Box::new(move |p, s| pcm_out.lock().unwrap().push((p, s.to_vec())))),
+            pcm_sink: Some(Box::new(move |p, s| {
+                pcm_out.lock().unwrap().push((p, s.to_vec()))
+            })),
             bitrate: BitrateAccum::default(),
         };
 

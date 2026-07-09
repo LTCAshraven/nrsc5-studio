@@ -8,7 +8,9 @@ use thiserror::Error;
 use crate::config::{GainMode, SdrTransport};
 use crate::dsp::{AgcConfig, AgcController, AgcSnapshot, AgcStatus, SearchPhase};
 use crate::sdr::profile::DeviceProfile;
-use crate::sdr::{GainCache, GainCacheEntry, GainCacheKey, IqBus, Sdr, SdrConfig, SdrError, StreamControl};
+use crate::sdr::{
+    GainCache, GainCacheEntry, GainCacheKey, IqBus, Sdr, SdrConfig, SdrError, StreamControl,
+};
 
 mod decoder;
 use decoder::{ActiveSession, MAX_PROGRAMS};
@@ -45,8 +47,13 @@ pub enum NrscEvent {
         psmi: i32,
     },
     LostSync,
-    Mer { lower: f32, upper: f32 },
-    Ber { cber: f32 },
+    Mer {
+        lower: f32,
+        upper: f32,
+    },
+    Ber {
+        cber: f32,
+    },
     /// Emitted when "Audio bit rate:" first appears, indicating audio is
     /// flowing.  nrsc5.exe plays audio itself via libao so we do not
     /// capture PCM data.
@@ -186,7 +193,9 @@ pub enum NrscEvent {
         size: u32,
         data: Vec<u8>,
     },
-    Agc { gain_db: f32 },
+    Agc {
+        gain_db: f32,
+    },
     /// Closed-loop AGC controller applied a new tuner gain. Emitted
     /// from the AGC driver thread immediately after the
     /// `Sdr::set_tuner_gain_tenths` call returns. UI uses this to
@@ -340,6 +349,12 @@ pub enum Nrsc5Error {
 enum LastStartMode {
     Piped,
 }
+
+/// Optional GUI wake callback, shared with the libnrsc5 worker thread that
+/// fires it after every queued event. Boxed opaque closure so this layer
+/// stays UI-framework-agnostic; `Arc<Mutex<_>>` so it can be installed after
+/// construction and cloned into the callback.
+type RepaintWaker = Arc<Mutex<Option<Box<dyn Fn() + Send + Sync>>>>;
 
 pub struct Nrsc5Process {
     /// Single libnrsc5 session driving the current piped tune.
@@ -497,6 +512,12 @@ pub struct Nrsc5Process {
     gain_cache: Arc<Mutex<GainCache>>,
     tx: Sender<NrscEvent>,
     rx: Receiver<NrscEvent>,
+    /// Optional GUI wake callback fired after every event is queued so
+    /// the window keeps draining the channel while unfocused, instead of
+    /// letting the backlog build up and stall the UI on refocus. Set via
+    /// [`Nrsc5Process::set_repaint_waker`]; kept as an opaque closure so
+    /// this layer stays UI-framework-agnostic.
+    waker: RepaintWaker,
     aas_dir: PathBuf,
 }
 
@@ -575,7 +596,8 @@ fn apply_agc_action(
     profile: &DeviceProfile,
     action: &crate::dsp::AgcAction,
 ) -> Option<f64> {
-    let target = profile.agc_element;    let desired_db = profile.agc_tenths_to_element_db(action.new_tenths);
+    let target = profile.agc_element;
+    let desired_db = profile.agc_tenths_to_element_db(action.new_tenths);
 
     // Look up the element's actual range. We deliberately re-query
     // every action rather than caching: it's a cheap Soapy call (no
@@ -691,6 +713,7 @@ impl Nrsc5Process {
             gain_cache: Arc::new(Mutex::new(gain_cache)),
             tx,
             rx,
+            waker: Arc::new(Mutex::new(None)),
             aas_dir,
         })
     }
@@ -872,7 +895,9 @@ impl Nrsc5Process {
     /// backends don't run our AGC \u2014 nrsc5 owns the dongle there).
     /// Cheap to call every frame.
     pub fn agc_snapshot(&self) -> Option<AgcSnapshot> {
-        self.agc.as_ref().and_then(|h| h.lock().ok().map(|g| g.snapshot()))
+        self.agc
+            .as_ref()
+            .and_then(|h| h.lock().ok().map(|g| g.snapshot()))
     }
 
     /// Wipe the on-disk per-frequency gain cache (Phase 3 of the
@@ -920,6 +945,17 @@ impl Nrsc5Process {
         &self.rx
     }
 
+    /// Install a callback fired after every decoder event is queued. The
+    /// GUI uses it to wake egui (`Context::request_repaint`) so the
+    /// window keeps draining the event channel while unfocused, rather
+    /// than letting the backlog build up and stall the UI on refocus.
+    /// Opaque closure keeps this layer UI-framework-agnostic.
+    pub fn set_repaint_waker<F: Fn() + Send + Sync + 'static>(&self, waker: F) {
+        if let Ok(mut guard) = self.waker.lock() {
+            *guard = Some(Box::new(waker));
+        }
+    }
+
     /// Tee a single event into the AGC controller, if one is installed.
     /// Called by the app's event-drain loop on every event pulled from
     /// [`events`]. This used to live inside the per-decoder libnrsc5
@@ -960,11 +996,7 @@ impl Nrsc5Process {
     /// (the change still survives in config and is applied on the
     /// next Start). Returns `Ok(())` for the no-op case too — callers
     /// don't need to distinguish "no stream running" from "applied".
-    pub fn set_sdr_gain_element(
-        &self,
-        element: &str,
-        value_db: f64,
-    ) -> Result<(), SdrError> {
+    pub fn set_sdr_gain_element(&self, element: &str, value_db: f64) -> Result<(), SdrError> {
         match self.sdr.as_ref() {
             Some(sdr) => sdr.set_gain_element(element, value_db),
             None => Ok(()),
@@ -1022,6 +1054,7 @@ impl Nrsc5Process {
     /// empty `Vec` when no stream is running — the SDR Settings modal
     /// then falls back to an idle open-and-close to populate its
     /// sliders.
+    #[allow(dead_code)] // Public API consumed by the SDR Settings modal; kept even when that path is compiled out.
     pub fn sdr_gain_elements(&self) -> Vec<crate::sdr::GainElement> {
         self.sdr
             .as_ref()
@@ -1034,10 +1067,7 @@ impl Nrsc5Process {
     /// (unnamed) input — the Tuner panel uses `len() > 1` as the gate
     /// for showing its antenna dropdown.
     pub fn sdr_antennas(&self) -> Vec<String> {
-        self.sdr
-            .as_ref()
-            .map(|s| s.antennas())
-            .unwrap_or_default()
+        self.sdr.as_ref().map(|s| s.antennas()).unwrap_or_default()
     }
 
     /// Currently selected antenna name on the live SDR. `None` when
@@ -1114,8 +1144,17 @@ impl Nrsc5Process {
         // per-program), so the tee moved to the central event dispatch
         // in `app.rs` via [`Nrsc5Process::forward_event_to_agc`].
         let event_tx = self.tx.clone();
+        let event_waker = self.waker.clone();
         session.set_event_callback(move |ev| {
             let _ = event_tx.send(ev);
+            // Wake the GUI so it drains the channel promptly even while
+            // unfocused; without this the backlog builds up and stalls
+            // the UI on refocus.
+            if let Ok(guard) = event_waker.lock() {
+                if let Some(w) = guard.as_ref() {
+                    w();
+                }
+            }
         })?;
 
         // Build the per-program ring + audio-started-flag arrays. In
@@ -1124,16 +1163,17 @@ impl Nrsc5Process {
         // nothing observes it. The `audio_started` flags stay live
         // either way so `decoded_programs()` / `is_decoding()` still
         // reflect what's on the air.
-        let audio_started: [Arc<AtomicBool>; MAX_PROGRAMS] = std::array::from_fn(|_| {
-            Arc::new(AtomicBool::new(false))
-        });
+        let audio_started: [Arc<AtomicBool>; MAX_PROGRAMS] =
+            std::array::from_fn(|_| Arc::new(AtomicBool::new(false)));
 
-        let rings: Option<[Arc<crate::audio::PcmRing>; MAX_PROGRAMS]> =
-            if self.audio_sink.is_some() {
-                Some(std::array::from_fn(|_| Arc::new(crate::audio::PcmRing::new())))
-            } else {
-                None
-            };
+        let rings: Option<[Arc<crate::audio::PcmRing>; MAX_PROGRAMS]> = if self.audio_sink.is_some()
+        {
+            Some(std::array::from_fn(|_| {
+                Arc::new(crate::audio::PcmRing::new())
+            }))
+        } else {
+            None
+        };
 
         // PCM callback. libnrsc5 emits one chunk per audio frame
         // tagged with a `program` field (0..=7). We route into the
@@ -1148,7 +1188,9 @@ impl Nrsc5Process {
                 return;
             }
             if !pcm_audio_started[idx].swap(true, Ordering::Relaxed) {
-                let _ = pcm_tx.send(NrscEvent::AudioStarted { program: pcm_program });
+                let _ = pcm_tx.send(NrscEvent::AudioStarted {
+                    program: pcm_program,
+                });
             }
             if let Some(rs) = pcm_rings.as_ref() {
                 rs[idx].push(samples);
@@ -1230,6 +1272,8 @@ impl Nrsc5Process {
     /// when the explicit `sdr.transport` field landed in config. The
     /// SDR is opened fresh on each Start and closed fully on each Stop
     /// (the modern librtlsdr.dll handles this cleanly).
+    #[allow(clippy::too_many_arguments, clippy::field_reassign_with_default)] // The single Start entry point threads
+                                                                              // the full tune + analog-fallback configuration through in one call.
     pub fn start_piped(
         &mut self,
         frequency_mhz: f32,
@@ -1295,8 +1339,7 @@ impl Nrsc5Process {
                 let (host, port) = remote.ok_or_else(|| {
                     Nrsc5Error::Sdr(crate::sdr::SdrError::RtlTcpConnect {
                         addr: "<unset>".to_string(),
-                        reason: "transport=rtl_tcp_remote but no host/port supplied"
-                            .to_string(),
+                        reason: "transport=rtl_tcp_remote but no host/port supplied".to_string(),
                     })
                 })?;
                 let rtl = crate::sdr::RtlTcpSdr::open(host, port)?;
@@ -1429,32 +1472,26 @@ impl Nrsc5Process {
                 },
                 Err(_) => false, // poisoned mutex — treat as cache miss
             };
-            let agc_ctrl = AgcController::new(
-                profile.agc_tenths_table,
-                agc_cfg,
-            );
+            let agc_ctrl = AgcController::new(profile.agc_tenths_table, agc_cfg);
             let agc = Arc::new(Mutex::new(agc_ctrl));
             let initial = agc
                 .lock()
                 .expect("AGC mutex poisoned at startup")
                 .initial_action();
             let _ = apply_agc_action(&sdr, &profile, &initial);
-            let _ = self
-                .tx
-                .send(NrscEvent::AgcDecision {
-                    tenths: initial.new_tenths,
-                    reason: initial.reason,
-                });
+            let _ = self.tx.send(NrscEvent::AgcDecision {
+                tenths: initial.new_tenths,
+                reason: initial.reason,
+            });
             let stderr_handle = Arc::clone(&agc);
             (Some(agc), Some(stderr_handle), cache_hit_logged)
         } else {
             // Surface the chosen mode on the status line so the user
             // can see what's running without checking config.toml.
             let label = match gain_mode {
-                GainMode::Manual => format!(
-                    "manual gain: {:.1} dB",
-                    manual_gain_tenths as f32 / 10.0
-                ),
+                GainMode::Manual => {
+                    format!("manual gain: {:.1} dB", manual_gain_tenths as f32 / 10.0)
+                }
                 GainMode::HardwareAgc => "hardware AGC".to_string(),
                 GainMode::Auto => unreachable!(),
             };
@@ -1479,10 +1516,8 @@ impl Nrsc5Process {
         // through `self.tx` (events) or per-program rings (PCM).
         let session = self.spawn_session(&bus, frequency_mhz)?;
 
-        let analog_runtime_enabled = analog_fallback_runtime_enabled(
-            self.audio_sink.is_some(),
-            analog_fallback_mode,
-        );
+        let analog_runtime_enabled =
+            analog_fallback_runtime_enabled(self.audio_sink.is_some(), analog_fallback_mode);
         let analog_rx = if analog_runtime_enabled {
             Some(bus.subscribe(64))
         } else {
@@ -1556,8 +1591,7 @@ impl Nrsc5Process {
         // clear any audio currently queued in the cpal sink so the
         // next Start doesn't replay stale audio from the previous
         // session.
-        if let (Some(router), Some(rings)) =
-            (self.speaker_router.as_ref(), session.rings.as_ref())
+        if let (Some(router), Some(rings)) = (self.speaker_router.as_ref(), session.rings.as_ref())
         {
             if let Some(sink) = self.audio_sink.as_ref() {
                 sink.clear();
@@ -1610,6 +1644,8 @@ impl Nrsc5Process {
                         let mut batch = Vec::with_capacity(2048);
                         let mut last_ps: Option<String> = None;
                         let mut last_rt: Option<String> = None;
+                        #[allow(clippy::while_let_loop)] // explicit match keeps the
+                        // Err(_) => break arm visible next to the large Ok body.
                         loop {
                             match rx.recv() {
                                 Ok(payload) => {
@@ -1624,7 +1660,9 @@ impl Nrsc5Process {
                                     // resumes once HD has been silent for
                                     // the handoff window (AGC still
                                     // searching, or sync lost).
-                                    let hd_owns = if analog_mode == crate::config::AnalogFallbackMode::AnalogOnly {
+                                    let hd_owns = if analog_mode
+                                        == crate::config::AnalogFallbackMode::AnalogOnly
+                                    {
                                         false
                                     } else {
                                         handoff.suppress_analog(HD_HANDOFF_WINDOW_MS)
@@ -1636,13 +1674,15 @@ impl Nrsc5Process {
                                             if let Some(ps) = demod.take_rds_program_service() {
                                                 if last_ps.as_deref() != Some(ps.as_str()) {
                                                     last_ps = Some(ps.clone());
-                                                    let _ = evt_tx_for_analog.send(NrscEvent::RdsProgramService(ps));
+                                                    let _ = evt_tx_for_analog
+                                                        .send(NrscEvent::RdsProgramService(ps));
                                                 }
                                             }
                                             if let Some(rt) = demod.take_rds_radiotext() {
                                                 if last_rt.as_deref() != Some(rt.as_str()) {
                                                     last_rt = Some(rt.clone());
-                                                    let _ = evt_tx_for_analog.send(NrscEvent::RdsRadioText(rt));
+                                                    let _ = evt_tx_for_analog
+                                                        .send(NrscEvent::RdsRadioText(rt));
                                                 }
                                             }
                                             if !hd_owns {
@@ -1704,8 +1744,7 @@ impl Nrsc5Process {
         // tick and no decisions to apply.
         if let Some(agc) = agc {
             let agc_for_driver = Arc::clone(&agc);
-            let sdr_for_agc: Arc<dyn Sdr> =
-                Arc::clone(self.sdr.as_ref().expect("sdr just set"));
+            let sdr_for_agc: Arc<dyn Sdr> = Arc::clone(self.sdr.as_ref().expect("sdr just set"));
             let agc_stop = Arc::new(AtomicBool::new(false));
             let agc_stop_for_driver = Arc::clone(&agc_stop);
             let agc_tx = self.tx.clone();
@@ -1811,9 +1850,9 @@ impl Nrsc5Process {
                             None
                         } else {
                             let _pre = crate::sdr::iq_bus::drain_now(&bus_rx_for_agc);
-                            std::thread::sleep(
-                                std::time::Duration::from_millis(amp_flush_ms as u64),
-                            );
+                            std::thread::sleep(std::time::Duration::from_millis(
+                                amp_flush_ms as u64,
+                            ));
                             let _post = crate::sdr::iq_bus::drain_now(&bus_rx_for_agc);
                             crate::sdr::iq_bus::rms_dbfs_cu8(
                                 &bus_rx_for_agc,
@@ -1911,9 +1950,7 @@ impl Nrsc5Process {
                     // require a finite `best_mer` so a controller
                     // that settled via the stability shortcut with
                     // no MER observation never poisons the cache.
-                    if prev_status != AgcStatus::Settled
-                        && snap.status == AgcStatus::Settled
-                    {
+                    if prev_status != AgcStatus::Settled && snap.status == AgcStatus::Settled {
                         // Gain has converged — let the analog fallback
                         // hand the sink over to HD from here on.
                         handoff_for_agc.set_agc_ready(true);
@@ -1946,8 +1983,7 @@ impl Nrsc5Process {
                             );
                             agc_trace(&msg);
                         }
-                    } else if prev_status == AgcStatus::Probing
-                        && snap.status == AgcStatus::Bailed
+                    } else if prev_status == AgcStatus::Probing && snap.status == AgcStatus::Bailed
                     {
                         // AGC gave up; gain is restored to the
                         // best-known value. Release the handoff gate
@@ -2064,10 +2100,10 @@ impl Nrsc5Process {
             if let Some(sink) = self.audio_sink.as_ref() {
                 sink.clear();
             }
-        }        // Drop the SDR last — all Arc clones (the one held by
-        // iq_thread is already gone) are released, refcount hits zero,
-        // and `RtlSdr::Drop` runs `rtlsdr_close`. Safe on the modern
-        // osmocom librtlsdr.dll (≥ 2022-01).
+        } // Drop the SDR last — all Arc clones (the one held by
+          // iq_thread is already gone) are released, refcount hits zero,
+          // and `RtlSdr::Drop` runs `rtlsdr_close`. Safe on the modern
+          // osmocom librtlsdr.dll (≥ 2022-01).
         self.sdr = None;
         // Clear AGC handles last — all references (driver thread,
         // decoder event-callback tee) are gone by this point.
@@ -2086,11 +2122,7 @@ impl Nrsc5Process {
     /// fall back to a USB-direct start here, but that legacy path was
     /// removed in the 0.5.0 transport cleanup. The GUI guarantees a
     /// `start_piped` precedes any retune.
-    pub fn retune(
-        &mut self,
-        frequency_mhz: f32,
-        program: u32,
-    ) -> Result<(), Nrsc5Error> {
+    pub fn retune(&mut self, frequency_mhz: f32, program: u32) -> Result<(), Nrsc5Error> {
         // Capture the mode before `stop()` clears live state. The
         // `LastStartMode` is preserved across stop() so the caller
         // doesn't have to re-plumb mode selection.
@@ -2169,7 +2201,10 @@ mod tests {
         // a successful start_piped — the message must point the caller
         // at the fix.
         let s = Nrsc5Error::NotStarted.to_string();
-        assert!(s.contains("start_piped"), "should name the prerequisite: {s}");
+        assert!(
+            s.contains("start_piped"),
+            "should name the prerequisite: {s}"
+        );
     }
 
     #[test]
@@ -2178,7 +2213,10 @@ mod tests {
         // Nrsc5Error::Api without losing the rc in the Display chain.
         let wrapped: Nrsc5Error = Nrsc5ApiError::PipeFailed(5).into();
         assert!(matches!(wrapped, Nrsc5Error::Api(_)));
-        assert!(wrapped.to_string().contains('5'), "rc must survive: {wrapped}");
+        assert!(
+            wrapped.to_string().contains('5'),
+            "rc must survive: {wrapped}"
+        );
     }
 
     #[test]

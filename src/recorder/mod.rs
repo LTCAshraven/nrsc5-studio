@@ -44,7 +44,9 @@ use std::time::Duration;
 use anyhow::{anyhow, Context, Result};
 use crossbeam_channel::{bounded, Receiver, RecvTimeoutError, Sender};
 use ogg::writing::{PacketWriteEndInfo, PacketWriter};
-use rubato::{Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction};
+use rubato::{
+    Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction,
+};
 
 /// Sample rate of the PCM stream coming off `Nrsc5Process`. Matches
 /// `crate::audio::NRSC5_SAMPLE_RATE`; redeclared here so the recorder
@@ -86,8 +88,8 @@ enum RecorderCmd {
     Pcm(Vec<i16>),
     /// Close the current Ogg stream + file and start a new one at
     /// `path` with the given `tags` written into a fresh OpusTags
-    /// packet. Used for the max-minutes rotation cap — the encoder
-    /// + resampler state is reused across rotations so there's no
+    /// packet. Used for the max-minutes rotation cap — the encoder +
+    /// resampler state is reused across rotations so there's no
     /// audible gap or click at the boundary; only the file changes.
     Rotate { path: PathBuf, tags: RecordingTags },
     /// Flush the current Opus stream and close the file. Sent on
@@ -389,12 +391,7 @@ fn run_recorder_loop(
         let mut granulepos: u64 = 0;
         // Write headers for this file (OpusHead + OpusTags, each on
         // its own page per RFC 7845).
-        packet_writer.write_packet(
-            build_opus_head(),
-            serial,
-            PacketWriteEndInfo::EndPage,
-            0,
-        )?;
+        packet_writer.write_packet(build_opus_head(), serial, PacketWriteEndInfo::EndPage, 0)?;
         packet_writer.write_packet(
             build_opus_tags(&current_tags),
             serial,
@@ -481,9 +478,9 @@ fn run_recorder_loop(
         // Drop the PacketWriter to release the &mut writer borrow
         // before we flush or replace the writer.
         drop(packet_writer);
-        writer.flush().with_context(|| {
-            format!("flush recording {}", output_path.display())
-        })?;
+        writer
+            .flush()
+            .with_context(|| format!("flush recording {}", output_path.display()))?;
 
         match action {
             NextAction::Stop => return Ok(()),
@@ -495,9 +492,8 @@ fn run_recorder_loop(
                         })?;
                     }
                 }
-                let new_file = File::create(&path).with_context(|| {
-                    format!("create recording file {}", path.display())
-                })?;
+                let new_file = File::create(&path)
+                    .with_context(|| format!("create recording file {}", path.display()))?;
                 writer = BufWriter::new(new_file);
                 output_path = path;
                 current_tags = tags;
@@ -512,6 +508,8 @@ fn run_recorder_loop(
 /// pipeline. Pulls `INPUT_CHUNK` samples-per-channel at a time off
 /// the front of `samples`; anything left over is held in the planes
 /// (we just append to them and consume in fixed-size strides).
+#[allow(clippy::too_many_arguments)] // audio pipeline stage: each buffer/stride
+                                     // is a distinct plane; a param struct would just relocate the fan-out.
 fn push_samples(
     samples: &[i16],
     plane_l: &mut Vec<f32>,
@@ -538,10 +536,8 @@ fn push_samples(
         // — otherwise the borrow checker (correctly) sees two live
         // mutable references to the same Vec.
         let result = {
-            let mut out_slices: [&mut [f32]; 2] = [
-                out_plane_l.as_mut_slice(),
-                out_plane_r.as_mut_slice(),
-            ];
+            let mut out_slices: [&mut [f32]; 2] =
+                [out_plane_l.as_mut_slice(), out_plane_r.as_mut_slice()];
             resampler.process_into_buffer(&in_slices, &mut out_slices, None)
         };
         let (in_used, out_written) = match result {
@@ -587,6 +583,7 @@ fn push_samples(
 ///   * output_gain = 0                 (i16 LE; Q7.8 dB)
 ///   * channel_mapping_family = 0      (u8; 0 = mono/stereo with
 ///                                      implicit channel order)
+#[allow(clippy::doc_overindented_list_items)] // deliberate column alignment
 fn build_opus_head() -> Vec<u8> {
     let mut h = Vec::with_capacity(19);
     h.extend_from_slice(b"OpusHead");
@@ -620,11 +617,7 @@ fn build_opus_tags(tags: &RecordingTags) -> Vec<u8> {
     let mut comments: Vec<String> = Vec::new();
     if !tags.station.is_empty() {
         comments.push(format!("ARTIST={}", tags.station));
-        comments.push(format!(
-            "ALBUM={} HD{}",
-            tags.station,
-            tags.program + 1,
-        ));
+        comments.push(format!("ALBUM={} HD{}", tags.station, tags.program + 1,));
     }
     if !tags.started_human.is_empty() {
         comments.push(format!(
@@ -643,9 +636,7 @@ fn build_opus_tags(tags: &RecordingTags) -> Vec<u8> {
     ));
 
     let mut t = Vec::with_capacity(
-        8 + 4 + vendor_bytes.len()
-            + 4
-            + comments.iter().map(|c| 4 + c.len()).sum::<usize>(),
+        8 + 4 + vendor_bytes.len() + 4 + comments.iter().map(|c| 4 + c.len()).sum::<usize>(),
     );
     t.extend_from_slice(b"OpusTags");
     t.extend_from_slice(&(vendor_bytes.len() as u32).to_le_bytes());
@@ -684,8 +675,7 @@ mod tests {
             started_human: "2026-05-25 12:00:00".to_string(),
             date: "2026-05-25".to_string(),
         };
-        let (session, pcm_tx) =
-            RecordingSession::spawn(0, tmp.clone(), tags).expect("spawn");
+        let (session, pcm_tx) = RecordingSession::spawn(0, tmp.clone(), tags).expect("spawn");
 
         // Generate ~1 second of 440 Hz stereo tone at 44.1 kHz s16.
         // Sent as 100 ticks of 10 ms each, mimicking the
@@ -716,7 +706,11 @@ mod tests {
             .expect("read recording");
         let _ = std::fs::remove_file(&tmp);
 
-        assert!(bytes.len() > 1000, "recording suspiciously small ({} bytes)", bytes.len());
+        assert!(
+            bytes.len() > 1000,
+            "recording suspiciously small ({} bytes)",
+            bytes.len()
+        );
         assert_eq!(&bytes[..4], b"OggS", "missing Ogg sync bytes");
         // OpusHead lives in the first Ogg page's payload, ~28 bytes
         // in (after the OggS header). Spot-check the magic.

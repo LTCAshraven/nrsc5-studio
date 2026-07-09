@@ -46,21 +46,17 @@ pub enum GainMode {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum AnalogFallbackMode {
     /// Never route the analog FM demod to the speakers. This is the
     /// DXer / silence-as-cue mode.
+    #[default]
     DigitalOnly,
     /// Use the full HD → analog ladder: HD audio while synced, then
     /// analog stereo, then mono, then squelch.
     Automatic,
     /// Force the analog-FM demod to own the audio sink and ignore HD.
     AnalogOnly,
-}
-
-impl Default for AnalogFallbackMode {
-    fn default() -> Self {
-        Self::DigitalOnly
-    }
 }
 
 impl AnalogFallbackMode {
@@ -202,6 +198,14 @@ pub struct AppConfig {
     /// value before this was made configurable.
     #[serde(default = "default_preset_slot_count")]
     pub preset_slot_count: u32,
+    /// Enable spectrum-line smoothing in the Spectrum panel.
+    /// When false, smoothing alpha is effectively forced to 1.0.
+    #[serde(default)]
+    pub spectrum_smoothing_enabled: bool,
+    /// EMA alpha used for spectrum-line smoothing.
+    /// 1.0 = no smoothing, 0.1 = strongest smoothing.
+    #[serde(default = "default_spectrum_smoothing_alpha")]
+    pub spectrum_smoothing_alpha: f32,
     /// Phase 4 — selected recording mode. See `RecordingMode` for the
     /// behavior of each variant.
     #[serde(default)]
@@ -231,8 +235,15 @@ pub struct AppConfig {
     /// Content hashes of album-art images the user has permanently blocked
     /// from the collage. Any image whose hash appears here is silently
     /// rejected on arrival — the filename doesn't matter.
+    ///
+    /// Stored as `i64` even though the live value is a `u64`: TOML integers
+    /// are signed 64-bit, so a `u64` hash above `i64::MAX` can't be
+    /// serialized and would silently drop the block (and abort the whole
+    /// config write). The app bit-casts `u64` <-> `i64` at the boundary,
+    /// which is lossless — a high hash just round-trips as a negative
+    /// integer, and existing positive entries are unaffected.
     #[serde(default)]
-    pub art_blocklist: Vec<u64>,
+    pub art_blocklist: Vec<i64>,
     /// Linux fallback: when true, a secondary-click on a collage tile can
     /// trigger block directly even if the context-menu popup fails to appear
     /// on some compositor/window-manager combinations.
@@ -344,10 +355,10 @@ impl SdrConfigSection {
     /// * `LocalSoapy`   → `driver=<driver>[,device_args]`
     /// * `SoapyRemote`  → `driver=remote,remote=<host>:<port>[,remote_extra_args]`
     /// * `RtlTcpRemote` → also returns the LocalSoapy form, but callers
-    ///                    on this transport should open via the
-    ///                    `RtlTcpSdr` backend instead of SoapySDR.
-    ///                    This string is unused in that path but kept
-    ///                    deterministic so logging / display still works.
+    ///   on this transport should open via the
+    ///   `RtlTcpSdr` backend instead of SoapySDR.
+    ///   This string is unused in that path but kept
+    ///   deterministic so logging / display still works.
     pub fn to_args_string(&self) -> String {
         match self.transport {
             SdrTransport::SoapyRemote => {
@@ -396,9 +407,7 @@ impl SdrConfigSection {
     /// `driver=sdrplay` while clearly streaming over the network.
     pub fn display_connection_string(&self) -> String {
         match self.transport {
-            SdrTransport::SoapyRemote | SdrTransport::LocalSoapy => {
-                self.to_args_string()
-            }
+            SdrTransport::SoapyRemote | SdrTransport::LocalSoapy => self.to_args_string(),
             SdrTransport::RtlTcpRemote => {
                 format!(
                     "rtl_tcp://{}:{}",
@@ -476,6 +485,10 @@ fn default_preset_slot_count() -> u32 {
     6
 }
 
+fn default_spectrum_smoothing_alpha() -> f32 {
+    0.5
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
@@ -497,13 +510,14 @@ impl Default for AppConfig {
             sdr: SdrConfigSection::default(),
             show_hd5_hd8: false,
             preset_slot_count: default_preset_slot_count(),
+            spectrum_smoothing_enabled: false,
+            spectrum_smoothing_alpha: default_spectrum_smoothing_alpha(),
             recording_mode: RecordingMode::Off,
             recording_dir: None,
             recording_max_minutes: 60,
             recording_subfolder_per_station: true,
             art_blocklist: Vec::new(),
-            collage_secondary_click_fallback:
-                default_collage_secondary_click_fallback(),
+            collage_secondary_click_fallback: default_collage_secondary_click_fallback(),
             analog_fallback_mode: AnalogFallbackMode::default(),
             analog_fallback_stereo: true,
             analog_fallback_rds_enabled: true,
@@ -539,8 +553,9 @@ pub fn load_config() -> AppConfig {
 /// hand-edited `config.toml` from poisoning runtime state with
 /// out-of-range numbers.
 fn sanitize(cfg: &mut AppConfig) {
-    cfg.play_log_retention_hours =
-        crate::play_log::clamp_retention(cfg.play_log_retention_hours);
+    cfg.play_log_retention_hours = crate::play_log::clamp_retention(cfg.play_log_retention_hours);
+    cfg.spectrum_smoothing_alpha =
+        ((cfg.spectrum_smoothing_alpha.clamp(0.1, 1.0) * 10.0).round() / 10.0).clamp(0.1, 1.0);
     if cfg.analog_fallback_enabled && cfg.analog_fallback_mode == AnalogFallbackMode::default() {
         cfg.analog_fallback_mode = AnalogFallbackMode::Automatic;
     }
@@ -575,9 +590,7 @@ fn migrate_legacy_sdr(cfg: &mut AppConfig) {
     // empty device_args" rather than just "empty device_args" so the
     // first migration cleanly seeds, and subsequent loads (where the
     // user has switched to e.g. driver=sdrplay) leave the args alone.
-    if cfg.sdr.driver == "rtlsdr" && cfg.sdr.device_args.is_empty()
-        && cfg.rtl_device_index > 0
-    {
+    if cfg.sdr.driver == "rtlsdr" && cfg.sdr.device_args.is_empty() && cfg.rtl_device_index > 0 {
         cfg.sdr.device_args = format!("device={}", cfg.rtl_device_index);
     }
 
@@ -586,10 +599,9 @@ fn migrate_legacy_sdr(cfg: &mut AppConfig) {
     // controller manages the value anyway. Stored as dB (not tenths)
     // to match the new section's convention.
     if cfg.sdr.gains.is_empty() && cfg.gain_mode == GainMode::Manual {
-        cfg.sdr.gains.insert(
-            "TUNER".to_string(),
-            cfg.manual_gain_tenths as f64 / 10.0,
-        );
+        cfg.sdr
+            .gains
+            .insert("TUNER".to_string(), cfg.manual_gain_tenths as f64 / 10.0);
     }
 
     // Legacy rtl_tcp → modern transport. Only fires when the user
@@ -628,8 +640,12 @@ pub fn save_config(cfg: &AppConfig) {
         return;
     }
 
-    let Ok(raw) = toml::to_string_pretty(cfg) else {
-        return;
+    let raw = match toml::to_string_pretty(cfg) {
+        Ok(raw) => raw,
+        Err(e) => {
+            eprintln!("[config] failed to serialize config, not saving: {e}");
+            return;
+        }
     };
 
     let _ = fs::write(path, raw);
@@ -637,6 +653,7 @@ pub fn save_config(cfg: &AppConfig) {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::field_reassign_with_default)] // test fixtures build configs field-by-field for readability
     use super::*;
 
     #[test]
@@ -759,10 +776,7 @@ mod tests {
         let mut sdr = SdrConfigSection::default();
         sdr.transport = SdrTransport::SoapyRemote;
         // remote_host left None → fallback to 127.0.0.1
-        assert_eq!(
-            sdr.to_args_string(),
-            "driver=remote,remote=127.0.0.1:55132"
-        );
+        assert_eq!(sdr.to_args_string(), "driver=remote,remote=127.0.0.1:55132");
     }
 
     #[test]

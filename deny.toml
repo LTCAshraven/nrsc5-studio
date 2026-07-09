@@ -1,0 +1,85 @@
+# cargo-deny configuration — https://embarkstudios.github.io/cargo-deny/
+#
+# Enforced in CI (see .github/workflows/ci.yml). Run locally with:
+#   cargo install cargo-deny
+#   cargo deny check
+#
+# Note: cargo-deny only inspects the Rust crate graph. The bundled native
+# C libraries (libnrsc5, SoapySDR, librtlsdr, libusb, FFTW, FAAD2) are not
+# Cargo dependencies and are covered separately by THIRD_PARTY_NOTICES.md.
+
+[graph]
+# Only evaluate the targets we actually ship for. Keeps advisory/license
+# results focused on Windows + Linux instead of every possible target.
+targets = [
+    "x86_64-pc-windows-gnullvm",
+    "x86_64-pc-windows-msvc",
+    "x86_64-unknown-linux-gnu",
+]
+
+[advisories]
+version = 2
+# Fail on any security advisory in the RustSec database by default.
+# `yanked` crates are treated as errors so a pulled release can't slip in.
+yanked = "deny"
+# Advisory IDs to consciously ignore. Each entry is a transitive dependency
+# we cannot currently fix (the fix is gated behind a newer winit/eframe, or
+# no maintained replacement exists) and has no exploitable path in this app.
+# Revisit on every eframe/winit/opus bump.
+ignore = [
+    # quick-xml DoS advisories: quick-xml is hard-pinned to ^0.39 by
+    # wayland-scanner (deep under eframe -> winit -> smithay-client-toolkit).
+    # It only parses trusted, build-time Wayland protocol XML files, never
+    # attacker-influenced broadcast data. Unreachable until eframe ships a
+    # winit new enough to allow quick-xml >= 0.41.
+    { id = "RUSTSEC-2026-0194", reason = "quick-xml <0.41 pinned by wayland-scanner; parses only trusted build-time protocol XML" },
+    { id = "RUSTSEC-2026-0195", reason = "quick-xml <0.41 pinned by wayland-scanner; parses only trusted build-time protocol XML" },
+    # Unmaintained transitive crates with no maintained upgrade available.
+    { id = "RUSTSEC-2026-0150", reason = "audiopus_sys unmaintained; transitive via opus 0.3, no maintained alternative binding" },
+    { id = "RUSTSEC-2024-0436", reason = "paste unmaintained; transitive proc-macro helper, no fix available" },
+    { id = "RUSTSEC-2026-0192", reason = "ttf-parser unmaintained; transitive via ab_glyph -> winit, no safe upgrade" },
+]
+
+[licenses]
+version = 2
+# Permissive licenses acceptable for the Rust dependency tree. The shipped
+# *binary* is GPL-3.0 (because it links libnrsc5); that obligation is a
+# native-linking concern documented in THIRD_PARTY_NOTICES.md and is out of
+# scope for this crate-graph license check.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "CC0-1.0",
+    "BSL-1.0",
+    "MPL-2.0",
+    # Font licenses for the default typefaces egui bundles (Ubuntu-Light,
+    # NotoEmoji, Hack, etc.). These cover font data only, not code.
+    "OFL-1.1",
+    "Ubuntu-font-1.0",
+]
+confidence-threshold = 0.8
+# Per-crate license exceptions go here if a single dependency needs a
+# license not in the global allow list, e.g.:
+# exceptions = [{ name = "some-crate", allow = ["OpenSSL"] }]
+exceptions = []
+
+[bans]
+# Duplicate versions of the same crate bloat the binary; warn rather than
+# fail since transitive pins are often out of our control.
+multiple-versions = "warn"
+# Wildcard version requirements (`= "*"`) are disallowed in our own
+# manifest — they make builds non-reproducible.
+wildcards = "deny"
+
+[sources]
+# Only crates.io (and any explicitly allowed git sources) are permitted.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

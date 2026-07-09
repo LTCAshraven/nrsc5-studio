@@ -127,13 +127,7 @@ impl SoapySdr {
     /// Enumeration may discover other Soapy modules (e.g. audio-only
     /// endpoints), but they are intentionally hidden from the SDR picker.
     const SUPPORTED_DRIVERS: &'static [&'static str] = &[
-        "rtlsdr",
-        "sdrplay",
-        "airspy",
-        "hackrf",
-        "lime",
-        "plutosdr",
-        "remote",
+        "rtlsdr", "sdrplay", "airspy", "hackrf", "lime", "plutosdr", "remote",
     ];
 
     /// Enumerate every device visible to libSoapySDR.
@@ -199,7 +193,10 @@ impl SoapySdr {
         // This works when every module loads cleanly.
         match soapysdr::enumerate("") {
             Ok(v) => {
-                diag.push_str(&format!("enumerate(\"\")           -> {} devices\n", v.len()));
+                diag.push_str(&format!(
+                    "enumerate(\"\")           -> {} devices\n",
+                    v.len()
+                ));
                 for args in v {
                     let info = args_to_info(args);
                     merged.insert(info.device_args.clone(), info);
@@ -218,19 +215,14 @@ impl SoapySdr {
             let filter = format!("driver={driver}");
             match soapysdr::enumerate(&filter[..]) {
                 Ok(v) => {
-                    diag.push_str(&format!(
-                        "enumerate(\"{filter}\") -> {} devices\n",
-                        v.len()
-                    ));
+                    diag.push_str(&format!("enumerate(\"{filter}\") -> {} devices\n", v.len()));
                     for args in v {
                         let info = args_to_info(args);
                         merged.insert(info.device_args.clone(), info);
                     }
                 }
                 Err(e) => {
-                    diag.push_str(&format!(
-                        "enumerate(\"{filter}\") -> ERROR: {e}\n"
-                    ));
+                    diag.push_str(&format!("enumerate(\"{filter}\") -> ERROR: {e}\n"));
                 }
             }
         }
@@ -375,10 +367,7 @@ impl SoapySdr {
         // doesn't expose CORR (it has its own internal correction via
         // device args at open time); we silently ignore the error for
         // that path and live with whatever the hardware provides.
-        match self
-            .device
-            .set_component_frequency(RX, CH, "CORR", ppm, "")
-        {
+        match self.device.set_component_frequency(RX, CH, "CORR", ppm, "") {
             Ok(()) => Ok(()),
             Err(_) if self.driver == "sdrplay" => Ok(()),
             Err(e) => Err(SdrError::SoapyCall {
@@ -792,14 +781,11 @@ impl Sdr for SoapySdr {
             // antenna selection). Fall back to a conservative
             // hardcoded range if the call fails -- some module
             // builds don't implement the aggregate `getGainRange`.
-            let range = self
-                .device
-                .gain_range(RX, CH)
-                .unwrap_or(soapysdr::Range {
-                    minimum: 0.0,
-                    maximum: 48.0,
-                    step: 0.0,
-                });
+            let range = self.device.gain_range(RX, CH).unwrap_or(soapysdr::Range {
+                minimum: 0.0,
+                maximum: 48.0,
+                step: 0.0,
+            });
             let current = self.device.gain(RX, CH).unwrap_or(0.0);
             return vec![super::GainElement {
                 name: "Gain".to_string(),
@@ -830,7 +816,10 @@ impl Sdr for SoapySdr {
                 Ok(r) => r,
                 Err(_) => continue,
             };
-            let current = self.device.gain_element(RX, CH, name.as_str()).unwrap_or(0.0);
+            let current = self
+                .device
+                .gain_element(RX, CH, name.as_str())
+                .unwrap_or(0.0);
             out.push(super::GainElement {
                 name,
                 min_db: range.minimum,
@@ -880,16 +869,11 @@ impl Sdr for SoapySdr {
         // list, which also hides the dropdown — correct UX since
         // there is nothing useful for the user to pick anyway.
         let raw = self.device.antennas(RX, CH).unwrap_or_default();
-        raw.into_iter()
-            .filter(|s| !s.is_empty())
-            .collect()
+        raw.into_iter().filter(|s| !s.is_empty()).collect()
     }
 
     fn antenna(&self) -> Option<String> {
-        self.device
-            .antenna(RX, CH)
-            .ok()
-            .filter(|s| !s.is_empty())
+        self.device.antenna(RX, CH).ok().filter(|s| !s.is_empty())
     }
 
     fn set_antenna(&self, name: &str) -> Result<(), SdrError> {
@@ -906,10 +890,7 @@ impl Sdr for SoapySdr {
             })
     }
 
-    fn run_stream(
-        &self,
-        cb: &mut dyn FnMut(&[u8]) -> StreamControl,
-    ) -> Result<(), SdrError> {
+    fn run_stream(&self, cb: &mut dyn FnMut(&[u8]) -> StreamControl) -> Result<(), SdrError> {
         // Only one streamer at a time per device.
         let _guard = self
             .stream_guard
@@ -929,8 +910,8 @@ impl Sdr for SoapySdr {
             // edge case from a bad rate), fall back to the pass-
             // through path -- worst case the user hears static
             // instead of a hard error.
-            let resampler = IqResampler::new(src_rate, dst_rate)
-                .map_err(|e| SdrError::SoapyCall {
+            let resampler =
+                IqResampler::new(src_rate, dst_rate).map_err(|e| SdrError::SoapyCall {
                     func: "IqResampler::new",
                     detail: format!("{src_rate} -> {dst_rate}: {e}"),
                 })?;
@@ -938,13 +919,13 @@ impl Sdr for SoapySdr {
             // CF32 natively, but not CS8. Request CS16 -- f32 would
             // double the USB bandwidth for no quality benefit at the
             // resampler's input.
-            let mut rx = self
-                .device
-                .rx_stream::<Complex<i16>>(&[CH])
-                .map_err(|e| SdrError::SoapyCall {
-                    func: "rx_stream",
-                    detail: format!("CS16 (resample path): {e}"),
-                })?;
+            let mut rx =
+                self.device
+                    .rx_stream::<Complex<i16>>(&[CH])
+                    .map_err(|e| SdrError::SoapyCall {
+                        func: "rx_stream",
+                        detail: format!("CS16 (resample path): {e}"),
+                    })?;
             return run_resample_loop(&mut rx, &self.stop_flag, resampler, cb);
         }
 
@@ -955,13 +936,13 @@ impl Sdr for SoapySdr {
         if let Ok(mut rx) = self.device.rx_stream::<Complex<i8>>(&[CH]) {
             run_cs8_loop(&mut rx, &self.stop_flag, cb)
         } else {
-            let mut rx = self
-                .device
-                .rx_stream::<Complex<i16>>(&[CH])
-                .map_err(|e| SdrError::SoapyCall {
-                    func: "rx_stream",
-                    detail: format!("CS16 fallback: {e}"),
-                })?;
+            let mut rx =
+                self.device
+                    .rx_stream::<Complex<i16>>(&[CH])
+                    .map_err(|e| SdrError::SoapyCall {
+                        func: "rx_stream",
+                        detail: format!("CS16 fallback: {e}"),
+                    })?;
             run_cs16_loop(&mut rx, &self.stop_flag, cb)
         }
     }
@@ -1006,9 +987,7 @@ fn run_cs8_loop(
                 let detail = e.to_string();
                 if is_overflow_error(&detail) {
                     if !overflow_warned {
-                        eprintln!(
-                            "[sdr] transient overflow in CS8 read path; continuing"
-                        );
+                        eprintln!("[sdr] transient overflow in CS8 read path; continuing");
                         overflow_warned = true;
                     }
                     continue;
@@ -1028,15 +1007,13 @@ fn run_cs8_loop(
         // add 128. SAFETY: Complex<i8> is #[repr(C)] (re/im in order),
         // both fields are 1 byte, no padding. We're touching only the
         // first `n` complex samples = `n*2` bytes.
-        let src = unsafe {
-            std::slice::from_raw_parts(i8_buf.as_ptr() as *const u8, n * 2)
-        };
+        let src = unsafe { std::slice::from_raw_parts(i8_buf.as_ptr() as *const u8, n * 2) };
         let dst = &mut u8_buf[..n * 2];
         for (s, d) in src.iter().zip(dst.iter_mut()) {
             *d = (*s).wrapping_add(128);
         }
 
-        if matches!(cb(&dst), StreamControl::Stop) {
+        if matches!(cb(dst), StreamControl::Stop) {
             break;
         }
     }
@@ -1081,9 +1058,7 @@ fn run_cs16_loop(
                 let detail = e.to_string();
                 if is_overflow_error(&detail) {
                     if !overflow_warned {
-                        eprintln!(
-                            "[sdr] transient overflow in CS16 read path; continuing"
-                        );
+                        eprintln!("[sdr] transient overflow in CS16 read path; continuing");
                         overflow_warned = true;
                     }
                     continue;
@@ -1177,9 +1152,7 @@ fn run_resample_loop(
                 let detail = e.to_string();
                 if is_overflow_error(&detail) {
                     if !overflow_warned {
-                        eprintln!(
-                            "[sdr] transient overflow in resample read path; continuing"
-                        );
+                        eprintln!("[sdr] transient overflow in resample read path; continuing");
                         overflow_warned = true;
                     }
                     continue;

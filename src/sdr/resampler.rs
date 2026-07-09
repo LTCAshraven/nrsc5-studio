@@ -166,23 +166,18 @@ impl IqResampler {
             // rubato wants borrowed per-channel slices. We hand it
             // exactly CHUNK_FRAMES from the front of each buffer
             // and drain those positions after processing.
-            let in_slices: [&[f32]; 2] = [
-                &self.in_i[..CHUNK_FRAMES],
-                &self.in_q[..CHUNK_FRAMES],
-            ];
+            let in_slices: [&[f32]; 2] = [&self.in_i[..CHUNK_FRAMES], &self.in_q[..CHUNK_FRAMES]];
             // Output buffers: two mutable per-channel slices the
             // resampler writes its result into.
             let (n_in, n_out) = {
-                let mut out_slices: [&mut [f32]; 2] =
-                    [&mut self.out_i[..], &mut self.out_q[..]];
+                let mut out_slices: [&mut [f32]; 2] = [&mut self.out_i[..], &mut self.out_q[..]];
                 // `process_into_buffer` returns `(input_frames_used,
                 // output_frames_written)`. We sized `out_slices` to
                 // `output_frames_max()` so it can't overflow.
-                match self.inner.process_into_buffer(
-                    &in_slices,
-                    &mut out_slices,
-                    None,
-                ) {
+                match self
+                    .inner
+                    .process_into_buffer(&in_slices, &mut out_slices, None)
+                {
                     Ok(pair) => pair,
                     Err(_) => {
                         // A processing error here means rubato hit

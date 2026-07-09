@@ -733,20 +733,12 @@ unsafe extern "C" {
     /// Register the event callback and an opaque context pointer.
     /// The callback is invoked on the worker thread for every event
     /// (metadata, audio, sync, MER/BER, …).
-    pub fn nrsc5_set_callback(
-        st: *mut nrsc5_t,
-        callback: nrsc5_callback_t,
-        opaque: *mut c_void,
-    );
+    pub fn nrsc5_set_callback(st: *mut nrsc5_t, callback: nrsc5_callback_t, opaque: *mut c_void);
 
     /// Push `length` unsigned-8-bit complex I/Q samples (interleaved
     /// I, Q) into the demodulator. The expected sample rate is
     /// [`NRSC5_SAMPLE_RATE_CU8`] (1.488375 Msps).
-    pub fn nrsc5_pipe_samples_cu8(
-        st: *mut nrsc5_t,
-        samples: *const u8,
-        length: c_uint,
-    ) -> c_int;
+    pub fn nrsc5_pipe_samples_cu8(st: *mut nrsc5_t, samples: *const u8, length: c_uint) -> c_int;
 
     /// Write the library version (e.g. `"3.1.0"`) into `*version`.
     /// The string is owned by libnrsc5; do not free.
@@ -790,7 +782,10 @@ mod tests {
 
         // The full event = tag (4) + pad to 8 + union. Union alignment
         // forces the struct to 8-byte alignment on 64-bit.
-        assert_eq!(align_of::<nrsc5_event_t>(), align_of::<nrsc5_event_payload>());
+        assert_eq!(
+            align_of::<nrsc5_event_t>(),
+            align_of::<nrsc5_event_payload>()
+        );
     }
 
     /// Verify the callback type signature matches what the C side

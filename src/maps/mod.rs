@@ -99,19 +99,20 @@ impl TrafficMap {
         // Prefer filename parsing for HERE traffic placement; observed HERE
         // `n1`/`n2` are often not 0..2 tile indices (e.g. 3,9), so they are
         // better treated as metadata.
-        let (row, col) = if let Some(name) = Path::new(filename).file_name().and_then(|s| s.to_str()) {
-            parse_here_traffic_position(name)
-                .or_else(|| {
-                    if (0..=2).contains(&n1) && (0..=2).contains(&n2) {
-                        Some((n1 as usize, n2 as usize))
-                    } else {
-                        None
-                    }
-                })
-                .unwrap_or((usize::MAX, usize::MAX))
-        } else {
-            (usize::MAX, usize::MAX)
-        };
+        let (row, col) =
+            if let Some(name) = Path::new(filename).file_name().and_then(|s| s.to_str()) {
+                parse_here_traffic_position(name)
+                    .or_else(|| {
+                        if (0..=2).contains(&n1) && (0..=2).contains(&n2) {
+                            Some((n1 as usize, n2 as usize))
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or((usize::MAX, usize::MAX))
+            } else {
+                (usize::MAX, usize::MAX)
+            };
         if row > 2 || col > 2 {
             return false;
         }
@@ -193,11 +194,7 @@ impl TrafficMap {
                 for y in 0..th.min(tile_h) {
                     for x in 0..tw.min(tile_w) {
                         let px = tile_rgba.get_pixel(x, y);
-                        canvas.put_pixel(
-                            col as u32 * tile_w + x,
-                            row as u32 * tile_h + y,
-                            *px,
-                        );
+                        canvas.put_pixel(col as u32 * tile_w + x, row as u32 * tile_h + y, *px);
                     }
                 }
             }
@@ -281,7 +278,9 @@ impl WeatherMap {
 
         for entry in entries.flatten() {
             let name = entry.file_name();
-            let Some(name_str) = name.to_str() else { continue };
+            let Some(name_str) = name.to_str() else {
+                continue;
+            };
             // Track the freshest cached BaseMap so we can fall back to it if
             // no DWRI is on disk yet. This avoids the "first DWRO arrives
             // before the broadcast cycle re-sends DWRI, so the first
@@ -514,7 +513,8 @@ impl WeatherMap {
                 let mut coords: Vec<f64> = Vec::new();
                 for token in rest.split(';') {
                     let token = token.trim().trim_matches('"');
-                    let Some(inner) = token.strip_prefix('(').and_then(|s| s.strip_suffix(')')) else {
+                    let Some(inner) = token.strip_prefix('(').and_then(|s| s.strip_suffix(')'))
+                    else {
                         continue;
                     };
                     let mut nums = inner.split(',');
@@ -536,8 +536,7 @@ impl WeatherMap {
             #[cfg(debug_assertions)]
             eprintln!("[map] parsed DWRI id={} coords={:?}", id, coords);
             // Rebuild base map if area changed.
-            let changed = self.area_id.as_deref() != Some(&id)
-                || self.coordinates != Some(coords);
+            let changed = self.area_id.as_deref() != Some(&id) || self.coordinates != Some(coords);
             self.area_id = Some(id.clone());
             self.coordinates = Some(coords);
             if changed || self.base_map_path.is_none() {
@@ -600,7 +599,11 @@ impl WeatherMap {
 
         let cropped = full_map.crop_imm(x1, y1, x2 - x1, y2 - y1);
         #[cfg(debug_assertions)]
-        eprintln!("[map] cropped size={}x{}", cropped.width(), cropped.height());
+        eprintln!(
+            "[map] cropped size={}x{}",
+            cropped.width(),
+            cropped.height()
+        );
         if cropped.save(&base_path).is_ok() {
             self.base_map_path = Some(base_path.clone());
             #[cfg(debug_assertions)]
@@ -748,7 +751,7 @@ fn parse_tmt_position(raw: &str) -> Option<(usize, usize)> {
     // parts[0] = "TMT", parts[1] = provider, parts[2] = X, parts[3] = Y
     let x: usize = parts[2].parse().ok()?;
     let y: usize = parts[3].parse().ok()?;
-    if x >= 1 && x <= 3 && y >= 1 && y <= 3 {
+    if (1..=3).contains(&x) && (1..=3).contains(&y) {
         // In the Python code: x=col, y=row (TMT naming is X_Y = row_column)
         // Actually looking at the Python: x = int(m.group(1))-1, y = int(m.group(2))-1
         // and paste at (j*200, i*200) where i=x, j=y → so group(1) is row, group(2) is col
@@ -811,7 +814,14 @@ const MAP_REF_Y_SCALE: f64 = 3565.0;
 /// Uses Web Mercator projection. The scale constants are tied to the reference
 /// map dimensions and scaled by the actual image size so the same logic works
 /// for `map.png` and exact higher-resolution multiples like `map2x.png`.
-fn get_map_area(lat1: f64, lon1: f64, lat2: f64, lon2: f64, width: u32, height: u32) -> (i32, i32, i32, i32) {
+fn get_map_area(
+    lat1: f64,
+    lon1: f64,
+    lat2: f64,
+    lon2: f64,
+    width: u32,
+    height: u32,
+) -> (i32, i32, i32, i32) {
     let top = f64::asinh(f64::tan(lat_rad(52.482780)));
     let y_ref = f64::asinh(f64::tan(lat_rad(38.898)));
     let lat_span = top - y_ref;
@@ -839,9 +849,9 @@ fn lat_rad(deg: f64) -> f64 {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)] // find_map_file is defined below the tests; harmless here.
 mod tests {
     use super::*;
-    use image::{ImageBuffer, Rgba};
     use std::fs;
 
     #[test]
@@ -865,35 +875,54 @@ mod tests {
 
         // Reference map.png resolution.
         let (x1, y1, x2, y2) = get_map_area(lat1, lon1, lat2, lon2, 12032, 6912);
-        assert!(x1 >= 0 && x2 <= 12032 && x1 < x2, "x out of bounds: {x1}..{x2}");
-        assert!(y1 >= 0 && y2 <= 6912 && y1 < y2, "y out of bounds: {y1}..{y2}");
+        assert!(
+            x1 >= 0 && x2 <= 12032 && x1 < x2,
+            "x out of bounds: {x1}..{x2}"
+        );
+        assert!(
+            y1 >= 0 && y2 <= 6912 && y1 < y2,
+            "y out of bounds: {y1}..{y2}"
+        );
 
         // 2x map2x.png resolution: crop must be in bounds and ~2x the box.
         let (x1d, y1d, x2d, y2d) = get_map_area(lat1, lon1, lat2, lon2, 24064, 13824);
-        assert!(x1d >= 0 && x2d <= 24064 && x1d < x2d, "2x x out of bounds: {x1d}..{x2d}");
-        assert!(y1d >= 0 && y2d <= 13824 && y1d < y2d, "2x y out of bounds: {y1d}..{y2d}");
+        assert!(
+            x1d >= 0 && x2d <= 24064 && x1d < x2d,
+            "2x x out of bounds: {x1d}..{x2d}"
+        );
+        assert!(
+            y1d >= 0 && y2d <= 13824 && y1d < y2d,
+            "2x y out of bounds: {y1d}..{y2d}"
+        );
         assert!((x1d - x1 * 2).abs() <= 1, "x1: {x1d} vs {}", x1 * 2);
         assert!((y1d - y1 * 2).abs() <= 1, "y1: {y1d} vs {}", y1 * 2);
         assert!((x2d - x2 * 2).abs() <= 1, "x2: {x2d} vs {}", x2 * 2);
         assert!((y2d - y2 * 2).abs() <= 1, "y2: {y2d} vs {}", y2 * 2);
 
         // Crop must be a usable region, not a degenerate strip.
-        assert!((y2 - y1) > 100, "reference crop height too small: {}", y2 - y1);
+        assert!(
+            (y2 - y1) > 100,
+            "reference crop height too small: {}",
+            y2 - y1
+        );
     }
 
     #[test]
     fn load_image_with_no_limits_handles_large_png_basemap() {
         let map_file = Path::new(env!("CARGO_MANIFEST_DIR")).join("res/map2x.png");
         let img = load_image_with_no_limits(&map_file);
-        assert!(img.is_ok(), "expected {:?} to decode: {:?}", map_file, img.err());
+        assert!(
+            img.is_ok(),
+            "expected {:?} to decode: {:?}",
+            map_file,
+            img.err()
+        );
     }
 
     #[test]
     fn bootstrap_from_cache_replays_existing_dwr_files() {
-        let tempdir = std::env::temp_dir().join(format!(
-            "nrsc5-weather-bootstrap-{}",
-            std::process::id()
-        ));
+        let tempdir =
+            std::env::temp_dir().join(format!("nrsc5-weather-bootstrap-{}", std::process::id()));
         let _ = fs::remove_dir_all(&tempdir);
         fs::create_dir_all(&tempdir).unwrap();
 
@@ -928,7 +957,10 @@ mod tests {
 /// locations the Linux packages use (`/usr/share/nrsc5-studio/map.png`, etc.)
 /// so a system-installed build can find the basemap without relying on $PWD.
 fn find_map_file() -> Option<PathBuf> {
-    let names = [Path::new("res").join("map2x.png"), Path::new("res").join("map.png")];
+    let names = [
+        Path::new("res").join("map2x.png"),
+        Path::new("res").join("map.png"),
+    ];
 
     // 1. Next to the executable.
     if let Ok(exe) = std::env::current_exe() {

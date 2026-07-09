@@ -1,3 +1,8 @@
+// TODO(egui-0.34 migration): egui 0.34 deprecated Ui::close_menu (used in
+// the collage context menu below). Migrating is tracked separately; silence
+// the deprecation lint here in the meantime.
+#![allow(deprecated)]
+
 use crate::config::{GainMode, Preset, SdrTransport};
 use crate::gui::state::{AppState, LogViewMode, NowPlayingImageMode};
 use crate::play_log::PlayLog;
@@ -23,8 +28,10 @@ mod tests {
 
     #[test]
     fn suppresses_rds_when_hd_metadata_is_present() {
-        let mut slot = ProgramRuntime::default();
-        slot.artist = "Artist".to_string();
+        let slot = ProgramRuntime {
+            artist: "Artist".to_string(),
+            ..Default::default()
+        };
         assert_eq!(now_playing_rds_fallback_text(&slot, Some("WXYZ")), None);
     }
 
@@ -79,7 +86,8 @@ fn sis_header_logo_layout(header_width: f32) -> SisHeaderLogoLayout {
     } else {
         wide_logo_width
     };
-    let logo_height = (logo_width * (LOGO_MAX_SIZE.y / LOGO_MAX_SIZE.x)).clamp(52.0, LOGO_MAX_SIZE.y);
+    let logo_height =
+        (logo_width * (LOGO_MAX_SIZE.y / LOGO_MAX_SIZE.x)).clamp(52.0, LOGO_MAX_SIZE.y);
 
     SisHeaderLogoLayout {
         compact_header,
@@ -227,6 +235,10 @@ pub enum UiCommand {
     /// connections (power-user override). Empty string clears the
     /// field. Ignored for non-SoapyRemote transports.
     SetSdrRemoteExtraArgs(String),
+    /// Enable/disable spectrum-line smoothing in the Spectrum panel.
+    SetSpectrumSmoothingEnabled(bool),
+    /// Set spectrum-line smoothing EMA alpha (0.1..=1.0, 0.1 steps).
+    SetSpectrumSmoothingAlpha(f32),
     /// Show the SDR Settings modal.
     ShowSdrSettings,
     /// Hide the SDR Settings modal.
@@ -392,21 +404,19 @@ impl DockViewer<'_> {
             // user doesn't have to grab the mouse after typing a freq.
             // `lost_focus()` + `Enter` is egui's idiomatic "submit" gesture
             // for text-editable widgets including `DragValue`.
-            let enter_pressed = freq_resp.lost_focus()
-                && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            let enter_pressed =
+                freq_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             if ui.button("<").on_hover_text("Tune down 0.2 MHz").clicked() {
-                self.commands.push(UiCommand::TuneMhz(
-                    self.app_state.frequency_mhz - 0.2,
-                ));
+                self.commands
+                    .push(UiCommand::TuneMhz(self.app_state.frequency_mhz - 0.2));
             }
             if ui.button("Tune").clicked() || enter_pressed {
                 self.commands
                     .push(UiCommand::TuneMhz(self.app_state.frequency_mhz));
             }
             if ui.button(">").on_hover_text("Tune up 0.2 MHz").clicked() {
-                self.commands.push(UiCommand::TuneMhz(
-                    self.app_state.frequency_mhz + 0.2,
-                ));
+                self.commands
+                    .push(UiCommand::TuneMhz(self.app_state.frequency_mhz + 0.2));
             }
         });
         ui.add_space(2.0);
@@ -447,7 +457,14 @@ impl DockViewer<'_> {
             // second row would otherwise just sit there muted forever.
             ui.vertical(|ui| {
                 for row in 0..rows {
-                    self.render_program_row(ui, row, &available, active_idx, &decoded, is_streaming);
+                    self.render_program_row(
+                        ui,
+                        row,
+                        &available,
+                        active_idx,
+                        &decoded,
+                        is_streaming,
+                    );
                 }
             });
         });
@@ -494,10 +511,8 @@ impl DockViewer<'_> {
 
             let start_btn = ui.add_sized(
                 [64.0, 26.0],
-                egui::Button::new(
-                    RichText::new("▶ Start").color(btn_text).strong(),
-                )
-                .fill(start_fill),
+                egui::Button::new(RichText::new("▶ Start").color(btn_text).strong())
+                    .fill(start_fill),
             );
             if start_btn.clicked() {
                 self.commands.push(UiCommand::Start);
@@ -505,10 +520,7 @@ impl DockViewer<'_> {
 
             let stop_btn = ui.add_sized(
                 [64.0, 26.0],
-                egui::Button::new(
-                    RichText::new("■ Stop").color(btn_text).strong(),
-                )
-                .fill(stop_fill),
+                egui::Button::new(RichText::new("■ Stop").color(btn_text).strong()).fill(stop_fill),
             );
             if stop_btn.clicked() {
                 self.commands.push(UiCommand::Stop);
@@ -547,11 +559,9 @@ impl DockViewer<'_> {
             };
             let rec_btn = ui.add_enabled(
                 !recording_disabled,
-                egui::Button::new(
-                    RichText::new(rec_label).color(btn_text).strong(),
-                )
-                .fill(rec_fill)
-                .min_size(rec_min_size),
+                egui::Button::new(RichText::new(rec_label).color(btn_text).strong())
+                    .fill(rec_fill)
+                    .min_size(rec_min_size),
             );
             let rec_btn = rec_btn.on_hover_text(if is_recording {
                 self.app_state
@@ -638,11 +648,9 @@ impl DockViewer<'_> {
             }
         });
         ui.label(
-            RichText::new(
-                "Click to tune · Right-click to save · Double-click to edit",
-            )
-            .small()
-            .color(Color32::from_gray(100)),
+            RichText::new("Click to tune · Right-click to save · Double-click to edit")
+                .small()
+                .color(Color32::from_gray(100)),
         );
 
         // Floating preset editor — modal-ish window with name/freq/subchannel
@@ -666,9 +674,7 @@ impl DockViewer<'_> {
                             ui.label("Name");
                             let name_resp = ui.add_sized(
                                 [180.0, 22.0],
-                                egui::TextEdit::singleline(
-                                    &mut self.app_state.editing_preset_text,
-                                ),
+                                egui::TextEdit::singleline(&mut self.app_state.editing_preset_text),
                             );
                             if self.app_state.editing_preset_just_opened {
                                 name_resp.request_focus();
@@ -678,12 +684,10 @@ impl DockViewer<'_> {
 
                             ui.label("Frequency");
                             ui.add(
-                                egui::DragValue::new(
-                                    &mut self.app_state.editing_preset_freq,
-                                )
-                                .speed(0.1)
-                                .range(87.5..=108.0)
-                                .suffix(" MHz"),
+                                egui::DragValue::new(&mut self.app_state.editing_preset_freq)
+                                    .speed(0.1)
+                                    .range(87.5..=108.0)
+                                    .suffix(" MHz"),
                             );
                             ui.end_row();
 
@@ -716,19 +720,14 @@ impl DockViewer<'_> {
                         if ui
                             .add(
                                 egui::Button::new(
-                                    RichText::new("Save")
-                                        .color(Color32::from_rgb(80, 220, 120)),
+                                    RichText::new("Save").color(Color32::from_rgb(80, 220, 120)),
                                 )
                                 .min_size(Vec2::new(70.0, 24.0)),
                             )
                             .clicked()
                         {
                             let preset = Preset {
-                                name: self
-                                    .app_state
-                                    .editing_preset_text
-                                    .trim()
-                                    .to_string(),
+                                name: self.app_state.editing_preset_text.trim().to_string(),
                                 frequency_mhz: self.app_state.editing_preset_freq,
                                 program: self.app_state.editing_preset_program,
                             };
@@ -738,8 +737,7 @@ impl DockViewer<'_> {
                         if ui
                             .add(
                                 egui::Button::new(
-                                    RichText::new("Clear")
-                                        .color(Color32::from_rgb(240, 80, 80)),
+                                    RichText::new("Clear").color(Color32::from_rgb(240, 80, 80)),
                                 )
                                 .min_size(Vec2::new(70.0, 24.0)),
                             )
@@ -750,10 +748,7 @@ impl DockViewer<'_> {
                             self.app_state.editing_preset = None;
                         }
                         if ui
-                            .add(
-                                egui::Button::new("Cancel")
-                                    .min_size(Vec2::new(70.0, 24.0)),
-                            )
+                            .add(egui::Button::new("Cancel").min_size(Vec2::new(70.0, 24.0)))
                             .clicked()
                         {
                             self.app_state.editing_preset = None;
@@ -807,17 +802,24 @@ impl DockViewer<'_> {
                 let i = row * 4 + col;
                 let lit = available[i as usize];
                 let on_air = decoded[i as usize];
+                // A subchannel is selectable only when the station
+                // advertises it (`lit`) or it is already producing audio
+                // (`on_air`). Greyed-out slots the station isn't
+                // delivering must not be actionable — clicking one used to
+                // "tune anyway" and land on a dead subchannel with
+                // unpredictable results (issue #20). The currently active
+                // slot stays enabled so it never renders greyed while
+                // selected.
+                let selected = active_idx as u32 == i;
+                let is_selectable = lit || on_air || selected;
                 let mut text = RichText::new(format!("HD{}", i + 1));
-                if !lit && !on_air {
+                if !is_selectable {
                     text = text.weak();
                 }
-                let selected = active_idx as u32 == i;
-                let mut resp = ui.selectable_label(selected, text);
-                if !lit && !on_air {
-                    resp = resp.on_hover_text(
-                        "Not advertised by this station. \
-                         Click to tune anyway.",
-                    );
+                let mut resp =
+                    ui.add_enabled(is_selectable, egui::SelectableLabel::new(selected, text));
+                if !is_selectable {
+                    resp = resp.on_disabled_hover_text("Not advertised by this station.");
                 } else if on_air {
                     resp = resp.on_hover_text("Decoding (audio on air).");
                 }
@@ -840,28 +842,17 @@ impl DockViewer<'_> {
 
         let rds_fallback_text = now_playing_rds_fallback_text(
             slot,
-            self.app_state
-                .station_info
-                .rds_ticker_text()
-                .as_deref(),
+            self.app_state.station_info.rds_ticker_text().as_deref(),
         );
 
         // Line 1: Artist (long station name OR song artist — changes with broadcast).
         if !slot.artist.is_empty() {
-            ui.label(
-                RichText::new(&slot.artist)
-                    .heading()
-                    .color(accent),
-            );
+            ui.label(RichText::new(&slot.artist).heading().color(accent));
         }
 
         // Line 2: Title (slogan OR song title).
         if !slot.title.is_empty() {
-            ui.label(
-                RichText::new(&slot.title)
-                    .size(15.0)
-                    .color(dim),
-            );
+            ui.label(RichText::new(&slot.title).size(15.0).color(dim));
         }
 
         // (Station identity line removed — the upcoming Station Information
@@ -936,9 +927,7 @@ impl DockViewer<'_> {
         // with the text and marks the wrap point between repeats, and its
         // width doubles as the inter-copy gap.
         let display = format!("{text}   |   ");
-        let galley = ui
-            .painter()
-            .layout_no_wrap(display, font_id, color);
+        let galley = ui.painter().layout_no_wrap(display, font_id, color);
         let text_w = galley.size().x;
         let text_h = galley.size().y;
         let desired = Vec2::new(ui.available_width(), text_h + 8.0);
@@ -1008,14 +997,14 @@ impl DockViewer<'_> {
         let alert_red = Color32::from_rgb(220, 80, 80);
 
         let slot = self.app_state.active_program();
-        let title_fresh = !slot.title.is_empty()
-            && AppState::is_psd_field_fresh(slot.title_updated);
-        let artist_fresh = !slot.artist.is_empty()
-            && AppState::is_psd_field_fresh(slot.artist_updated);
-        let album_fresh = !slot.album.is_empty()
-            && AppState::is_psd_field_fresh(slot.album_updated);
-        let genre_fresh = !slot.genre.is_empty()
-            && AppState::is_psd_field_fresh(slot.genre_updated);
+        let title_fresh =
+            !slot.title.is_empty() && AppState::is_psd_field_fresh(slot.title_updated);
+        let artist_fresh =
+            !slot.artist.is_empty() && AppState::is_psd_field_fresh(slot.artist_updated);
+        let album_fresh =
+            !slot.album.is_empty() && AppState::is_psd_field_fresh(slot.album_updated);
+        let genre_fresh =
+            !slot.genre.is_empty() && AppState::is_psd_field_fresh(slot.genre_updated);
         let psd_has_any = title_fresh || artist_fresh || album_fresh || genre_fresh;
         let sis_has_any = self.app_state.station_info.has_any_data();
 
@@ -1064,13 +1053,7 @@ impl DockViewer<'_> {
     /// PSD section \u2014 per-song metadata. Rendered as a label + two-column
     /// grid. Caller has already verified at least one field is present
     /// and within the freshness window.
-    fn render_psd_section(
-        &self,
-        ui: &mut Ui,
-        accent: Color32,
-        dim: Color32,
-        muted: Color32,
-    ) {
+    fn render_psd_section(&self, ui: &mut Ui, accent: Color32, dim: Color32, muted: Color32) {
         ui.label(
             RichText::new("PSD \u{2014} Program Service Data")
                 .color(accent)
@@ -1091,34 +1074,16 @@ impl DockViewer<'_> {
                     muted,
                     dim,
                 );
-                Self::psd_row(
-                    ui,
-                    "Artist",
-                    &slot.artist,
-                    slot.artist_updated,
-                    muted,
-                    dim,
-                );
-                Self::psd_row(
-                    ui,
-                    "Album",
-                    &slot.album,
-                    slot.album_updated,
-                    muted,
-                    dim,
-                );
-                Self::psd_row(
-                    ui,
-                    "Genre",
-                    &slot.genre,
-                    slot.genre_updated,
-                    muted,
-                    dim,
-                );
+                Self::psd_row(ui, "Artist", &slot.artist, slot.artist_updated, muted, dim);
+                Self::psd_row(ui, "Album", &slot.album, slot.album_updated, muted, dim);
+                Self::psd_row(ui, "Genre", &slot.genre, slot.genre_updated, muted, dim);
             });
 
         if let Some(ts) = self.app_state.psd_latest_updated() {
-            let txt = format!("PSD updated {}", Self::fmt_elapsed_bucketed(ts.elapsed().as_secs()));
+            let txt = format!(
+                "PSD updated {}",
+                Self::fmt_elapsed_bucketed(ts.elapsed().as_secs())
+            );
             ui.add_space(2.0);
             ui.label(RichText::new(txt).small().color(muted));
         }
@@ -1239,11 +1204,7 @@ impl DockViewer<'_> {
                     let uri = format!("file:///{}", path.replace('\\', "/"));
                     let src = logo_source.as_deref().unwrap_or("Unknown");
                     ui.with_layout(egui::Layout::top_down(align), |ui| {
-                        ui.label(
-                            RichText::new(format!("Source: {src}"))
-                                .small()
-                                .color(muted),
-                        );
+                        ui.label(RichText::new(format!("Source: {src}")).small().color(muted));
                         ui.add_space(2.0);
                         egui::Frame::new()
                             .fill(Color32::from_rgba_unmultiplied(255, 255, 255, 16))
@@ -1309,9 +1270,8 @@ impl DockViewer<'_> {
                 });
         }
 
-        let has_identity_row = info.country.is_some()
-            || info.fcc_facility_id.is_some()
-            || info.location.is_some();
+        let has_identity_row =
+            info.country.is_some() || info.fcc_facility_id.is_some() || info.location.is_some();
         if has_identity_row {
             ui.add_space(6.0);
             ui.separator();
@@ -1357,11 +1317,7 @@ impl DockViewer<'_> {
                 .show(ui, |ui| {
                     for (i, slot) in info.programs.iter().enumerate() {
                         let Some(prog) = slot else { continue };
-                        ui.label(
-                            RichText::new(format!("HD{}", i + 1))
-                                .strong()
-                                .color(accent),
-                        );
+                        ui.label(RichText::new(format!("HD{}", i + 1)).strong().color(accent));
                         let name_txt = if prog.short_name.is_empty() {
                             "\u{2014}".to_string()
                         } else {
@@ -1428,7 +1384,10 @@ impl DockViewer<'_> {
 
         if let Some(ts) = info.last_updated {
             ui.add_space(8.0);
-            let txt = format!("SIS updated {}", Self::fmt_elapsed_bucketed(ts.elapsed().as_secs()));
+            let txt = format!(
+                "SIS updated {}",
+                Self::fmt_elapsed_bucketed(ts.elapsed().as_secs())
+            );
             ui.label(RichText::new(txt).small().color(muted));
         }
     }
@@ -1461,7 +1420,11 @@ impl DockViewer<'_> {
         let has_live_payloads = !self.app_state.payload_log.is_empty()
             || self.app_state.traffic_map_path.is_some()
             || !self.app_state.weather_frames.is_empty()
-            || self.app_state.station_logo_paths.iter().any(|p| p.is_some())
+            || self
+                .app_state
+                .station_logo_paths
+                .iter()
+                .any(|p| p.is_some())
             || self.app_state.active_program().cover_art_path.is_some();
 
         if !(has_rf_health || has_live_payloads || has_equipment || has_time) {
@@ -1479,16 +1442,24 @@ impl DockViewer<'_> {
         // 1. RF / DECODER HEALTH
         // ============================================
         if has_rf_health {
-            ui.label(RichText::new("1. RF / Decoder Health").small().color(accent));
-            
+            ui.label(
+                RichText::new("1. RF / Decoder Health")
+                    .small()
+                    .color(accent),
+            );
+
             // SYNC info
             if let Some(freq_offset_hz) = info.sync_freq_offset_hz {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("Frequency offset:").color(muted));
-                    ui.label(RichText::new(format!("{:.1} Hz", freq_offset_hz)).monospace().color(dim));
+                    ui.label(
+                        RichText::new(format!("{:.1} Hz", freq_offset_hz))
+                            .monospace()
+                            .color(dim),
+                    );
                 });
             }
-            
+
             if let Some(psmi) = info.sync_psmi {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("PSMI:").color(muted));
@@ -1523,26 +1494,31 @@ impl DockViewer<'_> {
                         format!("{} - {}", mode_code, mode_desc)
                     };
                     let resp = ui.label(RichText::new(mode_text).monospace().color(dim));
-                    resp.on_hover_text(
-                        format!(
-                            "Raw PSMI value = {} from the libnrsc5 SYNC event.",
-                            psmi
-                        ),
-                    );
+                    resp.on_hover_text(format!(
+                        "Raw PSMI value = {} from the libnrsc5 SYNC event.",
+                        psmi
+                    ));
                 });
             }
-            
+
             // MER readout
             ui.horizontal(|ui| {
                 ui.label(RichText::new("MER:").color(muted));
                 let mer_txt = if self.app_state.mer > 0.0 {
-                    format!("lower {:.1} dB, upper {:.1} dB", self.app_state.mer_lower, self.app_state.mer_upper)
+                    format!(
+                        "lower {:.1} dB, upper {:.1} dB",
+                        self.app_state.mer_lower, self.app_state.mer_upper
+                    )
                 } else {
                     "—".to_string()
                 };
-                ui.label(RichText::new(mer_txt).monospace().color(if self.app_state.mer > 0.0 { dim } else { muted }));
+                ui.label(
+                    RichText::new(mer_txt)
+                        .monospace()
+                        .color(if self.app_state.mer > 0.0 { dim } else { muted }),
+                );
             });
-            
+
             // BER readout
             ui.horizontal(|ui| {
                 ui.label(RichText::new("BER:").color(muted));
@@ -1551,20 +1527,23 @@ impl DockViewer<'_> {
                 } else {
                     "—".to_string()
                 };
-                ui.label(RichText::new(ber_txt).monospace().color(if self.app_state.ber > 0.0 { dim } else { muted }));
+                ui.label(
+                    RichText::new(ber_txt)
+                        .monospace()
+                        .color(if self.app_state.ber > 0.0 { dim } else { muted }),
+                );
             });
-            
+
             // Sync status: use plain text labels so the state remains
             // legible even when emoji/symbol fonts are missing.
-            let sync_status = if self.app_state.currently_synced
-                || self.app_state.nrsc5_status == "synced"
-            {
-                ("SYNC LOCKED", green)
-            } else if self.app_state.is_streaming {
-                ("NO SYNC", Color32::from_rgb(200, 100, 100))
-            } else {
-                ("IDLE", muted)
-            };
+            let sync_status =
+                if self.app_state.currently_synced || self.app_state.nrsc5_status == "synced" {
+                    ("SYNC LOCKED", green)
+                } else if self.app_state.is_streaming {
+                    ("NO SYNC", Color32::from_rgb(200, 100, 100))
+                } else {
+                    ("IDLE", muted)
+                };
             ui.horizontal(|ui| {
                 ui.label(RichText::new("Status:").color(muted));
                 ui.label(
@@ -1579,10 +1558,54 @@ impl DockViewer<'_> {
                 ui.add_space(4.0);
                 ui.label(RichText::new("AM Indicators:").small().color(muted));
                 let rows = [
-                    ("PLI", if am.pli >= 0 { if am.pli != 0 { "high" } else { "low" } } else { "unknown" }),
-                    ("HPPI", if am.hppi >= 0 { if am.hppi != 0 { "high" } else { "low" } } else { "unknown" }),
-                    ("AABI", if am.aabi >= 0 { if am.aabi != 0 { "8 kHz" } else { "5 kHz" } } else { "unknown" }),
-                    ("RDBI", if am.rdbi >= 0 { if am.rdbi != 0 { "reduced" } else { "full" } } else { "unknown" }),
+                    (
+                        "PLI",
+                        if am.pli >= 0 {
+                            if am.pli != 0 {
+                                "high"
+                            } else {
+                                "low"
+                            }
+                        } else {
+                            "unknown"
+                        },
+                    ),
+                    (
+                        "HPPI",
+                        if am.hppi >= 0 {
+                            if am.hppi != 0 {
+                                "high"
+                            } else {
+                                "low"
+                            }
+                        } else {
+                            "unknown"
+                        },
+                    ),
+                    (
+                        "AABI",
+                        if am.aabi >= 0 {
+                            if am.aabi != 0 {
+                                "8 kHz"
+                            } else {
+                                "5 kHz"
+                            }
+                        } else {
+                            "unknown"
+                        },
+                    ),
+                    (
+                        "RDBI",
+                        if am.rdbi >= 0 {
+                            if am.rdbi != 0 {
+                                "reduced"
+                            } else {
+                                "full"
+                            }
+                        } else {
+                            "unknown"
+                        },
+                    ),
                 ];
 
                 for (label, value) in rows {
@@ -1610,14 +1633,24 @@ impl DockViewer<'_> {
                         ui.label(RichText::new("Exciter:").color(muted));
                         let mut txt = format!(
                             "{}  core {} ({})  mfr {} ({})",
-                            if eq.manufacturer_id.is_empty() { "—" } else { eq.manufacturer_id.as_str() },
+                            if eq.manufacturer_id.is_empty() {
+                                "—"
+                            } else {
+                                eq.manufacturer_id.as_str()
+                            },
                             eq.core_version_string(),
                             crate::station_info::EquipmentInfo::status_label(eq.core_status),
                             eq.manufacturer_version_string(),
-                            crate::station_info::EquipmentInfo::status_label(eq.manufacturer_status),
+                            crate::station_info::EquipmentInfo::status_label(
+                                eq.manufacturer_status
+                            ),
                         );
                         if let Some(connected) = eq.importer_connected {
-                            txt.push_str(if connected { "  · importer connected" } else { "  · no importer" });
+                            txt.push_str(if connected {
+                                "  · importer connected"
+                            } else {
+                                "  · no importer"
+                            });
                         }
                         ui.label(RichText::new(txt).monospace().color(dim));
                     });
@@ -1628,11 +1661,17 @@ impl DockViewer<'_> {
                         ui.label(RichText::new("Importer:").color(muted));
                         let txt = format!(
                             "{}  core {} ({})  mfr {} ({})",
-                            if eq.manufacturer_id.is_empty() { "—" } else { eq.manufacturer_id.as_str() },
+                            if eq.manufacturer_id.is_empty() {
+                                "—"
+                            } else {
+                                eq.manufacturer_id.as_str()
+                            },
                             eq.core_version_string(),
                             crate::station_info::EquipmentInfo::status_label(eq.core_status),
                             eq.manufacturer_version_string(),
-                            crate::station_info::EquipmentInfo::status_label(eq.manufacturer_status),
+                            crate::station_info::EquipmentInfo::status_label(
+                                eq.manufacturer_status
+                            ),
                         );
                         ui.label(RichText::new(txt).monospace().color(dim));
                     });
@@ -1742,18 +1781,24 @@ impl DockViewer<'_> {
 
             ui.add_space(4.0);
             ui.label(RichText::new("Rolling payload log:").small().color(muted));
-            egui::ScrollArea::vertical().max_height(130.0).show(ui, |ui| {
-                for entry in self.app_state.payload_log.iter().rev() {
-                    ui.label(
-                        RichText::new(format!("- [{}] {}", entry.hhmmss, entry.text))
-                            .monospace()
-                            .color(dim),
-                    );
-                }
-                if self.app_state.payload_log.is_empty() {
-                    ui.label(RichText::new("- waiting for LOT/XHDR payloads...").monospace().color(muted));
-                }
-            });
+            egui::ScrollArea::vertical()
+                .max_height(130.0)
+                .show(ui, |ui| {
+                    for entry in self.app_state.payload_log.iter().rev() {
+                        ui.label(
+                            RichText::new(format!("- [{}] {}", entry.hhmmss, entry.text))
+                                .monospace()
+                                .color(dim),
+                        );
+                    }
+                    if self.app_state.payload_log.is_empty() {
+                        ui.label(
+                            RichText::new("- waiting for LOT/XHDR payloads...")
+                                .monospace()
+                                .color(muted),
+                        );
+                    }
+                });
         }
     }
 
@@ -1870,7 +1915,7 @@ impl DockViewer<'_> {
             .as_ref()
             .map(|tex| fit_map_size(tex.size_vec2(), available))
             .unwrap_or_else(|| {
-                let s = available.x.min(available.y).min(600.0).max(120.0);
+                let s = available.x.min(available.y).clamp(120.0, 600.0);
                 Vec2::new(s, s)
             });
 
@@ -1879,7 +1924,9 @@ impl DockViewer<'_> {
             // top of the bottom strip as an overlay.
             let (img_rect, _resp) = ui.allocate_exact_size(img_size, egui::Sense::hover());
             if let Some(tex) = self.app_state.weather_texture.as_ref() {
-                egui::Image::new(tex).corner_radius(4).paint_at(ui, img_rect);
+                egui::Image::new(tex)
+                    .corner_radius(4)
+                    .paint_at(ui, img_rect);
             } else {
                 ui.painter().text(
                     img_rect.center(),
@@ -1924,11 +1971,9 @@ impl DockViewer<'_> {
             } else {
                 ("\u{25B6}", "Play animation")
             };
-            let play_btn = egui::Button::new(
-                RichText::new(label).size(16.0).color(Color32::WHITE),
-            )
-            .fill(Color32::from_rgba_unmultiplied(255, 255, 255, 30))
-            .min_size(egui::vec2(28.0, 24.0));
+            let play_btn = egui::Button::new(RichText::new(label).size(16.0).color(Color32::WHITE))
+                .fill(Color32::from_rgba_unmultiplied(255, 255, 255, 30))
+                .min_size(egui::vec2(28.0, 24.0));
             if child
                 .add_enabled(frame_count > 1, play_btn)
                 .on_hover_text(hover)
@@ -1986,8 +2031,7 @@ impl DockViewer<'_> {
         use crate::dsp::{FFT_SIZE, WATERFALL_ROWS};
         use egui::{
             epaint::{Mesh, Vertex},
-            pos2, vec2, Color32, ColorImage, Pos2, Rect, Sense, Shape, Stroke,
-            TextureOptions,
+            pos2, vec2, Color32, ColorImage, Pos2, Rect, Sense, Shape, Stroke, TextureOptions,
         };
 
         let dim = Color32::from_gray(140);
@@ -1996,19 +2040,12 @@ impl DockViewer<'_> {
         ui.add_space(2.0);
         ui.horizontal(|ui| {
             ui.label(
-                RichText::new(format!(
-                    "{:.4} MHz",
-                    self.app_state.frequency_mhz
-                ))
-                .monospace()
-                .strong(),
+                RichText::new(format!("{:.4} MHz", self.app_state.frequency_mhz))
+                    .monospace()
+                    .strong(),
             );
             ui.add_space(8.0);
-            ui.label(
-                RichText::new("span 1.488 Msps")
-                    .small()
-                    .color(dim),
-            );
+            ui.label(RichText::new("span 1.488 Msps").small().color(dim));
             ui.add_space(8.0);
             if !self.app_state.is_streaming {
                 ui.label(
@@ -2017,12 +2054,37 @@ impl DockViewer<'_> {
                         .color(dim),
                 );
             } else {
-                ui.label(
-                    RichText::new("Click to tune")
-                        .small()
-                        .color(dim),
-                );
+                ui.label(RichText::new("Click to tune").small().color(dim));
             }
+
+            ui.separator();
+            ui.push_id("spectrum_smoothing_controls", |ui| {
+                let mut smoothing_enabled = self.app_state.spectrum_smoothing_enabled;
+                let smoothing_checkbox =
+                    egui::Checkbox::new(&mut smoothing_enabled, "Spectrum Smoothing");
+                if ui.add(smoothing_checkbox).changed() {
+                    self.commands
+                        .push(UiCommand::SetSpectrumSmoothingEnabled(smoothing_enabled));
+                }
+
+                let mut smoothing_alpha = self.app_state.spectrum_smoothing_alpha;
+                // Keep the underlying alpha semantics (1.0 = off, 0.1 = max smoothing)
+                // while making the slider run left-to-right as 1.0 -> 0.1.
+                let mut slider_value = 1.1 - smoothing_alpha;
+                let slider = egui::Slider::new(&mut slider_value, 0.1..=1.0)
+                    .step_by(0.1)
+                    .show_value(false);
+                let slider_changed = ui
+                    .push_id("spectrum_smoothing_slider", |ui| {
+                        ui.add_enabled(smoothing_enabled, slider).changed()
+                    })
+                    .inner;
+                if slider_changed {
+                    smoothing_alpha = 1.1 - slider_value;
+                    self.commands
+                        .push(UiCommand::SetSpectrumSmoothingAlpha(smoothing_alpha));
+                }
+            });
         });
         ui.add_space(2.0);
 
@@ -2032,8 +2094,7 @@ impl DockViewer<'_> {
         let Some(tap) = self.app_state.spectrum_tap.clone() else {
             ui.centered_and_justified(|ui| {
                 ui.label(
-                    RichText::new("Spectrum unavailable: SDR backend not initialized")
-                        .color(dim),
+                    RichText::new("Spectrum unavailable: SDR backend not initialized").color(dim),
                 );
             });
             return;
@@ -2077,7 +2138,7 @@ impl DockViewer<'_> {
             let y = db_to_y(db_mark);
             painter.line_segment(
                 [pos2(spec_rect.left(), y), pos2(spec_rect.right(), y)],
-                Stroke::new(0.6, grid_color),
+                Stroke::new(0.6_f32, grid_color),
             );
             painter.text(
                 pos2(spec_rect.left() + 4.0, y - 2.0),
@@ -2142,9 +2203,9 @@ impl DockViewer<'_> {
             let bin_start = (i * n) / columns;
             let bin_end = (((i + 1) * n) / columns).max(bin_start + 1).min(n);
             let mut peak = f32::NEG_INFINITY;
-            for k in bin_start..bin_end {
-                if spec[k] > peak {
-                    peak = spec[k];
+            for &v in &spec[bin_start..bin_end] {
+                if v > peak {
+                    peak = v;
                 }
             }
             let y_top = db_to_y(peak);
@@ -2175,7 +2236,7 @@ impl DockViewer<'_> {
         }
         painter.add(Shape::mesh(mesh));
         // Crisp trace line on top of the fill.
-        painter.add(Shape::line(trace_pts, Stroke::new(1.2, trace_color)));
+        painter.add(Shape::line(trace_pts, Stroke::new(1.2_f32, trace_color)));
 
         // Frequency scale pinned to the FM 200 kHz raster (87.9 + n*0.2).
         let center_mhz = self.app_state.spectrum_snapshot.center_freq_hz / 1_000_000.0;
@@ -2189,19 +2250,20 @@ impl DockViewer<'_> {
             let last = ((view_max_mhz - FM_BASE_MHZ) / FM_STEP_MHZ).floor() as i32;
             for slot in first..=last {
                 let mhz = FM_BASE_MHZ + (slot as f64) * FM_STEP_MHZ;
-                let t = ((mhz - view_min_mhz) / (view_max_mhz - view_min_mhz)).clamp(0.0, 1.0) as f32;
+                let t =
+                    ((mhz - view_min_mhz) / (view_max_mhz - view_min_mhz)).clamp(0.0, 1.0) as f32;
                 let x = spec_rect.left() + t * spec_rect.width();
                 painter.line_segment(
                     [pos2(x, spec_rect.top()), pos2(x, spec_rect.bottom())],
-                    Stroke::new(0.6, Color32::from_rgb(36, 48, 70)),
+                    Stroke::new(0.6_f32, Color32::from_rgb(36, 48, 70)),
                 );
-            painter.text(
-                pos2(x, spec_rect.bottom() - 2.0),
+                painter.text(
+                    pos2(x, spec_rect.bottom() - 2.0),
                     egui::Align2::CENTER_BOTTOM,
                     format!("{:.1}", mhz),
-                egui::FontId::monospace(10.0),
-                Color32::from_rgb(150, 170, 200),
-            );
+                    egui::FontId::monospace(10.0),
+                    Color32::from_rgb(150, 170, 200),
+                );
             }
         }
 
@@ -2234,11 +2296,9 @@ impl DockViewer<'_> {
             match self.app_state.spectrum_texture.as_mut() {
                 Some(handle) => handle.set(img, TextureOptions::LINEAR),
                 None => {
-                    let new = ui.ctx().load_texture(
-                        "spectrum_waterfall",
-                        img,
-                        TextureOptions::LINEAR,
-                    );
+                    let new =
+                        ui.ctx()
+                            .load_texture("spectrum_waterfall", img, TextureOptions::LINEAR);
                     self.app_state.spectrum_texture = Some(new);
                 }
             }
@@ -2260,11 +2320,11 @@ impl DockViewer<'_> {
         let cx = spec_rect.center().x;
         painter.line_segment(
             [pos2(cx, spec_rect.top()), pos2(cx, spec_rect.bottom())],
-            Stroke::new(0.7, Color32::from_rgba_unmultiplied(255, 60, 60, 110)),
+            Stroke::new(0.7_f32, Color32::from_rgba_unmultiplied(255, 60, 60, 110)),
         );
         painter.line_segment(
             [pos2(cx, wf_rect.top()), pos2(cx, wf_rect.bottom())],
-            Stroke::new(0.7, Color32::from_rgba_unmultiplied(255, 60, 60, 110)),
+            Stroke::new(0.7_f32, Color32::from_rgba_unmultiplied(255, 60, 60, 110)),
         );
 
         // Click-to-tune: map x-position in the spectrum pane to frequency.
@@ -2272,8 +2332,7 @@ impl DockViewer<'_> {
             if let Some(pos) = panel_resp.interact_pointer_pos() {
                 if spec_rect.contains(pos) && sample_rate > 1.0 {
                     let t = ((pos.x - spec_rect.left()) / spec_rect.width()).clamp(0.0, 1.0);
-                    let clicked_mhz =
-                        center_mhz - half_span_mhz + (t as f64) * 2.0 * half_span_mhz;
+                    let clicked_mhz = center_mhz - half_span_mhz + (t as f64) * 2.0 * half_span_mhz;
                     self.commands.push(UiCommand::TuneMhz(clicked_mhz as f32));
                 }
             }
@@ -2282,7 +2341,8 @@ impl DockViewer<'_> {
         // Keep repainting while the panel is on screen so we get smooth
         // waterfall scroll even when no other UI is animating.
         if self.app_state.is_streaming {
-            ui.ctx().request_repaint_after(std::time::Duration::from_millis(33));
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(33));
         }
     }
 
@@ -2516,9 +2576,7 @@ impl DockViewer<'_> {
                     for name in &self.app_state.sdr_antennas {
                         if ui
                             .selectable_label(*name == active, name)
-                            .on_hover_text(
-                                "Switching antennas briefly restarts the stream.",
-                            )
+                            .on_hover_text("Switching antennas briefly restarts the stream.")
                             .clicked()
                         {
                             new_antenna = Some(name.clone());
@@ -2623,13 +2681,17 @@ impl DockViewer<'_> {
                 );
             });
         if analog_fallback_mode != self.app_state.analog_fallback_mode {
-            self.commands.push(UiCommand::SetAnalogFallbackMode(analog_fallback_mode));
+            self.commands
+                .push(UiCommand::SetAnalogFallbackMode(analog_fallback_mode));
         }
         if analog_fallback_stereo != self.app_state.analog_fallback_stereo {
-            self.commands.push(UiCommand::SetAnalogFallbackStereo(analog_fallback_stereo));
+            self.commands
+                .push(UiCommand::SetAnalogFallbackStereo(analog_fallback_stereo));
         }
         if analog_fallback_rds_enabled != self.app_state.analog_fallback_rds_enabled {
-            self.commands.push(UiCommand::SetAnalogFallbackRdsEnabled(analog_fallback_rds_enabled));
+            self.commands.push(UiCommand::SetAnalogFallbackRdsEnabled(
+                analog_fallback_rds_enabled,
+            ));
         }
         ui.separator();
         ui.label(
@@ -2646,8 +2708,9 @@ impl DockViewer<'_> {
 
     /// QPSK "scope" panel — animated scatter of synthesized symbol samples
     /// that visually tightens or fuzzes based on per-sideband MER reported
-    /// by nrsc5. Lower-sideband MER governs the spread of samples on the
-    /// left half of the plot; upper-sideband MER governs the right half.
+    /// by nrsc5. For FM, NRSC-5 defines sidebands with an inverted RF
+    /// spectrum relationship, so upper-sideband MER is rendered on the
+    /// left half and lower-sideband MER on the right half.
     ///
     /// Note: these samples are *generated* from MER, not captured from the
     /// real demodulator — nrsc5 doesn't expose post-equalizer symbol data
@@ -2667,7 +2730,11 @@ impl DockViewer<'_> {
         } else {
             Color32::from_rgb(200, 70, 70)
         };
-        let lock_text = if synced { "\u{25CF} LOCK" } else { "\u{25CB} no lock" };
+        let lock_text = if synced {
+            "\u{25CF} LOCK"
+        } else {
+            "\u{25CB} no lock"
+        };
 
         ui.add_space(2.0);
         ui.horizontal(|ui| {
@@ -2675,8 +2742,8 @@ impl DockViewer<'_> {
             ui.add_space(8.0);
             ui.label(
                 RichText::new(format!(
-                    "MER  L {:>5.1} dB   U {:>5.1} dB",
-                    self.app_state.mer_lower, self.app_state.mer_upper,
+                    "MER  Left(U) {:>5.1} dB   Right(L) {:>5.1} dB",
+                    self.app_state.mer_upper, self.app_state.mer_lower,
                 ))
                 .monospace()
                 .color(dim),
@@ -2687,8 +2754,7 @@ impl DockViewer<'_> {
         // Allocate a square viewport — constellations only look right at 1:1.
         let avail = ui.available_size();
         let side = avail.x.min(avail.y).max(80.0);
-        let (rect, _resp) =
-            ui.allocate_exact_size(Vec2::new(side, side), egui::Sense::hover());
+        let (rect, _resp) = ui.allocate_exact_size(Vec2::new(side, side), egui::Sense::hover());
         let painter = ui.painter_at(rect);
 
         // Dark "oscilloscope" backdrop, independent of light/dark theme so the
@@ -2711,20 +2777,20 @@ impl DockViewer<'_> {
         for &v in &[-1.0f32, 1.0] {
             painter.line_segment(
                 [to_screen(v, -1.5), to_screen(v, 1.5)],
-                egui::Stroke::new(0.5, grid),
+                egui::Stroke::new(0.5_f32, grid),
             );
             painter.line_segment(
                 [to_screen(-1.5, v), to_screen(1.5, v)],
-                egui::Stroke::new(0.5, grid),
+                egui::Stroke::new(0.5_f32, grid),
             );
         }
         painter.line_segment(
             [to_screen(0.0, -1.5), to_screen(0.0, 1.5)],
-            egui::Stroke::new(0.8, axis),
+            egui::Stroke::new(0.8_f32, axis),
         );
         painter.line_segment(
             [to_screen(-1.5, 0.0), to_screen(1.5, 0.0)],
-            egui::Stroke::new(0.8, axis),
+            egui::Stroke::new(0.8_f32, axis),
         );
 
         // Crosshairs at the four ideal QPSK symbol locations.
@@ -2734,11 +2800,11 @@ impl DockViewer<'_> {
                 let c = to_screen(sx, sy);
                 painter.line_segment(
                     [c - egui::vec2(5.0, 0.0), c + egui::vec2(5.0, 0.0)],
-                    egui::Stroke::new(1.0, target),
+                    egui::Stroke::new(1.0_f32, target),
                 );
                 painter.line_segment(
                     [c - egui::vec2(0.0, 5.0), c + egui::vec2(0.0, 5.0)],
-                    egui::Stroke::new(1.0, target),
+                    egui::Stroke::new(1.0_f32, target),
                 );
             }
         }
@@ -2782,22 +2848,21 @@ impl DockViewer<'_> {
             st.constellation_sigma_l = sigma_l_target;
             st.constellation_sigma_u = sigma_u_target;
         } else {
-            st.constellation_sigma_l +=
-                (sigma_l_target - st.constellation_sigma_l) * 0.08;
-            st.constellation_sigma_u +=
-                (sigma_u_target - st.constellation_sigma_u) * 0.08;
+            st.constellation_sigma_l += (sigma_l_target - st.constellation_sigma_l) * 0.08;
+            st.constellation_sigma_u += (sigma_u_target - st.constellation_sigma_u) * 0.08;
         }
         let sigma_l = st.constellation_sigma_l;
         let sigma_u = st.constellation_sigma_u;
 
         // Push fresh samples. Bits 0/1 of the RNG word pick which QPSK
         // symbol; Gaussian noise from box_muller is scaled by the σ for
-        // whichever sideband that symbol falls into.
+        // whichever sideband that symbol falls into. Left half uses upper
+        // MER and right half uses lower MER to match FM NRSC-5 semantics.
         for _ in 0..NEW_PER_FRAME {
             let bits = xorshift64(&mut st.constellation_rng);
             let bx = if (bits & 1) == 0 { -1.0_f32 } else { 1.0 };
             let by = if (bits & 2) == 0 { -1.0_f32 } else { 1.0 };
-            let sigma = if bx < 0.0 { sigma_l } else { sigma_u };
+            let sigma = if bx < 0.0 { sigma_u } else { sigma_l };
             let nx = box_muller(&mut st.constellation_rng) * sigma;
             let ny = box_muller(&mut st.constellation_rng) * sigma;
             let idx = st.constellation_head;
@@ -2851,11 +2916,9 @@ impl DockViewer<'_> {
         if tiles.is_empty() {
             ui.centered_and_justified(|ui| {
                 ui.label(
-                    RichText::new(
-                        "Album art will appear here as the station plays songs.",
-                    )
-                    .color(dim)
-                    .italics(),
+                    RichText::new("Album art will appear here as the station plays songs.")
+                        .color(dim)
+                        .italics(),
                 );
             });
             return;
@@ -2874,10 +2937,7 @@ impl DockViewer<'_> {
                 } else {
                     format!("last {hours}h{mins:02}m")
                 };
-                format!(
-                    "{span} \u{2022} {} unique covers (rolling)",
-                    tiles.len()
-                )
+                format!("{span} \u{2022} {} unique covers (rolling)", tiles.len())
             }
             None => format!("{} covers", tiles.len()),
         };
@@ -2930,8 +2990,7 @@ impl DockViewer<'_> {
 
         // Allocate the rest of the tab for the treemap.
         let avail = ui.available_size();
-        let (rect, _resp) =
-            ui.allocate_exact_size(avail, egui::Sense::hover());
+        let (rect, _resp) = ui.allocate_exact_size(avail, egui::Sense::hover());
 
         let weights: Vec<(f64, String)> = tiles
             .iter()
@@ -2939,9 +2998,7 @@ impl DockViewer<'_> {
             .collect();
         let placements = square_grid_pack(&weights, rect);
 
-        for ((tile_rect, _placement_path), tile) in
-            placements.into_iter().zip(tiles.iter())
-        {
+        for ((tile_rect, _placement_path), tile) in placements.into_iter().zip(tiles.iter()) {
             let path = &tile.path;
             // Paint into the full treemap cell with no inter-tile gap so
             // covers butt right up against each other. Album art is 1:1, so
@@ -2956,17 +3013,11 @@ impl DockViewer<'_> {
             let uv = if aspect >= 1.0 {
                 // Cell wider than tall: trim top/bottom of the square cover.
                 let crop = (1.0 - 1.0 / aspect) * 0.5;
-                egui::Rect::from_min_max(
-                    egui::pos2(0.0, crop),
-                    egui::pos2(1.0, 1.0 - crop),
-                )
+                egui::Rect::from_min_max(egui::pos2(0.0, crop), egui::pos2(1.0, 1.0 - crop))
             } else {
                 // Cell taller than wide: trim left/right of the square cover.
                 let crop = (1.0 - aspect) * 0.5;
-                egui::Rect::from_min_max(
-                    egui::pos2(crop, 0.0),
-                    egui::pos2(1.0 - crop, 1.0),
-                )
+                egui::Rect::from_min_max(egui::pos2(crop, 0.0), egui::pos2(1.0 - crop, 1.0))
             };
             let uri = format!("file:///{}", path.replace('\\', "/"));
             // Use a real clickable Image widget (with a stable per-path ID)
@@ -3015,7 +3066,9 @@ impl DockViewer<'_> {
                     }
                     for (title, artist) in &songs {
                         let line = match (title.is_empty(), artist.is_empty()) {
-                            (false, false) => format!("\u{201c}{}\u{201d} \u{2014} {}", title, artist),
+                            (false, false) => {
+                                format!("\u{201c}{}\u{201d} \u{2014} {}", title, artist)
+                            }
                             (false, true) => format!("\u{201c}{}\u{201d}", title),
                             (true, false) => artist.clone(),
                             (true, true) => continue,
@@ -3052,22 +3105,21 @@ impl DockViewer<'_> {
                 .menu_button(
                     RichText::new(&menu_label).color(Color32::from_gray(140)),
                     |ui| {
-                        ui.label(
-                            RichText::new("Rolling window")
-                                .strong()
-                                .small(),
-                        );
+                        ui.label(RichText::new("Rolling window").strong().small());
                         ui.separator();
                         for &hours in crate::play_log::RETENTION_CHOICES {
                             let label = format!(
                                 "{}{}",
-                                if hours == cur_hours { "\u{2714} " } else { "  " },
+                                if hours == cur_hours {
+                                    "\u{2714} "
+                                } else {
+                                    "  "
+                                },
                                 format_retention(hours),
                             );
                             if ui.button(label).clicked() {
                                 if hours != cur_hours {
-                                    self.commands
-                                        .push(UiCommand::SetPlayLogRetention(hours));
+                                    self.commands.push(UiCommand::SetPlayLogRetention(hours));
                                 }
                                 ui.close();
                             }
@@ -3088,10 +3140,7 @@ impl DockViewer<'_> {
                 self.commands.push(UiCommand::ExportLogCsv);
             }
             let clear_enabled = !self.play_log.is_empty();
-            let clear_resp = ui.add_enabled(
-                clear_enabled,
-                egui::Button::new("\u{1F5D1} Clear"),
-            );
+            let clear_resp = ui.add_enabled(clear_enabled, egui::Button::new("\u{1F5D1} Clear"));
             let clear_resp = clear_resp.on_hover_text(
                 "Drop every entry from the play log. The on-disk \
                  file is rewritten to an empty log immediately.",
@@ -3112,10 +3161,7 @@ impl DockViewer<'_> {
         if self.play_log.is_empty() {
             ui.vertical_centered(|ui| {
                 ui.add_space(40.0);
-                ui.label(
-                    RichText::new("No plays logged yet.")
-                        .color(Color32::from_gray(180)),
-                );
+                ui.label(RichText::new("No plays logged yet.").color(Color32::from_gray(180)));
                 ui.add_space(8.0);
                 ui.label(
                     RichText::new(
@@ -3307,7 +3353,7 @@ fn fit_map_size(tex_size: Vec2, available: Vec2) -> Vec2 {
         return Vec2::ZERO;
     }
     let fit = (available.x / tex_size.x).min(available.y / tex_size.y);
-    let scale = fit.min(MAP_MAX_UPSCALE).max(0.0);
+    let scale = fit.clamp(0.0, MAP_MAX_UPSCALE);
     tex_size * scale
 }
 
@@ -3315,7 +3361,7 @@ fn fit_map_size(tex_size: Vec2, available: Vec2) -> Vec2 {
 /// (`6h`, `24h`, `7d`). Used by the log header and its dropdown so the
 /// visible value and the menu items stay in sync.
 fn format_retention(hours: u32) -> String {
-    if hours >= 24 && hours % 24 == 0 {
+    if hours >= 24 && hours.is_multiple_of(24) {
         let days = hours / 24;
         format!("{days}d")
     } else {
@@ -3350,12 +3396,12 @@ fn turbo_colormap(v: u8) -> Color32 {
     // 6-stop gradient: black → deep blue → cyan → yellow → red → white.
     // Tuned to match the SDR# / Gqrx "waterfall" feel the user asked for.
     const STOPS: [(u8, u8, u8); 6] = [
-        (0, 0, 16),     // near-black at floor
-        (32, 60, 160),  // deep blue
-        (40, 200, 220), // cyan
-        (240, 220, 60), // yellow
-        (240, 80, 40),  // red-orange
-        (255, 240, 220),// near-white at ceiling
+        (0, 0, 16),      // near-black at floor
+        (32, 60, 160),   // deep blue
+        (40, 200, 220),  // cyan
+        (240, 220, 60),  // yellow
+        (240, 80, 40),   // red-orange
+        (255, 240, 220), // near-white at ceiling
     ];
     let t = v as f32 / 255.0;
     let n = STOPS.len() - 1;
@@ -3364,9 +3410,7 @@ fn turbo_colormap(v: u8) -> Color32 {
     let frac = scaled - idx as f32;
     let (r0, g0, b0) = STOPS[idx];
     let (r1, g1, b1) = STOPS[idx + 1];
-    let mix = |a: u8, b: u8| -> u8 {
-        (a as f32 + (b as f32 - a as f32) * frac).round() as u8
-    };
+    let mix = |a: u8, b: u8| -> u8 { (a as f32 + (b as f32 - a as f32) * frac).round() as u8 };
     Color32::from_rgb(mix(r0, r1), mix(g0, g1), mix(b0, b1))
 }
 
@@ -3408,10 +3452,7 @@ fn signal_badge(ui: &mut Ui, label: &str, value: &str, color: Color32) {
 /// the caller can keep pairing placements with its own ordered tile list.
 /// Tiles that didn't fit are returned with a zero-sized rect; the caller
 /// already skips anything below an 8px minimum.
-fn square_grid_pack(
-    items: &[(f64, String)],
-    rect: egui::Rect,
-) -> Vec<(egui::Rect, String)> {
+fn square_grid_pack(items: &[(f64, String)], rect: egui::Rect) -> Vec<(egui::Rect, String)> {
     let n = items.len();
     if n == 0 || rect.width() <= 0.0 || rect.height() <= 0.0 {
         return Vec::new();
@@ -3491,10 +3532,8 @@ fn square_grid_pack(
     }
 
     let mut occupied = vec![vec![false; rows]; cols];
-    let mut placement_rects: Vec<egui::Rect> = vec![
-        egui::Rect::from_min_size(egui::Pos2::ZERO, egui::Vec2::ZERO);
-        n
-    ];
+    let mut placement_rects: Vec<egui::Rect> =
+        vec![egui::Rect::from_min_size(egui::Pos2::ZERO, egui::Vec2::ZERO); n];
 
     let mut pack_order: Vec<usize> = (0..n).collect();
     pack_order.sort_by(|&a, &b| sizes[b].cmp(&sizes[a]));
@@ -3540,10 +3579,7 @@ fn square_grid_pack(
                 occupied[c0 + dx][r0 + dy] = true;
             }
         }
-        let min = egui::pos2(
-            rect.min.x + c0 as f32 * cell,
-            rect.min.y + r0 as f32 * cell,
-        );
+        let min = egui::pos2(rect.min.x + c0 as f32 * cell, rect.min.y + r0 as f32 * cell);
         let size = egui::vec2(s as f32 * cell, s as f32 * cell);
         placement_rects[i] = egui::Rect::from_min_size(min, size);
     }
@@ -3562,10 +3598,7 @@ fn square_grid_pack(
 /// to 1:1 as possible. This is what makes the album-art tiles "look right"
 /// instead of getting stretched into skinny strips.
 #[allow(dead_code)]
-fn squarified_treemap(
-    items: &[(f64, String)],
-    rect: egui::Rect,
-) -> Vec<(egui::Rect, String)> {
+fn squarified_treemap(items: &[(f64, String)], rect: egui::Rect) -> Vec<(egui::Rect, String)> {
     if items.is_empty() || rect.width() <= 0.0 || rect.height() <= 0.0 {
         return Vec::new();
     }
@@ -3648,10 +3681,7 @@ fn worst_ratio(row: &[(f64, String)], w: f64) -> f64 {
 /// Place a completed row of `(area, payload)` items inside `rect`, returning
 /// the placed rectangles and the remaining area for the next row.
 #[allow(dead_code)]
-fn layout_row(
-    row: &[(f64, String)],
-    rect: egui::Rect,
-) -> (Vec<(egui::Rect, String)>, egui::Rect) {
+fn layout_row(row: &[(f64, String)], rect: egui::Rect) -> (Vec<(egui::Rect, String)>, egui::Rect) {
     let sum: f64 = row.iter().map(|(a, _)| *a).sum();
     let w = rect.width() as f64;
     let h = rect.height() as f64;
@@ -3669,10 +3699,8 @@ fn layout_row(
             placed.push((r, p.clone()));
             y += item_h;
         }
-        let new_remaining = egui::Rect::from_min_max(
-            egui::pos2(rect.min.x + row_w as f32, rect.min.y),
-            rect.max,
-        );
+        let new_remaining =
+            egui::Rect::from_min_max(egui::pos2(rect.min.x + row_w as f32, rect.min.y), rect.max);
         (placed, new_remaining)
     } else {
         // Lay out horizontally on top, row occupies height = sum / w.
@@ -3687,10 +3715,8 @@ fn layout_row(
             placed.push((r, p.clone()));
             x += item_w;
         }
-        let new_remaining = egui::Rect::from_min_max(
-            egui::pos2(rect.min.x, rect.min.y + row_h as f32),
-            rect.max,
-        );
+        let new_remaining =
+            egui::Rect::from_min_max(egui::pos2(rect.min.x, rect.min.y + row_h as f32), rect.max);
         (placed, new_remaining)
     }
 }

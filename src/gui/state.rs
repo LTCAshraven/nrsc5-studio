@@ -331,6 +331,10 @@ pub struct AppState {
     /// Reusable snapshot buffer for the Spectrum panel so it doesn't
     /// allocate on every paint.
     pub spectrum_snapshot: SpectrumSnapshot,
+    /// Whether spectrum-line smoothing is enabled in the UI.
+    pub spectrum_smoothing_enabled: bool,
+    /// Spectrum-line smoothing EMA alpha. 1.0 = no smoothing.
+    pub spectrum_smoothing_alpha: f32,
     /// Last generation drawn into `spectrum_texture`. Used to skip the
     /// per-frame texture re-upload when nothing has changed.
     pub spectrum_last_drawn_generation: u64,

@@ -144,7 +144,11 @@ pub fn legacy_config_path() -> Option<PathBuf> {
     if is_portable() {
         return None;
     }
-    Some(dirs::config_dir()?.join("nrsc5-tui-rust").join("config.toml"))
+    Some(
+        dirs::config_dir()?
+            .join("nrsc5-tui-rust")
+            .join("config.toml"),
+    )
 }
 
 /// Directory for cached album-art images and their manifest.

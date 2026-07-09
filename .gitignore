@@ -50,6 +50,11 @@ nrsc5-*.log
 # Personal planning notes (kept local, not in the public repo) ----------
 *.private.md
 
+# Scratch output of the Ctrl+Shift+D dock-layout capture helper. The
+# curated copy lives at res/default-layout.ron (baked into the binary via
+# include_str!); this root-level dump is a throwaway working file.
+/dock-layout-dump.ron
+
 # Dev-only one-shot screenshot helper (mocks the album-art cache) -------
 scripts/seed-collage-mock.ps1
 

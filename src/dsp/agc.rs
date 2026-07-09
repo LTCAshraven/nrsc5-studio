@@ -498,15 +498,12 @@ impl AgcController {
                 // Saturate at u32::MAX so a no-decision stream doesn't
                 // wrap around (it'd take ~33 years at 4 Hz, but
                 // saturating is free and explicit).
-                self.mer_samples_since_change =
-                    self.mer_samples_since_change.saturating_add(1);
+                self.mer_samples_since_change = self.mer_samples_since_change.saturating_add(1);
                 // v0.6.0: drive the MerQualityCheck countdown so the
                 // amplitude-pre-stage handoff fires after `n` MER
                 // frames at the amplitude winner, regardless of how
                 // often the driver calls `tick`.
-                if self.phase == SearchPhase::MerQualityCheck
-                    && self.mer_check_remaining > 0
-                {
+                if self.phase == SearchPhase::MerQualityCheck && self.mer_check_remaining > 0 {
                     self.mer_check_remaining -= 1;
                 }
             }
@@ -543,9 +540,8 @@ impl AgcController {
         // off to Fine seeded from the amplitude-probe winner.
         if self.phase == SearchPhase::MerQualityCheck {
             let elapsed = self.last_change_at.elapsed();
-            let samples_ok =
-                self.mer_samples_since_change >= self.cfg.min_mer_samples_post_change
-                    && self.mer_check_remaining == 0;
+            let samples_ok = self.mer_samples_since_change >= self.cfg.min_mer_samples_post_change
+                && self.mer_check_remaining == 0;
             let timeout_ok = elapsed >= self.cfg.probe_period;
             if !samples_ok && !timeout_ok {
                 return None;
@@ -616,8 +612,7 @@ impl AgcController {
         // soft ceiling. Tests zero both knobs and drive synthetic
         // events to get deterministic single-tick decisions.
         let elapsed = self.last_change_at.elapsed();
-        let samples_ok =
-            self.mer_samples_since_change >= self.cfg.min_mer_samples_post_change;
+        let samples_ok = self.mer_samples_since_change >= self.cfg.min_mer_samples_post_change;
         let timeout_ok = elapsed >= self.cfg.probe_period;
         if !samples_ok && !timeout_ok {
             return None;
@@ -674,10 +669,8 @@ impl AgcController {
         // -- 2. Target hit? -------------------------------------------
         if let Some(e) = current_ema {
             if e >= self.cfg.mer_target_db {
-                self.last_reason = format!(
-                    "ema {:.2} dB >= target {:.1} dB",
-                    e, self.cfg.mer_target_db
-                );
+                self.last_reason =
+                    format!("ema {:.2} dB >= target {:.1} dB", e, self.cfg.mer_target_db);
                 self.status = AgcStatus::Settled;
                 self.phase = SearchPhase::Done;
                 return None;
@@ -992,7 +985,11 @@ impl AgcController {
             self.best_mer_seen = f32::NEG_INFINITY;
             self.explored.clear();
             self.probes_without_improvement = 0;
-            self.last_dir = if self.cfg.initial_direction >= 1 { 1 } else { -1 };
+            self.last_dir = if self.cfg.initial_direction >= 1 {
+                1
+            } else {
+                -1
+            };
             self.last_reason = format!(
                 "amp-probe: every gain above target {:.1} dBFS; aborting amp \
                  pre-stage and seeding {} from idx {} ({:.1} dB)",
@@ -1059,7 +1056,7 @@ impl AgcController {
         // Otherwise pick the next midpoint. Bias high: round the
         // midpoint up so a 2-element window probes the upper element,
         // matching our "highest safe gain wins" rule.
-        let mid = self.amp_lo + (self.amp_hi - self.amp_lo + 1) / 2;
+        let mid = self.amp_lo + (self.amp_hi - self.amp_lo).div_ceil(2);
         let mid_tenths = self.table[mid];
         self.amp_probing = Some(mid);
         self.gain_idx = mid;
@@ -1164,7 +1161,10 @@ mod tests {
     fn settles_immediately_when_initial_gain_is_good() {
         let mut agc = AgcController::new(R820T_GAINS_TENTHS, cfg_fast());
         let initial = agc.initial_action();
-        assert_eq!(initial.new_tenths, R820T_GAINS_TENTHS[nearest_idx(R820T_GAINS_TENTHS, 197)]);
+        assert_eq!(
+            initial.new_tenths,
+            R820T_GAINS_TENTHS[nearest_idx(R820T_GAINS_TENTHS, 197)]
+        );
         let action = drive(&mut agc, 12.5);
         assert!(action.is_none(), "expected settle, got step");
         assert_eq!(agc.snapshot().status, AgcStatus::Settled);
@@ -1204,7 +1204,10 @@ mod tests {
                 return;
             }
         }
-        panic!("expected BAIL after budget exhausted, status = {:?}", agc.snapshot().status);
+        panic!(
+            "expected BAIL after budget exhausted, status = {:?}",
+            agc.snapshot().status
+        );
     }
 
     #[test]
@@ -1274,7 +1277,8 @@ mod tests {
         for &want_idx in &expected_idx {
             let action = drive(&mut agc, 4.0).expect("expected a coarse-step action");
             assert_eq!(
-                action.new_idx, want_idx,
+                action.new_idx,
+                want_idx,
                 "coarse probe order broken; phase = {:?}",
                 agc.snapshot().phase
             );
@@ -1285,8 +1289,7 @@ mod tests {
         // already equals best_gain_idx).
         let _next = drive(&mut agc, 4.0);
         assert!(
-            agc.snapshot().phase == SearchPhase::Fine
-                || agc.snapshot().phase == SearchPhase::Done,
+            agc.snapshot().phase == SearchPhase::Fine || agc.snapshot().phase == SearchPhase::Done,
             "expected Fine or Done after coarse exhausted, got {:?}",
             agc.snapshot().phase
         );
@@ -1417,13 +1420,19 @@ mod tests {
 
         // 3 samples → still not enough.
         for _ in 0..3 {
-            agc.on_event(&NrscEvent::Mer { lower: 8.0, upper: 8.0 });
+            agc.on_event(&NrscEvent::Mer {
+                lower: 8.0,
+                upper: 8.0,
+            });
         }
         assert!(agc.tick().is_none(), "tick fired with only 3 samples");
 
         // 4th sample → gate opens, tick can now decide (and will, since
         // EMA ≈ 8.0 is below cfg_fast's 10 dB target — so it steps).
-        agc.on_event(&NrscEvent::Mer { lower: 8.0, upper: 8.0 });
+        agc.on_event(&NrscEvent::Mer {
+            lower: 8.0,
+            upper: 8.0,
+        });
         // 4 samples is enough; the controller has a real EMA reading
         // and will either step or settle. Either way it's not None.
         let snap_before = agc.snapshot();
@@ -1497,10 +1506,7 @@ mod tests {
         // from_cache=false so the UI suffix logic is correct on misses.
         let agc = AgcController::new(R820T_GAINS_TENTHS, cfg_fast());
         let snap = agc.snapshot();
-        assert!(
-            !snap.from_cache,
-            "default cfg must report from_cache=false"
-        );
+        assert!(!snap.from_cache, "default cfg must report from_cache=false");
     }
 
     #[test]
@@ -1599,7 +1605,11 @@ mod tests {
         let mut last_idx = None;
         for probe_num in 0..10 {
             let measurement = last_idx.map(|idx: usize| {
-                if idx <= 18 { -25.0 } else { -10.0 } // -25 = safe, -10 = hot (target -20)
+                if idx <= 18 {
+                    -25.0
+                } else {
+                    -10.0
+                } // -25 = safe, -10 = hot (target -20)
             });
             let action = agc.tick_amp(measurement);
             if agc.snapshot().phase == SearchPhase::MerQualityCheck {

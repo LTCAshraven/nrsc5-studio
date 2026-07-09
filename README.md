@@ -12,7 +12,7 @@ A native Windows and Linux desktop app for listening to **HD Radio** broadcasts 
 ![Forks](https://img.shields.io/github/forks/LTCAshraven/nrsc5-studio?style=flat-square)
 ![Watchers](https://img.shields.io/github/watchers/LTCAshraven/nrsc5-studio?style=flat-square)
 
-![Version](https://img.shields.io/badge/version-0.6.3-blue?style=flat-square)
+![Version](https://img.shields.io/badge/version-0.6.5-blue?style=flat-square)
 ![License](https://img.shields.io/badge/license-GPL--3.0-green?style=flat-square)
 ![Platform](https://img.shields.io/badge/platform-windows%20%7C%20linux-lightgrey?style=flat-square)
 

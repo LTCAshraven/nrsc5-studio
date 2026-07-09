@@ -141,9 +141,7 @@ fn fill_polygon(img: &mut RgbaImage, pts: &[(f32, f32)], color: [u8; 4]) {
                 break;
             }
             let x_start = pair[0].max(0.0).floor() as i32;
-            let x_end = pair[1]
-                .min((img.width() - 1) as f32)
-                .ceil() as i32;
+            let x_end = pair[1].min((img.width() - 1) as f32).ceil() as i32;
             if y < 0 || y >= img.height() as i32 {
                 continue;
             }
@@ -180,6 +178,10 @@ fn fill_circle(img: &mut RgbaImage, cx: f32, cy: f32, r: f32, color: [u8; 4]) {
 /// within `±thickness/2` of `r` *and* whose angle falls inside
 /// `[start_rad, end_rad]` (measured with `atan2(dy, dx)` in image space) is
 /// painted with `color`.
+// Geometry primitive: the eight scalars (center, radius, thickness, angle
+// span, color) are all intrinsic parameters of an arc band; bundling them
+// into a struct would add indirection without clarifying the call sites.
+#[allow(clippy::too_many_arguments)]
 fn draw_arc_band(
     img: &mut RgbaImage,
     cx: f32,

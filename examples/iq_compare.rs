@@ -26,7 +26,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use num_complex::Complex32;
-use rustfft::{FftPlanner, num_complex::Complex as FftComplex};
+use rustfft::{num_complex::Complex as FftComplex, FftPlanner};
 
 const FFT_SIZE: usize = 65536;
 const SAMPLE_RATE_HZ: f64 = 1_488_375.0;
@@ -121,10 +121,7 @@ fn main() -> ExitCode {
             "  Noise floor within ±3 dB ({:+.2} dB)",
             stats_a.noise_floor_db - stats_b.noise_floor_db
         );
-        println!(
-            "  RMS ratio within ±20% ({:.3}×)",
-            rms_ratio
-        );
+        println!("  RMS ratio within ±20% ({:.3}×)", rms_ratio);
         println!(
             "  DC offset within ±0.05 mag ({:+.4})",
             stats_a.dc_magnitude - stats_b.dc_magnitude
@@ -144,10 +141,7 @@ fn main() -> ExitCode {
             );
         }
         if !rms_ok {
-            println!(
-                "  RMS ratio {:.3}× outside tolerance 0.8–1.25",
-                rms_ratio
-            );
+            println!("  RMS ratio {:.3}× outside tolerance 0.8–1.25", rms_ratio);
         }
         if !dc_ok {
             println!(
@@ -172,7 +166,10 @@ fn print_stats(s: &Stats) {
         s.peak_bin, s.peak_offset_hz
     );
     println!("  Peak level         : {:.2} dB", s.peak_db);
-    println!("  Noise floor        : {:.2} dB (median of magnitude spectrum)", s.noise_floor_db);
+    println!(
+        "  Noise floor        : {:.2} dB (median of magnitude spectrum)",
+        s.noise_floor_db
+    );
     println!("  SNR (peak − floor) : {:.2} dB", s.snr_db);
 }
 
@@ -191,7 +188,10 @@ fn analyze(path: &Path) -> std::io::Result<Stats> {
     if n_samples < FFT_SIZE {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("file too short: {} samples (need ≥ {})", n_samples, FFT_SIZE),
+            format!(
+                "file too short: {} samples (need ≥ {})",
+                n_samples, FFT_SIZE
+            ),
         ));
     }
     let iq: Vec<Complex32> = (0..n_samples)
@@ -224,6 +224,8 @@ fn analyze(path: &Path) -> std::io::Result<Stats> {
     // Magnitude spectrum, fftshift'd so bin 0 = -Fs/2 and bin N-1 = +Fs/2.
     let half = FFT_SIZE / 2;
     let mut mag = vec![0f32; FFT_SIZE];
+    #[allow(clippy::needless_range_loop)]
+    // k drives an fftshift index remap, not a straight iteration
     for k in 0..FFT_SIZE {
         // unshifted: bins 0..N/2 are positive freqs, N/2..N are negative.
         // We want centered: shifted_bin = (k + N/2) mod N.

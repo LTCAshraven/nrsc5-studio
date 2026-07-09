@@ -168,13 +168,7 @@ pub fn device_count() -> Option<u32> {
 /// rather than re-exported because this presence probe runs every 2 s and
 /// we want it to stay independent of the full enumeration code path.
 const SOAPY_SUPPORTED_DRIVERS: &[&str] = &[
-    "rtlsdr",
-    "sdrplay",
-    "airspy",
-    "hackrf",
-    "lime",
-    "plutosdr",
-    "remote",
+    "rtlsdr", "sdrplay", "airspy", "hackrf", "lime", "plutosdr", "remote",
 ];
 
 /// Returns the number of SDRs visible to libSoapySDR whose driver is in

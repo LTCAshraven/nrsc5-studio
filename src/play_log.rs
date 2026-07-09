@@ -145,11 +145,7 @@ impl PlayLog {
         // song 100 ms after HD1 would silently be dropped by the rate
         // limit, and an identical title across two programs would dedup
         // even though they're distinct plays.
-        let same_program_recent = self
-            .entries
-            .iter()
-            .rev()
-            .find(|e| e.program == program);
+        let same_program_recent = self.entries.iter().rev().find(|e| e.program == program);
         if let Some(last) = same_program_recent {
             if last.title == title && last.artist == artist {
                 return false;
@@ -201,7 +197,9 @@ impl PlayLog {
     /// Persist atomically (tmp + rename). Failure is non-fatal — the log
     /// keeps working in memory.
     pub fn save(&self) {
-        let Some(path) = crate::paths::play_log_path() else { return };
+        let Some(path) = crate::paths::play_log_path() else {
+            return;
+        };
         let Some(parent) = path.parent() else { return };
         if fs::create_dir_all(parent).is_err() {
             return;
@@ -359,7 +357,11 @@ mod tests {
     #[test]
     fn ignores_very_short_call_signs() {
         // A 2-letter "call sign" would match too much (e.g. "I" inside titles).
-        assert!(!is_likely_station_string("It's a Long Way to the Top", "AB", 99.9));
+        assert!(!is_likely_station_string(
+            "It's a Long Way to the Top",
+            "AB",
+            99.9
+        ));
     }
 
     #[test]
@@ -377,27 +379,13 @@ mod tests {
         // NOT be rate-limited or deduped (different program).
         assert!(log.try_push(t0 + 100, "Song A", "Artist 1", 100.3, 1, "KEXP"));
         // Same program + same title = duplicate, rejected.
-        assert!(!log.try_push(
-            t0 + 10_000,
-            "Song A",
-            "Artist 1",
-            100.3,
-            0,
-            "KEXP",
-        ));
+        assert!(!log.try_push(t0 + 10_000, "Song A", "Artist 1", 100.3, 0, "KEXP",));
         // Same program + different title within the rate-limit window
         // = also rejected (rate limit applies per-program).
         assert!(!log.try_push(t0 + 200, "Song B", "Artist 2", 100.3, 0, "KEXP"));
         // Different program + different title within rate-limit window
         // = accepted (per-program rate limit). HD2's last entry was at
         // t0 + 100 so this push needs to clear HD2's own 30s window.
-        assert!(log.try_push(
-            t0 + 31_000,
-            "Song C",
-            "Artist 3",
-            100.3,
-            1,
-            "KEXP",
-        ));
+        assert!(log.try_push(t0 + 31_000, "Song C", "Artist 3", 100.3, 1, "KEXP",));
     }
 }

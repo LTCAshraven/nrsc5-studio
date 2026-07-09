@@ -1,0 +1,124 @@
+name: CI
+
+# Continuous integration for NRSC5 Studio.
+#
+# The Windows build is the project's primary target, but it depends on a
+# bundled llvm-mingw toolchain plus an MSYS2 install with hardcoded
+# `C:\msys64\...` pkg-config / libclang paths (see .cargo/config.toml),
+# which is impractical to reproduce on a GitHub-hosted runner. CI therefore
+# gates on the Linux toolchain, which builds the same Rust source against a
+# self-contained `libnrsc5.so` produced by scripts/build-nrsc5-linux.sh.
+# rustfmt runs everywhere (no native deps); clippy + the test suite run on
+# Linux once the native dependencies and the decoder library are in place.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel superseded runs on the same ref so a rapid push sequence doesn't
+# queue redundant CI.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Bump to force a rebuild of the cached libnrsc5.so independent of the
+  # build-script hash (e.g. when the upstream tag default changes).
+  NRSC5_CACHE_EPOCH: v1
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable toolchain (rustfmt)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+  # Dependency audit: checks the Rust crate graph against the RustSec
+  # advisory database (the same data cargo-audit uses) and enforces the
+  # license / source / ban policy in deny.toml. Reads crate metadata only,
+  # so it needs no native dependencies and runs fast.
+  cargo-deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run cargo-deny
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          arguments: all
+
+  lint-and-test:
+    name: clippy + test (linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            pkg-config \
+            git \
+            clang \
+            libclang-dev \
+            cmake \
+            autoconf \
+            automake \
+            libtool \
+            patchelf \
+            libsoapysdr-dev \
+            librtlsdr-dev \
+            libusb-1.0-0-dev \
+            libasound2-dev \
+            libwayland-dev \
+            libxkbcommon-dev \
+            libx11-dev \
+            libxrandr-dev \
+            libxi-dev \
+            libxcursor-dev \
+            libxinerama-dev \
+            libgl1-mesa-dev \
+            libgtk-3-dev
+
+      - name: Install stable toolchain (clippy)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache Cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      # The decoder library is expensive to build (it clones upstream nrsc5
+      # and statically links FFTW / FAAD2 / libusb / librtlsdr), so cache the
+      # staged bin/libnrsc5.so and only rebuild when the build script, the
+      # pinned header, or the cache epoch changes.
+      - name: Cache libnrsc5.so
+        id: nrsc5-cache
+        uses: actions/cache@v4
+        with:
+          path: bin/libnrsc5.so
+          key: libnrsc5-${{ env.NRSC5_CACHE_EPOCH }}-${{ runner.os }}-${{ hashFiles('scripts/build-nrsc5-linux.sh', 'res/nrsc5.h') }}
+
+      - name: Build libnrsc5.so
+        if: steps.nrsc5-cache.outputs.cache-hit != 'true'
+        run: bash scripts/build-nrsc5-linux.sh
+
+      - name: Clippy (deny warnings)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Run tests
+        run: cargo test --all-features --no-fail-fast

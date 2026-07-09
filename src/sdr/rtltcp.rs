@@ -256,12 +256,10 @@ impl RtlTcpSdr {
         // (write) can both hold one. `try_clone` shares the underlying
         // OS socket so `shutdown()` on either clone unblocks reads on
         // the other.
-        let tx_clone = stream
-            .try_clone()
-            .map_err(|e| SdrError::RtlTcpIo {
-                addr: addr.clone(),
-                reason: format!("try_clone for control half: {e}"),
-            })?;
+        let tx_clone = stream.try_clone().map_err(|e| SdrError::RtlTcpIo {
+            addr: addr.clone(),
+            reason: format!("try_clone for control half: {e}"),
+        })?;
 
         Ok(Self {
             addr,
@@ -348,10 +346,7 @@ impl Sdr for RtlTcpSdr {
         self.send_cmd(op::SET_TUNER_GAIN, tenths as u32)
     }
 
-    fn run_stream(
-        &self,
-        cb: &mut dyn FnMut(&[u8]) -> StreamControl,
-    ) -> Result<(), SdrError> {
+    fn run_stream(&self, cb: &mut dyn FnMut(&[u8]) -> StreamControl) -> Result<(), SdrError> {
         let mut rx = match self.rx.lock() {
             Ok(mut guard) => guard.take().ok_or_else(|| SdrError::RtlTcpIo {
                 addr: self.addr.clone(),
@@ -390,8 +385,9 @@ impl Sdr for RtlTcpSdr {
                         break;
                     }
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut =>
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut =>
                 {
                     // Read timeout fired (5 s). Loop back and check
                     // the stop flag so a `cancel_stream` becomes
@@ -513,9 +509,7 @@ mod tests {
     fn parses_valid_dongle_info() {
         // RTL0, tuner type = 5 (R820T), gain count = 29
         let bytes = [
-            b'R', b'T', b'L', b'0',
-            0x00, 0x00, 0x00, 0x05,
-            0x00, 0x00, 0x00, 0x1D,
+            b'R', b'T', b'L', b'0', 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00, 0x1D,
         ];
         let info = DongleInfo::parse(&bytes, "127.0.0.1:1234").expect("valid header");
         assert_eq!(info.tuner_type, 5);
@@ -527,9 +521,7 @@ mod tests {
         // First 4 bytes are garbage — typical of pointing at the wrong
         // service (e.g. a SoapySDRServer port that immediately closes).
         let bytes = [
-            0xDE, 0xAD, 0xBE, 0xEF,
-            0x00, 0x00, 0x00, 0x05,
-            0x00, 0x00, 0x00, 0x1D,
+            0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00, 0x1D,
         ];
         let err = DongleInfo::parse(&bytes, "127.0.0.1:1234").expect_err("bad magic");
         match err {

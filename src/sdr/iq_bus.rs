@@ -113,10 +113,7 @@ impl IqBus {
     /// thinks N decoders are alive, the bus agrees").
     #[allow(dead_code)]
     pub fn subscriber_count(&self) -> usize {
-        self.subs
-            .lock()
-            .expect("iq_bus subs mutex poisoned")
-            .len()
+        self.subs.lock().expect("iq_bus subs mutex poisoned").len()
     }
 }
 
@@ -294,8 +291,14 @@ mod tests {
         let rx1 = bus.subscribe(4);
         let rx2 = bus.subscribe(4);
         bus.publish(&[7, 7]);
-        assert_eq!(&*rx1.recv_timeout(Duration::from_millis(50)).unwrap(), &[7, 7]);
-        assert_eq!(&*rx2.recv_timeout(Duration::from_millis(50)).unwrap(), &[7, 7]);
+        assert_eq!(
+            &*rx1.recv_timeout(Duration::from_millis(50)).unwrap(),
+            &[7, 7]
+        );
+        assert_eq!(
+            &*rx2.recv_timeout(Duration::from_millis(50)).unwrap(),
+            &[7, 7]
+        );
     }
 
     #[test]
@@ -303,7 +306,7 @@ mod tests {
         let bus = IqBus::new();
         let _rx = bus.subscribe(1); // capacity 1, never recv'd
         bus.publish(&[1]); // fills the queue
-        // Subsequent publishes must not block or panic; payload silently dropped.
+                           // Subsequent publishes must not block or panic; payload silently dropped.
         bus.publish(&[2]);
         bus.publish(&[3]);
         assert_eq!(bus.subscriber_count(), 1);
@@ -484,7 +487,10 @@ mod tests {
         while slow.try_recv().is_ok() {
             slow_got += 1;
         }
-        assert_eq!(slow_got, 1, "slow consumer is capacity-bounded → drops the rest");
+        assert_eq!(
+            slow_got, 1,
+            "slow consumer is capacity-bounded → drops the rest"
+        );
     }
 
     // =================================================================
@@ -545,7 +551,10 @@ mod tests {
         let rx = bus.subscribe(4);
         bus.shutdown(); // drop the sender → rx is disconnected
         let got = rms_dbfs_cu8(&rx, 512, Duration::from_millis(50));
-        assert!(got.is_none(), "disconnect before data must yield None, got {got:?}");
+        assert!(
+            got.is_none(),
+            "disconnect before data must yield None, got {got:?}"
+        );
     }
 
     // =================================================================

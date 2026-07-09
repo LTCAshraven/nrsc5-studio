@@ -1,3 +1,10 @@
+// TODO(egui-0.34 migration): egui 0.34 deprecated several panel/menu APIs
+// used below (TopBottomPanel/SidePanel, Ui::close_menu, Context::screen_rect,
+// Panel::exact_width, Slider::clamp_to_range). Migrating them touches live UI
+// layout and needs visual verification, so it's tracked as a separate change;
+// silence the deprecation lint here in the meantime.
+#![allow(deprecated)]
+
 use crate::collage::CollageEngine;
 use crate::config::{load_config, save_config, AppConfig};
 use crate::ffi::{Nrsc5Process, NrscEvent};
@@ -282,6 +289,18 @@ pub struct Nrsc5App {
     /// Last time we pruned expired plays from `art_history`. Throttled so
     /// we don't walk the map every UI frame.
     last_art_prune_at: Option<Instant>,
+    /// Set when a cover-art event updates `art_history` so the (expensive)
+    /// collage relayout + art-cache disk write can be coalesced to a single
+    /// pass per frame instead of running once per event. Keeps a backlog
+    /// catch-up (e.g. after the window was unfocused) from replaying every
+    /// historical cover one relayout/write at a time.
+    art_dirty: bool,
+    /// Last time the collage tiles were relaid out. Used to defer the
+    /// (visible) relayout during a large refocus catch-up so the collage
+    /// jumps straight to the final layout instead of stepping through
+    /// intermediate states, while bounding how long it can look stale under
+    /// a sustained cover-art flood.
+    last_art_rebuild_at: Option<Instant>,
     /// Last time we pruned stale raw LOT dumps from the AAS scratch dir.
     /// Throttled so we don't scan the directory every UI frame.
     last_aas_prune_at: Option<Instant>,
@@ -322,19 +341,25 @@ pub struct Nrsc5App {
 }
 
 impl Nrsc5App {
-    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
-        egui_extras::install_image_loaders(&_cc.egui_ctx);
-        Self::install_fonts(&_cc.egui_ctx);
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        egui_extras::install_image_loaders(&cc.egui_ctx);
+        Self::install_fonts(&cc.egui_ctx);
         let mut config = load_config();
         let snapped_boot_freq = snap_fm_tune_mhz(config.frequency_mhz);
         if (config.frequency_mhz - snapped_boot_freq).abs() > f32::EPSILON {
             config.frequency_mhz = snapped_boot_freq;
             save_config(&config);
         }
-        Self::apply_theme(&_cc.egui_ctx, config.dark_mode);
-        let dock_state = _cc
+        Self::apply_theme(&cc.egui_ctx, config.dark_mode);
+        // Restore the user's saved dock layout (their panel arrangement,
+        // including any floating windows) if one is persisted and still
+        // parses; otherwise fall back to the curated default. A saved
+        // layout that fails to deserialize (e.g. after an egui_dock schema
+        // change) is silently discarded so a stale layout can't brick
+        // startup.
+        let dock_state = cc
             .storage
-            .and_then(|s| eframe::get_value::<DockState<DockTab>>(s, "dock_state"))
+            .and_then(|s| eframe::get_value::<DockState<DockTab>>(s, DOCK_LAYOUT_KEY))
             .unwrap_or_else(default_dock_state);
 
         let (nrsc5, nrsc5_status) = match Nrsc5Process::new() {
@@ -349,6 +374,13 @@ impl Nrsc5App {
         // every time the piped path starts. Done once at app startup
         // (and again when the backend is recreated on a config switch).
         let spectrum_tap = crate::dsp::SpectrumTap::new(1_488_375.0);
+        let smoothing_alpha = config.spectrum_smoothing_alpha.clamp(0.1, 1.0);
+        let effective_alpha = if config.spectrum_smoothing_enabled {
+            smoothing_alpha
+        } else {
+            1.0
+        };
+        spectrum_tap.set_smoothing_alpha(effective_alpha);
         // Build the audio player (opens the default output device) and
         // grab a clone-cheap sink for the nrsc5 backend to push PCM into.
         // Device-open failures are surfaced via `init_error` rather than
@@ -386,7 +418,7 @@ impl Nrsc5App {
 
         // Load the permanent block list from config.
         let art_blocklist: std::collections::HashSet<u64> =
-            config.art_blocklist.iter().copied().collect();
+            config.art_blocklist.iter().map(|&h| h as u64).collect();
         let art_blocklist_count = art_blocklist.len();
 
         // Snapshot any per-field config values needed after `config` is
@@ -422,6 +454,8 @@ impl Nrsc5App {
                 analog_fallback_rds_enabled: config.analog_fallback_rds_enabled,
                 collage_tile_cap: collage_tile_cap(&config) as u32,
                 spectrum_tap: Some(spectrum_tap),
+                spectrum_smoothing_enabled: config.spectrum_smoothing_enabled,
+                spectrum_smoothing_alpha: smoothing_alpha,
                 ..AppState::default()
             },
             dock_state,
@@ -441,6 +475,8 @@ impl Nrsc5App {
             art_blocklist,
             art_cache,
             last_art_prune_at: None,
+            art_dirty: false,
+            last_art_rebuild_at: None,
             last_aas_prune_at: None,
             closed_tab_locations: HashMap::new(),
             prev_layout: LayoutSnapshot::default(),
@@ -504,22 +540,67 @@ impl eframe::App for Nrsc5App {
         }
         self.app_state.decoded = decoded;
 
-        // Drain events from the nrsc5 process.
+        // Drain events from the nrsc5 process. Cap the number processed
+        // per frame: when the window is minimized/occluded, Windows
+        // suspends painting so `update` stops running and events
+        // (metadata + LOT image payloads) pile up in the unbounded
+        // channel. Draining the whole backlog in a single frame on
+        // refocus froze the UI for seconds and, with a large image
+        // backlog, could exhaust memory during the texture-upload burst.
+        // A bounded batch keeps each frame cheap; if events remain we ask
+        // egui for another frame right away so catch-up stays prompt.
+        let mut more_events_pending = false;
         if let Some(nrsc5) = &self.nrsc5 {
+            const MAX_EVENTS_PER_FRAME: usize = 128;
             let mut pending = Vec::new();
-            while let Ok(evt) = nrsc5.events().try_recv() {
-                // Tee MER / Sync / etc into the AGC controller
-                // centrally. Used to live in each decoder's libnrsc5
-                // callback but moved here so AGC keeps getting fed
-                // when the primary decoder is disabled and so that
-                // starting on a non-HD1 program still drives AGC.
-                nrsc5.forward_event_to_agc(&evt);
-                nrsc5.forward_event_to_handoff(&evt);
-                pending.push(evt);
+            while pending.len() < MAX_EVENTS_PER_FRAME {
+                match nrsc5.events().try_recv() {
+                    Ok(evt) => {
+                        // Tee MER / Sync / etc into the AGC controller
+                        // centrally. Used to live in each decoder's
+                        // libnrsc5 callback but moved here so AGC keeps
+                        // getting fed when the primary decoder is disabled
+                        // and so that starting on a non-HD1 program still
+                        // drives AGC.
+                        nrsc5.forward_event_to_agc(&evt);
+                        nrsc5.forward_event_to_handoff(&evt);
+                        pending.push(evt);
+                    }
+                    Err(_) => break,
+                }
             }
+            more_events_pending = !nrsc5.events().is_empty();
             for evt in pending {
                 self.app_state.last_event = evt.label().to_string();
                 self.handle_nrsc5_event(evt);
+            }
+            // Backlog left over (we hit the per-frame cap): keep the
+            // catch-up going without waiting for the next scheduled paint.
+            if more_events_pending {
+                ui.ctx().request_repaint();
+            }
+        }
+
+        // Collage refresh, deferred until the event backlog is drained.
+        // Cover-art ingest only marks the tiles dirty; the actual (expensive)
+        // relayout + art-cache disk write happens here. Crucially, while a
+        // large refocus catch-up is still draining we HOLD the relayout so
+        // the collage doesn't visibly step through hundreds of intermediate
+        // states (each one a relayout + texture churn + disk write) — instead
+        // it jumps straight to the final layout once we're caught up, and
+        // catch-up frames stay cheap. A 2-second fallback bounds how long the
+        // collage can look stale under a sustained cover-art flood.
+        if self.art_dirty {
+            let caught_up = !more_events_pending;
+            let stale = self
+                .last_art_rebuild_at
+                .map(|t| t.elapsed() >= Duration::from_secs(2))
+                .unwrap_or(true);
+            if caught_up || stale {
+                self.rebuild_art_tiles();
+                self.persist_art_history();
+                self.art_dirty = false;
+                self.last_art_rebuild_at = Some(Instant::now());
             }
         }
 
@@ -530,6 +611,10 @@ impl eframe::App for Nrsc5App {
                 match handle.join() {
                     Ok((backend, None)) => {
                         self.nrsc5 = Some(backend);
+                        if let Some(n) = self.nrsc5.as_ref() {
+                            let ctx = ui.ctx().clone();
+                            n.set_repaint_waker(move || ctx.request_repaint());
+                        }
                         self.app_state.is_streaming = true;
                         self.start_requested_at = Some(Instant::now());
                         self.app_state.nrsc5_status = format!(
@@ -540,6 +625,10 @@ impl eframe::App for Nrsc5App {
                     }
                     Ok((backend, Some(err_msg))) => {
                         self.nrsc5 = Some(backend);
+                        if let Some(n) = self.nrsc5.as_ref() {
+                            let ctx = ui.ctx().clone();
+                            n.set_repaint_waker(move || ctx.request_repaint());
+                        }
                         self.app_state.is_streaming = false;
                         self.app_state.nrsc5_status = format!("retune failed: {err_msg}");
                     }
@@ -576,6 +665,40 @@ impl eframe::App for Nrsc5App {
                         Ok(()) => eprintln!("[speaker] set_active_speaker({program}) ok"),
                         Err(e) => eprintln!("[speaker] set_active_speaker({program}) err: {e}"),
                     }
+                }
+            }
+        }
+
+        // --- Hidden dev helper: capture the current dock layout ----------
+        // Ctrl+Shift+D serializes the live dock layout to
+        // `dock-layout-dump.ron` in the working directory so a hand-tuned
+        // arrangement can be captured and baked in as the default. Arrange
+        // the panels as *docked* splits (drag tabs into position rather than
+        // popping out floating windows) so the captured layout stays
+        // single-surface — that keeps it resolution-independent and avoids
+        // the egui_dock startup layer-id assert on restore.
+        {
+            let dump = egui::KeyboardShortcut::new(
+                egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+                egui::Key::D,
+            );
+            if ui.ctx().input_mut(|i| i.consume_shortcut(&dump)) {
+                match ron::ser::to_string_pretty(
+                    &self.dock_state,
+                    ron::ser::PrettyConfig::default(),
+                ) {
+                    Ok(s) => {
+                        let path = std::env::current_dir()
+                            .unwrap_or_default()
+                            .join("dock-layout-dump.ron");
+                        match std::fs::write(&path, &s) {
+                            Ok(()) => {
+                                eprintln!("[layout] dumped dock layout to {}", path.display())
+                            }
+                            Err(e) => eprintln!("[layout] dump write failed: {e}"),
+                        }
+                    }
+                    Err(e) => eprintln!("[layout] dump serialize failed: {e}"),
                 }
             }
         }
@@ -782,7 +905,10 @@ impl eframe::App for Nrsc5App {
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
-        eframe::set_value(storage, "dock_state", &self.dock_state);
+        // Persist the dock layout so the user's panel arrangement (docked
+        // splits and floating windows alike) survives restarts. eframe
+        // flushes `storage` after this returns.
+        eframe::set_value(storage, DOCK_LAYOUT_KEY, &self.dock_state);
         // Flush runtime state to the TOML config too, so a crash or
         // Task-Manager kill doesn't lose the user's last frequency,
         // subchannel, theme, volume, or mute state. eframe calls save()
@@ -943,8 +1069,8 @@ impl Nrsc5App {
             v.extreme_bg_color = bg;
             v.faint_bg_color = egui::Color32::from_rgb(35, 35, 45);
             v.widgets.noninteractive.bg_stroke =
-                egui::Stroke::new(0.5, egui::Color32::from_gray(60));
-            v.widgets.inactive.bg_stroke = egui::Stroke::new(0.5, egui::Color32::from_gray(80));
+                egui::Stroke::new(0.5_f32, egui::Color32::from_gray(60));
+            v.widgets.inactive.bg_stroke = egui::Stroke::new(0.5_f32, egui::Color32::from_gray(80));
             v
         } else {
             let mut v = egui::Visuals::light();
@@ -954,13 +1080,14 @@ impl Nrsc5App {
             v.extreme_bg_color = egui::Color32::from_rgb(235, 235, 240);
             v.faint_bg_color = egui::Color32::from_rgb(240, 240, 248);
             v.widgets.noninteractive.bg_stroke =
-                egui::Stroke::new(0.5, egui::Color32::from_gray(200));
-            v.widgets.inactive.bg_stroke = egui::Stroke::new(0.5, egui::Color32::from_gray(180));
+                egui::Stroke::new(0.5_f32, egui::Color32::from_gray(200));
+            v.widgets.inactive.bg_stroke =
+                egui::Stroke::new(0.5_f32, egui::Color32::from_gray(180));
             v
         };
 
-        visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, accent);
-        visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, accent);
+        visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, accent);
+        visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0_f32, accent);
 
         let cr = egui::CornerRadius::same(4);
         visuals.widgets.noninteractive.corner_radius = cr;
@@ -970,7 +1097,7 @@ impl Nrsc5App {
         visuals.window_corner_radius = egui::CornerRadius::same(6);
 
         visuals.selection.bg_fill = accent.linear_multiply(0.3);
-        visuals.selection.stroke = egui::Stroke::new(1.0, accent);
+        visuals.selection.stroke = egui::Stroke::new(1.0_f32, accent);
         visuals.hyperlink_color = accent;
 
         // egui 0.34 has a dual-theme system with `ThemePreference::System`
@@ -1035,6 +1162,18 @@ impl Nrsc5App {
     /// free atomic store; the cpal callback picks it up on the next fill.
     fn apply_mute(&mut self) {
         self.audio_player.set_mute(self.app_state.muted);
+    }
+
+    /// Push the current smoothing settings into the shared SpectrumTap.
+    fn apply_spectrum_smoothing(&mut self) {
+        let alpha = if self.app_state.spectrum_smoothing_enabled {
+            self.app_state.spectrum_smoothing_alpha
+        } else {
+            1.0
+        };
+        if let Some(tap) = self.app_state.spectrum_tap.as_ref() {
+            tap.set_smoothing_alpha(alpha);
+        }
     }
 
     /// Probe attached SDRs and update `app_state.sdr_present` /
@@ -1188,7 +1327,7 @@ impl Nrsc5App {
                 egui::Frame::popup(ui.style())
                     .fill(egui::Color32::from_rgb(28, 32, 42))
                     .stroke(egui::Stroke::new(
-                        1.0,
+                        1.0_f32,
                         egui::Color32::from_rgb(90, 120, 180),
                     ))
                     .corner_radius(egui::CornerRadius::same(10))
@@ -1381,8 +1520,11 @@ impl Nrsc5App {
                 entry.songs.push(pair);
             }
         }
-        self.rebuild_art_tiles();
-        self.persist_art_history();
+        // Defer the expensive collage relayout + art-cache disk write to the
+        // single coalesced pass at the end of the frame (see `art_dirty`).
+        // During a large catch-up this collapses N relayouts + N disk
+        // writes into one per frame, eliminating the visible step-through.
+        self.art_dirty = true;
 
         // A genuinely new play just landed (the cover-hash cooldown has
         // gated this code path). Remember the moment so the metadata
@@ -1686,7 +1828,7 @@ impl Nrsc5App {
             .filter_map(|(k, e)| e.plays.front().map(|t| (*k, e, *t)))
             .collect();
         // Step 1: keep the most-played covers within the tile cap.
-        entries.sort_by(|a, b| b.1.plays.len().cmp(&a.1.plays.len()));
+        entries.sort_by_key(|e| std::cmp::Reverse(e.1.plays.len()));
         entries.truncate(cap);
         // Step 2: re-order the survivors by arrival so spatial layout
         // reflects "order they came in", not "how many plays".
@@ -1813,6 +1955,13 @@ impl Nrsc5App {
         for e in entries.flatten() {
             let fname = e.file_name();
             let fname = fname.to_string_lossy();
+            // Skip logo source sidecars (`<image>.src`); they share the
+            // `{freq}_hd{n}_` prefix and would otherwise be parsed as an
+            // image path for slot n and handed to egui, which reports
+            // "No matching ImageLoader" when it fails to decode them.
+            if fname.ends_with(".src") {
+                continue;
+            }
             let Some(rest) = fname.strip_prefix(&prefix) else {
                 continue;
             };
@@ -1823,15 +1972,13 @@ impl Nrsc5App {
                     let logo_path = e.path();
                     self.app_state.station_logo_paths[idx] =
                         Some(logo_path.to_string_lossy().into_owned());
-                    let source = std::fs::read_to_string(station_logo_source_sidecar_path(
-                        &logo_path,
-                    ))
-                    .ok()
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or_else(|| "Unknown".to_string());
-                    self.app_state.station_logo_sources[idx] =
-                        Some(format!("{} (Cached)", source));
+                    let source =
+                        std::fs::read_to_string(station_logo_source_sidecar_path(&logo_path))
+                            .ok()
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or_else(|| "Unknown".to_string());
+                    self.app_state.station_logo_sources[idx] = Some(format!("{} (Cached)", source));
                 }
             }
         }
@@ -2287,14 +2434,12 @@ impl Nrsc5App {
                             .map(|(_, cs)| cs.as_str())
                             .filter(|cs| !cs.is_empty())
                             .unwrap_or("unknown");
-                        if let Some(cached) =
-                            self.store_station_logo(
-                                logo_program,
-                                &logo_ext(&filename),
-                                &data,
-                                source_label,
-                            )
-                        {
+                        if let Some(cached) = self.store_station_logo(
+                            logo_program,
+                            &logo_ext(&filename),
+                            &data,
+                            source_label,
+                        ) {
                             let _ = std::fs::remove_file(self.aas_dir.join(&filename));
                             self.app_state.station_logo_paths[logo_program as usize] = Some(cached);
                             self.app_state.station_logo_sources[logo_program as usize] =
@@ -2365,17 +2510,9 @@ impl Nrsc5App {
                             // copy. Also temporarily takes over the Now Playing
                             // artwork slot until the next cover-art XHDR arrives.
                             let ext = logo_ext(filename);
-                            if let Some(cached) = std::fs::read(&full_path)
-                                .ok()
-                                .and_then(|bytes| {
-                                    self.store_station_logo(
-                                        program,
-                                        &ext,
-                                        &bytes,
-                                        "XHDR mime",
-                                    )
-                                })
-                            {
+                            if let Some(cached) = std::fs::read(&full_path).ok().and_then(|bytes| {
+                                self.store_station_logo(program, &ext, &bytes, "XHDR mime")
+                            }) {
                                 let _ = std::fs::remove_file(&full_path);
                                 self.app_state.station_logo_paths[program as usize] = Some(cached);
                                 self.app_state.station_logo_sources[program as usize] =
@@ -2685,7 +2822,6 @@ impl Nrsc5App {
                     rdbi,
                 });
             }
-            _ => {}
         }
     }
 
@@ -2942,6 +3078,19 @@ impl Nrsc5App {
                 self.config.show_hd5_hd8 = flag;
                 save_config(&self.config);
             }
+            UiCommand::SetSpectrumSmoothingEnabled(enabled) => {
+                self.app_state.spectrum_smoothing_enabled = enabled;
+                self.config.spectrum_smoothing_enabled = enabled;
+                self.apply_spectrum_smoothing();
+                save_config(&self.config);
+            }
+            UiCommand::SetSpectrumSmoothingAlpha(alpha) => {
+                let snapped = ((alpha.clamp(0.1, 1.0) * 10.0).round() / 10.0).clamp(0.1, 1.0);
+                self.app_state.spectrum_smoothing_alpha = snapped;
+                self.config.spectrum_smoothing_alpha = snapped;
+                self.apply_spectrum_smoothing();
+                save_config(&self.config);
+            }
             UiCommand::StartRecording => self.start_recording(),
             UiCommand::StopRecording => self.stop_recording(/* fatal = */ false),
             UiCommand::SetPresetSlotCount(n) => {
@@ -3088,7 +3237,8 @@ impl Nrsc5App {
             UiCommand::BlockCover(hash) => {
                 // Add to the persistent block list.
                 if self.art_blocklist.insert(hash) {
-                    self.config.art_blocklist = self.art_blocklist.iter().copied().collect();
+                    self.config.art_blocklist =
+                        self.art_blocklist.iter().map(|&h| h as i64).collect();
                     save_config(&self.config);
                     self.app_state.art_blocklist_count = self.art_blocklist.len();
                 }
@@ -3282,14 +3432,14 @@ impl Nrsc5App {
                 // something to show. Subsequent opens use the cached
                 // list; users can hit "Refresh" inside the modal to
                 // re-enumerate on demand.
-                if !self.app_state.show_sdr_settings {
-                    if should_auto_refresh_sdr_devices(
+                if !self.app_state.show_sdr_settings
+                    && should_auto_refresh_sdr_devices(
                         self.config.sdr.transport,
                         self.sdr_refresh_in_flight,
                         self.app_state.sdr_devices.is_empty(),
-                    ) {
-                        self.refresh_sdr_devices();
-                    }
+                    )
+                {
+                    self.refresh_sdr_devices();
                 }
                 // Seed the remote-input edit buffers from config so
                 // the Host/Port/Extra-args fields show the persisted
@@ -3779,6 +3929,9 @@ impl Nrsc5App {
     /// notes. The device section was previously its own tab; folding
     /// it back into Connection keeps "where IQ comes from" in one
     /// place.
+    #[allow(clippy::too_many_arguments)] // Settings tab wiring: each arg is a
+                                         // distinct piece of connection form state; grouping into a struct would
+                                         // just move the fan-out to the call site.
     fn render_settings_connection_tab(
         &mut self,
         ui: &mut egui::Ui,
@@ -4117,7 +4270,7 @@ impl Nrsc5App {
                         );
                         if resp.drag_stopped() || resp.lost_focus() || resp.changed() {
                             let prev = self.config.sdr.gains.get(&elem.name).copied();
-                            if prev.map_or(true, |p| (p - value).abs() > 1e-6) {
+                            if prev.is_none_or(|p| (p - value).abs() > 1e-6) {
                                 commands.push(UiCommand::SetSdrGainElement {
                                     element: elem.name.clone(),
                                     value_db: value,
@@ -4237,7 +4390,7 @@ impl Nrsc5App {
                             || slider_resp.changed())
                     {
                         let prev = self.app_state.agc_amp_target_dbfs_override;
-                        if prev.map_or(true, |p| (p - override_value).abs() > 1e-3) {
+                        if prev.is_none_or(|p| (p - override_value).abs() > 1e-3) {
                             commands.push(UiCommand::SetAgcAmpTargetDbfs(Some(override_value)));
                         }
                     }
@@ -4674,9 +4827,7 @@ fn parse_station_logo_filename(filename: &str) -> Option<(u32, String)> {
         if let Some(program) = parse_hd_program_token(&upper) {
             let callsign = if let Some(hd_idx) = upper.find("HD") {
                 let maybe = upper[2..hd_idx].trim();
-                if (3..=5).contains(&maybe.len())
-                    && maybe.chars().all(|c| c.is_ascii_uppercase())
-                {
+                if (3..=5).contains(&maybe.len()) && maybe.chars().all(|c| c.is_ascii_uppercase()) {
                     maybe.to_string()
                 } else {
                     String::new()
@@ -4692,9 +4843,7 @@ fn parse_station_logo_filename(filename: &str) -> Option<(u32, String)> {
     if let Some(program) = parse_hd_program_token(&upper) {
         if let Some(hd_idx) = upper.find("HD") {
             let prefix = upper[..hd_idx].trim();
-            if (3..=5).contains(&prefix.len())
-                && prefix.chars().all(|c| c.is_ascii_uppercase())
-            {
+            if (3..=5).contains(&prefix.len()) && prefix.chars().all(|c| c.is_ascii_uppercase()) {
                 return Some((program, prefix.to_string()));
             }
         }
@@ -4716,9 +4865,7 @@ fn is_likely_station_logo_filename(filename: &str) -> bool {
     }
     if let Some(hd_idx) = upper.find("HD") {
         let prefix = upper[..hd_idx].trim();
-        if (3..=5).contains(&prefix.len())
-            && prefix.chars().all(|c| c.is_ascii_uppercase())
-        {
+        if (3..=5).contains(&prefix.len()) && prefix.chars().all(|c| c.is_ascii_uppercase()) {
             score += 2;
         }
     }
@@ -4735,8 +4882,7 @@ fn classify_lot_image(
     lot_component_mime: Option<u32>,
 ) -> LotImageClass {
     use crate::ffi::nrsc5_sys::{
-        NRSC5_MIME_JPEG, NRSC5_MIME_PNG, NRSC5_MIME_PRIMARY_IMAGE,
-        NRSC5_MIME_STATION_LOGO,
+        NRSC5_MIME_JPEG, NRSC5_MIME_PNG, NRSC5_MIME_PRIMARY_IMAGE, NRSC5_MIME_STATION_LOGO,
     };
 
     if lot_mime == NRSC5_MIME_STATION_LOGO {
@@ -4828,158 +4974,6 @@ fn extract_call_sign(filename: &str) -> Option<String> {
     }
 }
 
-/// Default dock layout used on a fresh install (when no persisted state
-/// exists). Captured live with the in-app "Dump Layout" helper at a
-/// ~1560×880 inner window size so the floating sub-windows fit
-/// comfortably inside a 1920×1080 monitor with the Windows taskbar
-/// visible. Smaller windows still work — the user can drag any
-/// sub-window back into place, and persistence saves their changes.
-///
-/// Only a minimal set of panels is opened by default (Tuner +
-/// StationInfo, NowPlaying, Weather/Traffic). All other panels stay
-/// closed and can be reopened from the top-bar toggles.
-const DEFAULT_DOCK_RON: &str = r#"(
-    surfaces: [Main((
-        nodes: [],
-        focused_node: Some((0)),
-        collapsed: false,
-        collapsed_leaf_count: 0,
-)), Empty, Window((
-        nodes: [Leaf((
-            rect: (
-                min: (
-                    x: 659.0,
-                    y: 83.0,
-                ),
-                max: (
-                    x: 966.1875,
-                    y: 409.8125,
-                ),
-            ),
-            viewport: (
-                min: (
-                    x: 659.0,
-                    y: 107.0,
-                ),
-                max: (
-                    x: 966.1875,
-                    y: 409.8125,
-                ),
-            ),
-            tabs: [Weather, Traffic],
-            active: (0),
-            scroll: 0.0,
-            collapsed: false,
-        ))],
-        focused_node: Some((0)),
-        collapsed: false,
-        collapsed_leaf_count: 0,
-    ), (
-        screen_rect: None,
-        dragged: false,
-        next_position: None,
-        next_size: None,
-        expanded_height: None,
-        new: false,
-        minimized: false,
-    )), Window((
-        nodes: [Leaf((
-            rect: (
-                min: (
-                    x: 14.34375,
-                    y: 78.34375,
-                ),
-                max: (
-                    x: 276.90625,
-                    y: 520.5,
-                ),
-            ),
-            viewport: (
-                min: (
-                    x: 14.34375,
-                    y: 102.34375,
-                ),
-                max: (
-                    x: 276.90625,
-                    y: 520.5,
-                ),
-            ),
-            tabs: [Tuner, StationInfo],
-            active: (0),
-            scroll: 0.0,
-            collapsed: false,
-        ))],
-        focused_node: Some((0)),
-        collapsed: false,
-        collapsed_leaf_count: 0,
-    ), (
-        screen_rect: None,
-        dragged: false,
-        next_position: None,
-        next_size: None,
-        expanded_height: None,
-        new: false,
-        minimized: false,
-    )), Window((
-        nodes: [Leaf((
-            rect: (
-                min: (
-                    x: 301.65625,
-                    y: 81.0,
-                ),
-                max: (
-                    x: 616.1875,
-                    y: 473.8125,
-                ),
-            ),
-            viewport: (
-                min: (
-                    x: 301.65625,
-                    y: 105.0,
-                ),
-                max: (
-                    x: 616.1875,
-                    y: 473.8125,
-                ),
-            ),
-            tabs: [NowPlaying],
-            active: (0),
-            scroll: 0.0,
-            collapsed: false,
-        ))],
-        focused_node: None,
-        collapsed: false,
-        collapsed_leaf_count: 0,
-    ), (
-        screen_rect: None,
-        dragged: false,
-        next_position: None,
-        next_size: None,
-        expanded_height: None,
-        new: false,
-        minimized: false,
-    )), Empty, Empty],
-    focused_surface: Some((2)),
-    translations: (
-        tab_context_menu: (
-            close_button: "Close",
-            eject_button: "Eject",
-        ),
-        leaf: (
-            close_button_disabled_tooltip: "This leaf contains non-closable tabs.",
-            close_all_button: "Close window",
-            close_all_button_menu_hint: "Right click to close this window.",
-            close_all_button_modifier_hint: "Press modifier keys (Shift by default) to close this window.",
-            close_all_button_modifier_menu_hint: "Press modifier keys (Shift by default) or right click to close this window.",
-            close_all_button_disabled_tooltip: "This window contains non-closable tabs.",
-            minimize_button: "Minimize window",
-            minimize_button_menu_hint: "Right click to minimize this window.",
-            minimize_button_modifier_hint: "Press modifier keys (Shift by default) to minimize this window.",
-            minimize_button_modifier_menu_hint: "Press modifier keys (Shift by default) or right click to minimize this window.",
-        ),
-    ),
-)"#;
-
 /// Restore the persisted album-art history from disk and produce three
 /// pieces of state the constructor needs: the rebuilt `art_history` map
 /// (live `Instant`-based timestamps), the sorted `ArtTile` list, and a
@@ -5048,7 +5042,7 @@ fn restore_art_history(
         .iter()
         .filter_map(|(k, e)| e.plays.front().map(|t| (*k, e, *t)))
         .collect();
-    entries.sort_by(|a, b| b.1.plays.len().cmp(&a.1.plays.len()));
+    entries.sort_by_key(|e| std::cmp::Reverse(e.1.plays.len()));
     entries.truncate(cap);
     entries.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| a.1.path.cmp(&b.1.path)));
     tiles = entries
@@ -5065,27 +5059,62 @@ fn restore_art_history(
     (map, tiles, oldest_play)
 }
 
-/// Build the initial dock layout. Tries the captured RON first; falls back
-/// to a hand-built docked layout if parsing fails (e.g. after a future
-/// egui_dock version bump changes the serialization shape).
-fn default_dock_state() -> DockState<DockTab> {
-    if let Ok(ds) = ron::from_str::<DockState<DockTab>>(DEFAULT_DOCK_RON) {
-        return ds;
-    }
+/// Build the initial dock layout.
+///
+/// We intentionally avoid restoring the embedded RON snapshot here.
+/// The current egui/egui_dock combo can assert during tab-bar rendering
+/// when window-surface metadata from serialized layouts disagrees with
+/// live layer assignment. A deterministic hand-built single-surface tree
+/// keeps startup stable.
+/// eframe storage key under which the persisted dock layout is saved.
+const DOCK_LAYOUT_KEY: &str = "dock_layout";
 
-    eprintln!("warning: failed to parse embedded default dock layout; using built-in fallback");
-    let mut ds = DockState::new(vec![DockTab::NowPlaying]);
-    let tree = ds.main_surface_mut();
-    let [_old, left] = tree.split_left(NodeIndex::root(), 0.25, vec![DockTab::Tuner]);
-    // Signal + Constellation share a leaf so the user can flip between the
-    // numeric MER/BER readout and the visual scope without rearranging.
-    let [_old_left, _left_bottom] =
-        tree.split_below(left, 0.35, vec![DockTab::Signal, DockTab::Constellation]);
-    let [_old_root, right] = tree.split_right(NodeIndex::root(), 0.32, vec![DockTab::Traffic]);
-    let [_old_right, _right_bottom] = tree.split_below(right, 0.5, vec![DockTab::Weather]);
-    let [_old_center, _center_bottom] =
-        tree.split_below(NodeIndex::root(), 0.67, vec![DockTab::Collage]);
-    ds
+/// Default dock layout — used on a fresh install and as the fallback
+/// whenever no saved layout is present (or a saved one fails to parse).
+/// A hand-arranged, single-surface layout captured with the Ctrl+Shift+D
+/// dev helper and baked in from `res/default-layout.ron`. If the embedded
+/// RON ever fails to parse (e.g. an egui_dock schema bump), it falls back
+/// further to a programmatic split layout.
+fn default_dock_state() -> DockState<DockTab> {
+    const DEFAULT_LAYOUT_RON: &str = include_str!("../res/default-layout.ron");
+    ron::from_str::<DockState<DockTab>>(DEFAULT_LAYOUT_RON).unwrap_or_else(|e| {
+        eprintln!("[layout] embedded default layout failed to parse ({e}); using fallback");
+        fallback_dock_state()
+    })
+}
+
+/// Programmatic fraction-based fallback used only if the baked-in default
+/// layout fails to parse. Single-surface and resolution-independent.
+fn fallback_dock_state() -> DockState<DockTab> {
+    // Center column starts as the root leaf.
+    let mut state = DockState::new(vec![
+        DockTab::NowPlaying,
+        DockTab::Collage,
+        DockTab::Spectrum,
+        DockTab::Constellation,
+    ]);
+    let tree = state.main_surface_mut();
+
+    // Left column (~22%). `fraction` is the *old* (center) node's share and
+    // the new leaf is placed to the left, so 0.78 leaves the left ~22%.
+    let [center, _left] = tree.split_left(
+        NodeIndex::root(),
+        0.78,
+        vec![
+            DockTab::Tuner,
+            DockTab::StationInfo,
+            DockTab::Signal,
+            DockTab::EngineeringInfo,
+        ],
+    );
+
+    // Right column (~28% of the remaining center width): the maps.
+    let [center, _right] = tree.split_right(center, 0.72, vec![DockTab::Weather, DockTab::Traffic]);
+
+    // Log strip along the bottom of the center column (~22% of its height).
+    let [_center, _log] = tree.split_below(center, 0.78, vec![DockTab::Log]);
+
+    state
 }
 
 #[cfg(test)]

@@ -31,9 +31,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for &size in SIZES {
         let img = icon_render::render(size);
-        let dir = icon_root
-            .join(format!("{size}x{size}"))
-            .join("apps");
+        let dir = icon_root.join(format!("{size}x{size}")).join("apps");
         fs::create_dir_all(&dir)?;
         let out = dir.join("nrsc5-studio.png");
         img.save(&out)?;

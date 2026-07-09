@@ -115,10 +115,7 @@ impl EquipmentInfo {
     pub fn core_version_string(&self) -> String {
         format!(
             "{}.{}.{}.{}",
-            self.core_version[0],
-            self.core_version[1],
-            self.core_version[2],
-            self.core_version[3],
+            self.core_version[0], self.core_version[1], self.core_version[2], self.core_version[3],
         )
     }
 
@@ -225,6 +222,7 @@ pub struct AmSyncIndicators {
 /// The panel labels this as "inferred" in its tooltip so we're not
 /// claiming an authoritative readout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // Superseded by SYNC PSMI telemetry; kept as the fallback inference model.
 pub enum ServiceMode {
     /// MP1 — P1 partition only (HD1 audio).
     Mp1,
@@ -234,6 +232,7 @@ pub enum ServiceMode {
     Mp11,
 }
 
+#[allow(dead_code)] // Methods reachable only via the fallback ServiceMode path.
 impl ServiceMode {
     /// Short human-readable label for the panel ("MP1" / "MP3" / "MP11").
     pub fn label(self) -> &'static str {
@@ -375,6 +374,7 @@ impl StationInfo {
     ///
     /// This is now a fallback-only heuristic; the Station/Engineering
     /// panels prefer the raw SYNC PSMI telemetry when it is available.
+    #[allow(dead_code)] // Fallback-only heuristic; SYNC PSMI is preferred when present.
     pub fn infer_service_mode(&self) -> Option<ServiceMode> {
         let highest = self
             .programs
@@ -467,5 +467,3 @@ mod tests {
         assert_eq!(info.rds_ticker_text(), None);
     }
 }
-
-

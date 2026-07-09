@@ -249,7 +249,8 @@ impl AnalogHandoff {
     pub fn mark_hd_audio(&self) {
         // Saturate 0 to 1 so a push in the first millisecond still
         // reads as "seen" rather than the sentinel "never".
-        self.last_hd_ms.store(self.now_ms().max(1), Ordering::Relaxed);
+        self.last_hd_ms
+            .store(self.now_ms().max(1), Ordering::Relaxed);
     }
 
     /// Arm or disarm the AGC-ready gate. Called once at stream start
@@ -318,6 +319,7 @@ impl AnalogHandoff {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)] // helper item defined below the tests; harmless here.
 mod tests {
     use super::AnalogHandoff;
 
@@ -380,9 +382,7 @@ fn open_stream(
     let supported = match device.default_output_config() {
         Ok(s) => s,
         Err(e) => {
-            let msg = format!(
-                "audio device '{device_name}' default_output_config failed: {e}"
-            );
+            let msg = format!("audio device '{device_name}' default_output_config failed: {e}");
             eprintln!("[audio] init failed: {msg}");
             return (None, Some(msg));
         }

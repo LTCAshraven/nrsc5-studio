@@ -185,7 +185,7 @@ pub const RTLSDR: DeviceProfile = DeviceProfile {
     agc_db_offset: 0.0,
     agc_sign_flip: false,
     agc_tenths_table: R820T_GAINS_TENTHS,
-    agc_tick_ms: 500,    // R820T2's HD-Radio sweet spot is wide; 19.7 dB is mid-table and
+    agc_tick_ms: 500, // R820T2's HD-Radio sweet spot is wide; 19.7 dB is mid-table and
     // matches the long-standing AGC default that produced quick lock
     // on the reference RTL-SDR Blog V3 + dipole bench setup.
     default_agc_initial_tenths: 197,
@@ -339,8 +339,8 @@ const SDRPLAY_GAIN_TABLE: [i32; 29] = {
     arr
 };
 
-/// HackRF One. Two-stage analog gain: `LNA` (0..40 dB in 8 dB steps)
-/// + `VGA` (0..62 dB in 2 dB steps) + optional `AMP` (a 14 dB front-end
+/// HackRF One. Two-stage analog gain: `LNA` (0..40 dB in 8 dB steps) +
+/// `VGA` (0..62 dB in 2 dB steps) + optional `AMP` (a 14 dB front-end
 /// boost, on/off only). AGC drives `LNA` since it's the dominant
 /// noise-figure-vs-overload tradeoff at HD Radio frequencies.
 ///
@@ -425,8 +425,8 @@ pub const ALL_PROFILES: &[&DeviceProfile] = &[&RTLSDR, &SDRPLAY, &HACKRF];
 /// internal table, so this is still the canonical reference for
 /// "what a real RTL-SDR will silently snap to".
 pub const R820T_GAINS_TENTHS: &[i32] = &[
-    0, 9, 14, 27, 37, 77, 87, 125, 144, 157, 166, 197, 207, 229, 254, 280, 297, 328, 338, 364,
-    372, 386, 402, 421, 434, 439, 445, 480, 496,
+    0, 9, 14, 27, 37, 77, 87, 125, 144, 157, 166, 197, 207, 229, 254, 280, 297, 328, 338, 364, 372,
+    386, 402, 421, 434, 439, 445, 480, 496,
 ];
 
 #[cfg(test)]

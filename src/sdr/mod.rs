@@ -11,18 +11,18 @@
 //! (`RtlTcp`, `SoapySdr`, …) will implement the same trait so the rest of
 //! the app doesn't care which one is wired in.
 
-pub mod soapy;
+pub mod gain_cache;
+pub mod iq_bus;
 pub mod profile;
 pub mod resampler;
-pub mod iq_bus;
-pub mod gain_cache;
 pub mod rtltcp;
+pub mod soapy;
 
-pub use soapy::{DeviceInfo, SoapySdr};
-pub use profile::R820T_GAINS_TENTHS;
-pub use iq_bus::IqBus;
 pub use gain_cache::{GainCache, GainCacheEntry, GainCacheKey};
+pub use iq_bus::IqBus;
+pub use profile::R820T_GAINS_TENTHS;
 pub use rtltcp::RtlTcpSdr;
+pub use soapy::{DeviceInfo, SoapySdr};
 
 use thiserror::Error;
 
@@ -37,10 +37,7 @@ pub enum SdrError {
     #[error("SoapySDR could not open device `{args}`: {reason}")]
     OpenFailedArgs { args: String, reason: String },
     #[error("SoapySDR call `{func}` failed: {detail}")]
-    SoapyCall {
-        func: &'static str,
-        detail: String,
-    },
+    SoapyCall { func: &'static str, detail: String },
     // === rtl_tcp backend (v0.5.0) ===
     #[error("rtl_tcp connect to {addr} failed: {reason}")]
     RtlTcpConnect { addr: String, reason: String },
@@ -173,10 +170,7 @@ pub trait Sdr: Send + Sync {
     /// FM HD Radio sample rate, ~85 calls/s).
     ///
     /// [`cancel_stream`]: Sdr::cancel_stream
-    fn run_stream(
-        &self,
-        cb: &mut dyn FnMut(&[u8]) -> StreamControl,
-    ) -> Result<(), SdrError>;
+    fn run_stream(&self, cb: &mut dyn FnMut(&[u8]) -> StreamControl) -> Result<(), SdrError>;
 
     /// Request the in-flight `run_stream` (if any) to stop. Returns
     /// immediately; the worker thread will see the request on its next

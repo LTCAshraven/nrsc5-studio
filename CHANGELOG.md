@@ -6,6 +6,87 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.6.5] - 2026-07-09
+
+### Added
+
+- **Spectrum smoothing.** The Spectrum panel gains an optional **Spectrum
+  Smoothing** toggle with a strength slider. When enabled, the drawn spectrum
+  trace is run through an exponential moving average (EMA), taming the frame-to-
+  frame jitter of the FFT line into a steadier curve; the slider trades
+  responsiveness for smoothness (higher = smoother). Only the rendered line is
+  smoothed — the waterfall keeps raw FFT values so its history stays faithful.
+  Off by default, and both the toggle and strength persist in the config.
+- **Dock layout now persists across restarts.** Whatever panel arrangement
+  you leave the app in — docked splits *and* detached floating windows — is
+  saved on exit and restored on the next launch. A saved layout that fails to
+  deserialize (e.g. after an egui_dock schema change) is discarded silently so
+  a stale layout can never brick startup. A hidden **Ctrl+Shift+D** helper
+  dumps the live layout to `dock-layout-dump.ron` for capturing future
+  defaults.
+- **Redesigned default dock layout.** Fresh installs (and any launch with no
+  saved layout) now open into a curated multi-panel layout — Tuner / Station
+  Info / Signal / Engineering on the left, Now Playing / Collage / Spectrum /
+  Constellation in the center with a Log strip beneath, and Weather / Traffic
+  on the right — instead of every panel collapsed into a single tab bar. The
+  default is a single-surface, fraction-based split tree, so it scales
+  proportionally across resolutions (1080p ↔ 4K). It also serves as the
+  fallback whenever a saved layout can't be restored.
+
+### Fixed
+
+- **Greyed-out HD subchannels are no longer clickable.** Program buttons for
+  subchannels the tuned station doesn't deliver were drawn greyed but stayed
+  interactive — their tooltip even read "Click to tune anyway," and clicking
+  one selected a dead subchannel with unpredictable results (issue #20). Each
+  HD button is now rendered as a genuinely disabled widget when the station
+  neither advertises the subchannel nor has audio flowing for it, so it can't
+  be clicked; only advertised / on-air slots (and the currently active one)
+  remain selectable.
+- **Station logo preload no longer loads `.src` sidecars as images.** Each
+  cached logo is stored alongside a `<image>.src` source sidecar that shares
+  the `{freq}_hd{n}_` prefix. `preload_station_logos` scanned the cache
+  directory by prefix without filtering, so the sidecar could be parsed as an
+  image path for its subchannel slot and handed to egui — producing an
+  intermittent "No matching ImageLoader" error in the Station Information
+  panel (e.g. `971_hd2_d9eca340.png.src`). The preload now skips any file
+  ending in `.src`.
+- **Unfocused / minimized window no longer freezes or crashes on refocus.**
+  Decoder events (metadata + LOT image payloads) flow through an unbounded
+  channel that the GUI only drains while painting. When the window was
+  minimized or not in focus, Windows suspended painting, so events piled up for
+  the whole time the app sat in the background; on refocus the entire backlog
+  was processed in a single frame — freezing the UI for seconds and, on a
+  busy cover-art station, occasionally exhausting memory during the
+  texture-upload burst. Three changes address it: the per-frame event drain
+  is now capped (spreading catch-up across frames instead of one giant
+  hitch); the decoder wakes the UI via a repaint callback so it keeps
+  draining while unfocused-but-visible; and the collage relayout + art-cache
+  disk write are deferred until the backlog is fully drained, so the collage
+  jumps straight to the current state instead of visibly stepping through
+  hundreds of intermediate layouts.
+- **Album-art block list now persists across restarts for every image.**
+  Block entries are content hashes (`u64`) written to `config.toml`, but TOML
+  integers are signed 64-bit — a hash above `i64::MAX` (roughly half of all
+  hashes) couldn't be serialized, which silently aborted the *entire* config
+  write, so those blocks disappeared on the next launch. Hashes are now stored
+  as `i64` via a lossless bit-cast (a high hash round-trips as a negative
+  integer); existing positive entries are unaffected. `save_config` now also
+  logs a serialization failure instead of swallowing it.
+
+### Internal
+
+- **Project-quality / tooling pass.** Added a GitHub Actions CI workflow
+  (rustfmt, Clippy with `-D warnings`, the test suite, and `cargo-deny`),
+  plus `SECURITY.md`, `CONTRIBUTING.md`, issue/PR templates, a `deny.toml`
+  dependency-and-license policy, and a pinned `rustfmt.toml`. Bumped `anyhow`
+  to 1.0.103 to clear a RustSec advisory, ran `cargo fmt` across the whole
+  tree, and cleared the resulting Clippy `-D warnings` backlog (mechanical
+  lint fixes plus documented `#[allow]`s for intentional cases). Retired the
+  orphaned `DEFAULT_DOCK_RON` constant. The egui 0.34 deprecation migration is
+  tracked separately behind scoped `#![allow(deprecated)]` markers. No
+  user-facing behavior change.
+
 ## [0.6.4] - 2026-07-04
 
 ### Added

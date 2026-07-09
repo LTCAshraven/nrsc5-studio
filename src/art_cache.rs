@@ -101,12 +101,7 @@ impl ArtCache {
     /// file with the same name already exists it is left alone (the hash
     /// guarantees identical contents). Returns the absolute cache path on
     /// success.
-    pub fn store_image(
-        &self,
-        hash: u64,
-        bytes: &[u8],
-        source_path: &Path,
-    ) -> Option<PathBuf> {
+    pub fn store_image(&self, hash: u64, bytes: &[u8], source_path: &Path) -> Option<PathBuf> {
         let filename = Self::filename_for(hash, source_path);
         let dest = self.dir.join(&filename);
         if dest.exists() {
@@ -120,7 +115,11 @@ impl ArtCache {
             return None;
         }
         if let Err(e) = std::fs::rename(&tmp, &dest) {
-            eprintln!("art-cache: rename {} -> {} failed: {e}", tmp.display(), dest.display());
+            eprintln!(
+                "art-cache: rename {} -> {} failed: {e}",
+                tmp.display(),
+                dest.display()
+            );
             let _ = std::fs::remove_file(&tmp);
             return None;
         }
@@ -162,8 +161,7 @@ impl ArtCache {
             version: MANIFEST_VERSION,
             entries,
         };
-        let text = ron::to_string(&wrapper)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        let text = ron::to_string(&wrapper).map_err(|e| std::io::Error::other(e.to_string()))?;
         std::fs::write(&tmp, text)?;
         std::fs::rename(&tmp, &path)
     }
@@ -177,7 +175,9 @@ impl ArtCache {
         };
         for entry in entries.flatten() {
             let name_os = entry.file_name();
-            let Some(name) = name_os.to_str() else { continue; };
+            let Some(name) = name_os.to_str() else {
+                continue;
+            };
             if name == MANIFEST_FILENAME || name.ends_with(".tmp") {
                 continue;
             }

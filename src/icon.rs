@@ -1,4 +1,4 @@
-﻿//! Runtime window icon. Delegates pixel rendering to `icon_render` (shared
+//! Runtime window icon. Delegates pixel rendering to `icon_render` (shared
 //! with `build.rs`) and wraps the result in `egui::IconData` so it can be
 //! handed to eframe via `ViewportBuilder::with_icon`.
 

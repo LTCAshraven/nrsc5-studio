@@ -49,6 +49,10 @@ pub const WATERFALL_ROWS: usize = 256;
 /// Target FFT cadence in frames-per-second.
 const TARGET_FPS: f32 = 30.0;
 
+/// Default EMA alpha for spectrum-line smoothing when enabled.
+/// 1.0 = no smoothing, lower values smooth more aggressively.
+pub const DEFAULT_SMOOTHING_ALPHA: f32 = 0.5;
+
 /// dB floor mapped to waterfall intensity 0. Anything below this is
 /// rendered as deep blue.
 const DB_FLOOR: f32 = -80.0;
@@ -120,6 +124,8 @@ struct TapInner {
 
     sample_rate_sps: f32,
     center_freq_hz: f64,
+    /// EMA alpha for spectrum-line smoothing. 1.0 = raw trace.
+    smoothing_alpha: f32,
 
     last_fft_at: Option<Instant>,
     /// Minimum wall-clock spacing between accepted FFT batches.
@@ -153,6 +159,7 @@ impl SpectrumTap {
             waterfall_head: 0,
             sample_rate_sps,
             center_freq_hz: 0.0,
+            smoothing_alpha: DEFAULT_SMOOTHING_ALPHA,
             last_fft_at: None,
             min_period: std::time::Duration::from_secs_f32(1.0 / TARGET_FPS),
             generation: 0,
@@ -168,6 +175,14 @@ impl SpectrumTap {
     pub fn set_center_freq_hz(&self, hz: f64) {
         if let Ok(mut g) = self.inner.lock() {
             g.center_freq_hz = hz;
+        }
+    }
+
+    /// Set EMA alpha used for spectrum-line smoothing.
+    /// Values are clamped to [0.1, 1.0]. 1.0 disables smoothing.
+    pub fn set_smoothing_alpha(&self, alpha: f32) {
+        if let Ok(mut g) = self.inner.lock() {
+            g.smoothing_alpha = alpha.clamp(0.1, 1.0);
         }
     }
 
@@ -233,13 +248,22 @@ impl SpectrumTap {
         // slot newer than it was).
         let row_offset = waterfall_head * FFT_SIZE;
         for shifted in 0..FFT_SIZE {
-            let natural = if shifted < half { shifted + half } else { shifted - half };
+            let natural = if shifted < half {
+                shifted + half
+            } else {
+                shifted - half
+            };
             let c = g.samples[natural];
             let power = (c.re * c.re + c.im * c.im) * (norm * norm);
             // 10*log10 with a tiny floor to keep -inf out of the
             // arithmetic when a bin is exactly zero.
             let db = 10.0 * (power + 1e-30).log10();
-            g.spectrum_db[shifted] = db;
+
+            // EMA smoothing for the drawn spectrum line only.
+            // Waterfall keeps raw values so history stays faithful.
+            let a = g.smoothing_alpha;
+            let prev = g.spectrum_db[shifted];
+            g.spectrum_db[shifted] = a * db + (1.0 - a) * prev;
 
             let clamped = db.clamp(DB_FLOOR, DB_CEIL);
             let norm01 = (clamped - DB_FLOOR) / (DB_CEIL - DB_FLOOR);

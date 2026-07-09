@@ -1,6 +1,6 @@
 [package]
 name = "nrsc5-studio"
-version = "0.6.4"
+version = "0.6.5"
 edition = "2021"
 authors = ["LTCAshraven"]
 license = "MIT"
@@ -83,6 +83,9 @@ rfd = { version = "0.17", default-features = false }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+rfd = { version = "0.17", default-features = false }
 
 [build-dependencies]
 bindgen = "0.72"
