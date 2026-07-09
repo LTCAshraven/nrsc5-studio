@@ -243,6 +243,9 @@ pub enum SdrplayServiceState {
 
 #[cfg(not(target_os = "windows"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// Placeholder so the type exists on non-Windows targets; the probe below always
+// returns `None`, so no variant is ever constructed off-Windows.
+#[allow(dead_code)]
 pub enum SdrplayServiceState {
     /// Placeholder so the type compiles on non-Windows targets. The
     /// SDRplay API is Windows-only in practice; on Linux the probe
