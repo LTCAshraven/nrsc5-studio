@@ -230,8 +230,16 @@ impl Nrsc5Session {
             return Ok(());
         }
 
-        // SAFETY: we created the box, no other thread is reading it
-        // yet (caller contract: install all callbacks before `start`).
+        // At this point `self.ctx` is guaranteed non-null: the null case
+        // returned early above, and the only writes to the field are the
+        // `Box::into_raw` on that early-return path and the null-out in
+        // `Drop`. So the pointer here always refers to the live, leaked
+        // `CallbackCtx` box.
+        debug_assert!(!self.ctx.is_null());
+        // SAFETY: `self.ctx` is non-null (see above) and points to a valid
+        // box we leaked with `Box::into_raw`. Forming a `&mut` is sound
+        // because no other thread is reading it yet (caller contract:
+        // install all callbacks before `start`).
         let ctx = unsafe { &mut *self.ctx };
         if let Some(cb) = event_cb {
             if ctx.event_cb.is_some() {
